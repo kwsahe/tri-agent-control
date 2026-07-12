@@ -38,6 +38,13 @@
   .row.right .bubble { border-left: none; border-right: 3px solid var(--accent); }
   .row.center .bubble { border-left: none; border: 1px dashed var(--accent); max-width: 90%; }
   .row.report .bubble { border: 2px solid #f5c542; background: #23200f; max-width: 90%; }
+  .row.confirm .bubble { border: 2px solid #5b8def; background: #101a2e; max-width: 90%; }
+  .approve-banner {
+    max-width: 760px; margin: 20px auto 0; background: #101a2e; border: 2px solid #5b8def;
+    border-radius: 12px; padding: 16px 18px; text-align: center;
+  }
+  .approve-banner p { margin: 0 0 12px; font-size: 13.5px; color: #dbe6ff; }
+  .approve-banner button { background: #5b8def; }
   .mode-choice { display: flex; gap: 16px; font-size: 13px; color: #c7cad3; margin: 10px 0 4px; }
   .mode-choice label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .meta { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; }
@@ -75,6 +82,11 @@
   <div id="topicSection">__TOPIC_SECTION__</div>
   <div class="feed" id="feed">__FEED__</div>
 
+  <div class="approve-banner" id="approveBanner" style="display:none">
+    <p>⏸ 위 확인 요청을 검토하고, 실제 코딩을 진행해도 될지 승인해주세요.</p>
+    <button onclick="approveWork()">✅ 승인하고 코딩 진행</button>
+  </div>
+
   <div class="panel">
     <div class="panel-row">
       <button id="pauseBtn" onclick="ctrl('pause')" __PAUSE_DISABLED__>⏸ 일시정지</button>
@@ -105,7 +117,13 @@ async function poll() {
     document.getElementById('pauseBtn').disabled = !hasTopic || data.finished || data.stopped || data.paused;
     document.getElementById('resumeBtn').disabled = !hasTopic || data.finished || data.stopped || !data.paused;
     document.getElementById('stopBtn').disabled = !hasTopic || data.finished || data.stopped;
+    document.getElementById('approveBanner').style.display =
+      (data.awaiting_approval && !data.stopped) ? 'block' : 'none';
   } catch (e) {}
+}
+async function approveWork() {
+  await fetch('/approve', {method:'POST'});
+  poll();
 }
 async function submitTopic() {
   const ta = document.getElementById('topicInput');

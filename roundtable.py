@@ -162,67 +162,97 @@ ROLES = "백엔드(로직/API/데이터), 프론트엔드(UI/사용자 경험), 
 # 최종 보고(팀장에게 결론 전달)를 맡을 담당자 — 세 명 중 마지막에 말하는 사람으로 고정
 REPORTER_AGENT = "claude"
 
-# (agent, phase, instruction) — instruction은 지금까지의 대화 기록 뒤에 붙는다
+# 확인 요청 단계의 phase 이름 — worker_loop가 이 문자열로 승인 대기 상태를 감지한다
+CONFIRM_PHASE = "확인 요청"
+
+# (agent, phase, instruction, cli_mode) — instruction은 지금까지의 대화 기록 뒤에 붙는다.
+# cli_mode는 이 턴에서 실제로 파일을 쓸 수 있게 할지("coding") 읽기 전용으로 할지
+# ("discussion")를 결정한다 — 세션 모드(토론/코딩)와는 별개다.
 DISCUSSION_STEPS = [
     ("codex", "강점 이야기",
-     "지금부터 Antigravity, Claude Code와 함께 셋이서 하나의 프로젝트를 진행할 거야. "
-     "역할을 나누기 전에, 네가 가장 자신 있는 영역이 뭐인지 솔직하게 말해줘 (예: 백엔드 "
-     "로직, API 설계, 데이터 처리, 프론트엔드 UI, 기획/아이디어 정리 등). 이유도 함께 "
-     "3~5문장으로 간결하게 대답해."),
+     "지금부터 Antigravity, Claude Code와 함께 셋이서 이 프로젝트를 다룰 거야. 먼저 이 "
+     "프로젝트 폴더의 구조와 주요 파일들을 살펴봐 (아직 수정하지 말고 읽기만 해). 그 다음, "
+     "그 구조를 근거로 네가 가장 자신 있는 영역이 뭐인지 솔직하게 말해줘 (예: 백엔드 로직, "
+     "API 설계, 데이터 처리, 프론트엔드 UI, 기획/아이디어 정리 등). 이유도 함께 3~5문장으로 "
+     "간결하게 대답해.", "discussion"),
     ("antigravity", "강점 이야기",
-     "너는 Antigravity야. 지금까지의 대화를 참고해서, 네가 가장 자신 있는 영역이 뭐인지 "
-     "솔직하게 말해줘. Codex 발언에 동의하지 않는 부분이 있으면 반박해도 좋고, 겹치지 "
-     "않는 부분이 있다면 강조해도 좋아. 이유도 함께 3~5문장으로 간결하게 대답해."),
+     "너는 Antigravity야. 먼저 이 프로젝트 폴더의 구조와 주요 파일들을 살펴봐 (아직 "
+     "수정하지 말고 읽기만 해). 지금까지의 대화도 참고해서, 네가 가장 자신 있는 영역이 "
+     "뭐인지 솔직하게 말해줘. Codex 발언에 동의하지 않는 부분이 있으면 반박해도 좋고, "
+     "겹치지 않는 부분이 있다면 강조해도 좋아. 이유도 함께 3~5문장으로 간결하게 대답해.",
+     "discussion"),
     ("claude", "강점 이야기",
-     "너는 Claude Code야. 지금까지의 대화를 참고해서, 네가 가장 자신 있는 영역이 뭐인지 "
-     "솔직하게 말해줘. Codex나 Antigravity 발언에 동의하지 않으면 반박해도 좋고, 겹치지 "
-     "않는 부분이 있다면 강조해도 좋아. 이유도 함께 3~5문장으로 간결하게 대답해."),
+     "너는 Claude Code야. 먼저 이 프로젝트 폴더의 구조와 주요 파일들을 살펴봐 (아직 "
+     "수정하지 말고 읽기만 해). 지금까지의 대화도 참고해서, 네가 가장 자신 있는 영역이 "
+     "뭐인지 솔직하게 말해줘. Codex나 Antigravity 발언에 동의하지 않으면 반박해도 좋고, "
+     "겹치지 않는 부분이 있다면 강조해도 좋아. 이유도 함께 3~5문장으로 간결하게 대답해.",
+     "discussion"),
     ("codex", "역할 선언",
      f"지금까지의 대화를 참고해서, 이제 역할을 정하자: 셋이서 {ROLES} 중 서로 겹치지 "
      "않게 하나씩 맡아야 해. 네가 어떤 역할을 맡고 싶은지, 그 이유와 함께 명확하게 "
-     "선언해줘. 2~4문장."),
+     "선언해줘. 2~4문장.", "discussion"),
     ("antigravity", "역할 선언",
      f"Codex가 역할을 선언했어. 동의하지 않으면 반박하고 다른 역할을 제안해도 된다. "
      f"지금까지의 대화를 참고해서, 남은 역할({ROLES} 중 Codex가 고르지 않은 것) 중 "
-     "하나를 명확하게 선언해줘. Codex와 겹치지 않게. 2~4문장."),
+     "하나를 명확하게 선언해줘. Codex와 겹치지 않게. 2~4문장.", "discussion"),
     ("claude", "역할 확정",
      "지금까지의 대화를 참고해서, 너는 Codex와 Antigravity가 고르지 않은 마지막 역할을 "
      "맡거나, 의견이 갈렸다면 반박·조율해서 최종적으로 네 역할을 선언해줘. 겹치지 않게 "
-     "명확히 말해. 2~4문장."),
+     "명확히 말해. 2~4문장.", "discussion"),
 ]
 
 REPORT_STEP = (
     REPORTER_AGENT, "최종 보고",
     "지금까지 세 명이 나눈 강점 이야기와 역할 선언을 정리해서, 팀장(사용자)에게 바로 "
     "보고해. 누가 어떤 역할을 맡았는지, 의견이 갈렸다면 어떻게 정리됐는지, 그리고 다음에 "
-    "무엇부터 시작하면 좋을지 실행 가능한 결론으로 3~6문장 요약해줘.",
+    "무엇부터 시작하면 좋을지 실행 가능한 결론으로 3~6문장 요약해줘.", "discussion",
 )
 
-# 코딩 모드: 위 강점/역할 단계 뒤에 실제로 각자 역할에 맞는 작업을 코드에 반영한다
+# 코딩 모드 전용: 역할 확정 뒤 "아직 수정하지 않고" 개선안을 먼저 제안하는 단계.
+# 실제 코드 반영은 사용자가 승인한 뒤(/approve)에만 진행된다.
+PROPOSAL_STEPS = [
+    ("codex", "개선안 제안",
+     "네 역할에 맞게, 프로젝트 구조를 다시 확인하고 구체적으로 어떤 파일을 어떻게 "
+     "개선/수정할지 제안해. 아직 실제로 파일을 수정하지 마 — 계획만 3~6개 항목으로 "
+     "구체적으로 말해.", "discussion"),
+    ("antigravity", "개선안 제안",
+     "Codex의 제안을 참고해서, 겹치지 않게 네 역할 몫의 개선/수정 계획을 구체적으로 "
+     "제안해. 동의하지 않는 부분이 있으면 반박해도 된다. 아직 실제로 파일을 수정하지 "
+     "마 — 계획만 3~6개 항목으로 말해.", "discussion"),
+    ("claude", CONFIRM_PHASE,
+     "Codex와 Antigravity의 제안을 참고해서, 겹치지 않게 네 역할 몫의 개선/수정 계획도 "
+     "덧붙이고, 셋의 계획 전체를 하나로 정리해서 팀장(사용자)에게 실제로 진행해도 될지 "
+     "확인을 요청하는 메시지를 작성해. 무엇을 어떻게 바꿀지 항목별로 명확하게 정리해. "
+     "아직 실제로 파일을 수정하지 마.", "discussion"),
+]
+
+# 사용자가 승인한 뒤에만 실행되는 실제 코드 반영 단계
 CODING_WORK_STEPS = [
     ("codex", "작업 수행",
-     "지금까지 정해진 네 역할에 맞는 작업을 이 프로젝트 코드에 실제로 반영해. 파일을 "
-     "만들거나 수정해도 좋다. 작업이 끝나면 어떤 파일을 어떻게 바꿨는지 요약해서 보고해."),
+     "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을 이 프로젝트 코드에 실제로 "
+     "반영해. 파일을 만들거나 수정해도 좋다. 작업이 끝나면 어떤 파일을 어떻게 바꿨는지 "
+     "요약해서 보고해.", "coding"),
     ("antigravity", "작업 수행",
-     "지금까지 정해진 네 역할과 Codex가 방금 한 작업을 참고해서, 겹치거나 충돌하지 않게 "
-     "네 몫의 작업을 이 프로젝트 코드에 실제로 반영해. 동의하지 않는 접근이 있으면 반박하고 "
-     "다르게 해도 된다. 작업이 끝나면 어떤 파일을 어떻게 바꿨는지 요약해서 보고해."),
+     "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을, Codex가 방금 한 작업과 "
+     "겹치거나 충돌하지 않게 이 프로젝트 코드에 실제로 반영해. 작업이 끝나면 어떤 파일을 "
+     "어떻게 바꿨는지 요약해서 보고해.", "coding"),
     ("claude", "작업 수행",
-     "지금까지 정해진 네 역할과 Codex·Antigravity가 방금 한 작업을 참고해서, 겹치거나 "
-     "충돌하지 않게 네 몫의 작업을 이 프로젝트 코드에 실제로 반영해. 작업이 끝나면 어떤 "
-     "파일을 어떻게 바꿨는지 요약해서 보고해."),
+     "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을, Codex·Antigravity가 방금 "
+     "한 작업과 겹치거나 충돌하지 않게 이 프로젝트 코드에 실제로 반영해. 작업이 끝나면 "
+     "어떤 파일을 어떻게 바꿨는지 요약해서 보고해.", "coding"),
 ]
 
 CODING_REPORT_STEP = (
     REPORTER_AGENT, "최종 보고",
     "지금까지 세 명이 각자 실제로 반영한 코드 변경사항을 정리해서, 팀장(사용자)에게 "
     "무엇이 어떻게 바뀌었는지, 다음에 뭘 하면 좋을지 실행 가능한 결론으로 요약해줘.",
+    "discussion",
 )
 
 
-def steps_for_mode(mode: str) -> list[tuple[str, str, str]]:
+def steps_for_mode(mode: str) -> list[tuple[str, str, str, str]]:
     if mode == "coding":
-        return DISCUSSION_STEPS + CODING_WORK_STEPS + [CODING_REPORT_STEP]
+        return DISCUSSION_STEPS + PROPOSAL_STEPS + CODING_WORK_STEPS + [CODING_REPORT_STEP]
     return DISCUSSION_STEPS + [REPORT_STEP]
 
 
@@ -471,15 +501,16 @@ def build_transcript(messages: list[dict]) -> str:
 
 STATE_LOCK = threading.Lock()
 STATE: dict = load_state()
-CONTROL = {"paused": False, "stopped": False, "worker_running": False}
+CONTROL = {"paused": False, "stopped": False, "worker_running": False, "awaiting_approval": False}
 
 
 def bubble_html(m: dict) -> str:
     agent = AGENTS[m["agent"]]
     side = agent["side"]
-    report_class = " report" if m.get("phase") == "최종 보고" else ""
+    phase = m.get("phase", "")
+    highlight_class = " report" if phase == "최종 보고" else (" confirm" if phase == CONFIRM_PHASE else "")
     return f"""
-    <div class="row {side}{report_class}">
+    <div class="row {side}{highlight_class}">
       <div class="bubble" style="--accent:{agent['color']}">
         <div class="meta"><span class="name">{html.escape(agent['label'])}</span><span class="phase">{html.escape(m.get('phase', ''))}</span><span class="time">{html.escape(m['time'])}</span></div>
         <div class="text">{html.escape(m['text']).replace(chr(10), '<br>')}</div>
@@ -492,6 +523,8 @@ def status_text() -> str:
         return "완료"
     if CONTROL["stopped"]:
         return "중단됨"
+    if CONTROL["awaiting_approval"]:
+        return "\U0001f6d1 사용자 승인 대기 중"
     if CONTROL["paused"]:
         return "일시정지"
     return "진행 중..."
@@ -514,7 +547,7 @@ def add_message(agent: str, phase: str, text: str) -> None:
 # 워커 (에이전트 호출 루프) — 백그라운드 스레드
 # ──────────────────────────────────────────
 
-def run_step(agent: str, phase: str, instruction: str, mode: str) -> None:
+def run_step(agent: str, phase: str, instruction: str, cli_mode: str) -> None:
     label = AGENTS[agent]["label"]
     separator(f"{label} — {phase}")
     with STATE_LOCK:
@@ -525,9 +558,9 @@ def run_step(agent: str, phase: str, instruction: str, mode: str) -> None:
     body = f"지금까지의 대화 기록:\n\n{transcript}\n\n---\n\n{instruction}" if transcript else instruction
     prompt = f"{team_prompt}\n\n---\n\n{topic_line}{body}"
 
-    print(f"\U0001f914 {label} 생각 중... (입력 약 {len(prompt)}자)")
+    print(f"\U0001f914 {label} 생각 중... (입력 약 {len(prompt)}자, cli_mode={cli_mode})")
     t0 = time.time()
-    text = ASK_FUNCS[agent](prompt, mode)
+    text = ASK_FUNCS[agent](prompt, cli_mode)
     elapsed = time.time() - t0
     est_tokens = (len(prompt) + len(text)) // 4
     print(f"✅ {label} 응답 완료 — {elapsed:.1f}초, 추정 토큰 ~{est_tokens} "
@@ -553,12 +586,18 @@ def worker_loop() -> None:
             if CONTROL["stopped"]:
                 break
 
-            agent, phase, instruction = steps[step_index]
-            run_step(agent, phase, instruction, mode)
+            agent, phase, instruction, cli_mode = steps[step_index]
+            run_step(agent, phase, instruction, cli_mode)
 
             with STATE_LOCK:
                 STATE["step_index"] += 1
                 save_state(STATE)
+
+            if phase == CONFIRM_PHASE and not CONTROL["stopped"]:
+                CONTROL["awaiting_approval"] = True
+                separator("사용자 승인 대기 중 — 대시보드에서 승인해야 코딩이 진행됩니다")
+                while CONTROL["awaiting_approval"] and not CONTROL["stopped"]:
+                    time.sleep(0.3)
     finally:
         with STATE_LOCK:
             finished = STATE["step_index"] >= len(steps) and not CONTROL["stopped"]
@@ -686,6 +725,7 @@ def state_json_payload() -> dict:
         "finished": finished,
         "paused": CONTROL["paused"],
         "stopped": CONTROL["stopped"],
+        "awaiting_approval": CONTROL["awaiting_approval"],
         "topic": html.escape(topic) if topic else "",
         "mode_label": MODE_LABELS.get(mode, mode),
         "conn_html": connection_status_html(),
@@ -762,6 +802,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 STATE.update(new_state())
                 save_state(STATE)
             CONTROL["paused"] = False
+            CONTROL["awaiting_approval"] = False
             CONTROL["stopped"] = True  # 혹시 워커가 돌고 있었다면 다음 체크포인트에서 멈추게
             self._send_html(render_dashboard())
             return
@@ -787,6 +828,11 @@ class RoundtableHandler(BaseHTTPRequestHandler):
         if self.path == "/stop":
             CONTROL["stopped"] = True
             CONTROL["paused"] = False
+            self._send_json(state_json_payload())
+            return
+
+        if self.path == "/approve":
+            CONTROL["awaiting_approval"] = False
             self._send_json(state_json_payload())
             return
 
