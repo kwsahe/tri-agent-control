@@ -38,6 +38,7 @@ Agent Roundtable — Codex, Antigravity & Claude Code
 import html
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -420,11 +421,15 @@ def ask_claude(prompt: str, mode: str = "discussion") -> str:
 
 def ask_antigravity(prompt: str, mode: str = "discussion") -> str:
     # agy는 Go 스타일 플래그라 --print 자체가 프롬프트 값을 먹는다. 반드시 마지막에 와야 함.
+    # subprocess의 cwd만으로는 agy가 프로젝트 폴더를 인식하지 못하고 자기 내부의 기본
+    # scratch 워크스페이스를 본다 — --add-dir로 명시적으로 작업 폴더를 알려줘야 한다.
+    project_path = load_project_path()
+    base_args = ["--add-dir", str(project_path)]
     if mode == "coding":
-        args = ["--mode", "accept-edits", "--print", prompt]
+        args = base_args + ["--mode", "accept-edits", "--print", prompt]
     else:
-        args = ["--mode", "plan", "--sandbox", "--print", prompt]
-    result = run_cli("Antigravity", AGY_CMD, args, timeout=AGY_TIMEOUT, cwd=load_project_path())
+        args = base_args + ["--mode", "plan", "--sandbox", "--print", prompt]
+    result = run_cli("Antigravity", AGY_CMD, args, timeout=AGY_TIMEOUT, cwd=project_path)
     return _finalize_cli_result("Antigravity", result)
 
 
@@ -556,6 +561,72 @@ STATE: dict = load_state()
 CONTROL = {"paused": False, "stopped": False, "worker_running": False, "awaiting_approval": False}
 
 
+# ──────────────────────────────────────────
+# 아주 가벼운 마크다운 → HTML 변환 (외부 의존성 없이 굵게/목록/링크만 처리)
+# ──────────────────────────────────────────
+
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(((?:https?|file)://[^\s)]+)\)")
+_MD_NUM_LIST_RE = re.compile(r"^(\d+)\.\s+(.*)$")
+_MD_BULLET_LIST_RE = re.compile(r"^[-*]\s+(.*)$")
+_MD_HEADER_RE = re.compile(r"^#{1,6}\s+(.*)$")
+
+
+def _md_inline(escaped_line: str) -> str:
+    """이미 html.escape된 한 줄 안에서 인라인 서식만 치환한다."""
+    escaped_line = _MD_LINK_RE.sub(r'<a href="\2" target="_blank" rel="noopener">\1</a>', escaped_line)
+    escaped_line = _MD_BOLD_RE.sub(r"<strong>\1</strong>", escaped_line)
+    escaped_line = _MD_INLINE_CODE_RE.sub(r"<code>\1</code>", escaped_line)
+    return escaped_line
+
+
+def render_text_html(raw: str) -> str:
+    """LLM이 흔히 쓰는 마크다운(굵게/번호목록/불릿목록/링크/헤더)을 안전하게 HTML로 렌더링."""
+    escaped = html.escape(raw)
+    parts: list[str] = []
+    list_buffer: list[tuple[str, str | None]] = []  # (내용, 번호목록이면 원래 번호)
+    list_tag: str | None = None
+
+    def flush_list() -> None:
+        nonlocal list_buffer, list_tag
+        if list_buffer:
+            items = "".join(
+                f'<li value="{num}">{_md_inline(text)}</li>' if num else f"<li>{_md_inline(text)}</li>"
+                for text, num in list_buffer
+            )
+            parts.append(f"<{list_tag}>{items}</{list_tag}>")
+            list_buffer = []
+            list_tag = None
+
+    for line in escaped.split("\n"):
+        stripped = line.strip()
+        num_match = _MD_NUM_LIST_RE.match(stripped)
+        bullet_match = _MD_BULLET_LIST_RE.match(stripped)
+        header_match = _MD_HEADER_RE.match(stripped)
+
+        if num_match:
+            if list_tag != "ol":
+                flush_list()
+                list_tag = "ol"
+            list_buffer.append((num_match.group(2), num_match.group(1)))
+        elif bullet_match:
+            if list_tag != "ul":
+                flush_list()
+                list_tag = "ul"
+            list_buffer.append((bullet_match.group(1), None))
+        else:
+            flush_list()
+            if header_match:
+                parts.append(f"<strong>{_md_inline(header_match.group(1))}</strong><br>")
+            elif stripped == "":
+                parts.append("<br>")
+            else:
+                parts.append(_md_inline(line) + "<br>")
+    flush_list()
+    return "".join(parts)
+
+
 def bubble_html(m: dict) -> str:
     agent = AGENTS[m["agent"]]
     side = agent["side"]
@@ -576,7 +647,7 @@ def bubble_html(m: dict) -> str:
     <div class="row {side}{highlight_class}">
       <div class="bubble" style="--accent:{agent['color']}">
         <div class="meta"><span class="name">{html.escape(agent['label'])}</span><span class="phase">{html.escape(m.get('phase', ''))}</span><span class="time">{html.escape(m['time'])}</span></div>
-        <div class="text">{html.escape(m['text']).replace(chr(10), '<br>')}</div>
+        <div class="text">{render_text_html(m['text'])}</div>
         {stats_html}
       </div>
     </div>"""
