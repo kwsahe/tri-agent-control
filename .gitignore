@@ -1,0 +1,13 @@
+# 실행 중 생성/갱신되는 세션 상태·로그 (기기마다 다름, 커밋 안 함)
+roundtable_state.json
+roundtable.html
+roundtable_log.md
+CODEX_Profile.md
+ANTIGRAVITY_Profile.md
+CLAUDE_Profile.md
+
+# 기기별 로컬 설정 (경로가 사람마다 다름)
+PROJECT_PATH.txt
+
+__pycache__/
+*.pyc

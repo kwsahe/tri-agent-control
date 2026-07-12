@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Agent Roundtable — Codex, Antigravity & Claude Code</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 40px 16px; min-height: 100vh;
+    background: radial-gradient(circle at 50% 0%, #1b1f2a 0%, #0d0f14 60%);
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    color: #e8e8ec;
+  }
+  h1 { text-align: center; font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  .status { text-align: center; color: #9a9aa5; font-size: 13px; margin-bottom: 12px; }
+
+  .conn {
+    max-width: 760px; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;
+    gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: #c7cad3;
+    background: #181c24; border: 1px solid #2a2f3a; border-radius: 10px; padding: 8px 14px;
+  }
+  .conn-item { display: inline-flex; align-items: center; gap: 5px; }
+  .conn-item small { color: #7a7f8c; }
+
+  .topic {
+    max-width: 760px; margin: 0 auto 20px; text-align: center; font-size: 13.5px;
+    color: #c7cad3; background: #181c24; border: 1px solid #2a2f3a; border-radius: 10px; padding: 10px 16px;
+  }
+  .feed { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+  .row { display: flex; }
+  .row.left { justify-content: flex-start; }
+  .row.right { justify-content: flex-end; }
+  .row.center { justify-content: center; }
+  .bubble {
+    max-width: 78%; background: #181c24; border: 1px solid #2a2f3a;
+    border-left: 3px solid var(--accent); border-radius: 12px; padding: 12px 16px;
+  }
+  .row.right .bubble { border-left: none; border-right: 3px solid var(--accent); }
+  .row.center .bubble { border-left: none; border: 1px dashed var(--accent); max-width: 90%; }
+  .row.report .bubble { border: 2px solid #f5c542; background: #23200f; max-width: 90%; }
+  .mode-choice { display: flex; gap: 16px; font-size: 13px; color: #c7cad3; margin: 10px 0 4px; }
+  .mode-choice label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .meta { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; }
+  .name { font-weight: 700; font-size: 13px; color: var(--accent); }
+  .phase { font-size: 11px; color: #7a7f8c; background: #22262f; padding: 2px 8px; border-radius: 999px; }
+  .time { font-size: 11px; color: #5c6070; margin-left: auto; }
+  .text { font-size: 14.5px; line-height: 1.55; white-space: pre-wrap; }
+
+  .panel {
+    max-width: 760px; margin: 20px auto 0; background: #181c24; border: 1px solid #2a2f3a;
+    border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 12px;
+  }
+  .panel-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    border: none; border-radius: 8px; padding: 10px 16px; font-size: 13.5px; font-weight: 600;
+    cursor: pointer; color: #0d0f14; background: #5b8def;
+  }
+  button.secondary { background: #2a2f3a; color: #e8e8ec; }
+  button.danger { background: #e06060; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  textarea {
+    width: 100%; box-sizing: border-box; min-height: 70px; resize: vertical; background: #0d0f14;
+    border: 1px solid #2a2f3a; border-radius: 8px; color: #e8e8ec; font-size: 14px; padding: 10px;
+    font-family: inherit;
+  }
+</style>
+</head>
+<body>
+  <h1>🗣️ Codex <span style="color:#5c6070">·</span> Antigravity <span style="color:#5c6070">·</span> Claude Code</h1>
+  <div class="status" id="status">__STATUS__</div>
+  <div class="conn" id="conn">
+    __CONN_HTML__
+    <button class="secondary" onclick="recheck()" style="padding:4px 10px;font-size:12px">다시 확인</button>
+  </div>
+  <div id="topicSection">__TOPIC_SECTION__</div>
+  <div class="feed" id="feed">__FEED__</div>
+
+  <div class="panel">
+    <div class="panel-row">
+      <button id="pauseBtn" onclick="ctrl('pause')" __PAUSE_DISABLED__>⏸ 일시정지</button>
+      <button id="resumeBtn" class="secondary" onclick="ctrl('resume')" __RESUME_DISABLED__>▶ 재개</button>
+      <button id="stopBtn" class="danger" onclick="stopSession()" __STOP_DISABLED__>■ 중단하기</button>
+      <button class="secondary" onclick="restartSession()">⟳ 새 세션</button>
+    </div>
+    <div class="panel-row" style="flex-direction:column">
+      <textarea id="msgText" placeholder="대화에 끼어들어 메시지를 보내세요 (다음 에이전트가 참고합니다)" __NO_TOPIC__></textarea>
+      <button onclick="sendMessage()" __NO_TOPIC__>내 메시지 보내기</button>
+    </div>
+  </div>
+
+<script>
+async function poll() {
+  try {
+    const r = await fetch('/state.json');
+    const data = await r.json();
+    document.getElementById('feed').innerHTML = data.feed_html;
+    document.getElementById('status').textContent = data.status;
+    document.getElementById('conn').innerHTML = data.conn_html +
+      '<button class="secondary" onclick="recheck()" style="padding:4px 10px;font-size:12px">다시 확인</button>';
+    if (data.topic) {
+      document.getElementById('topicSection').innerHTML =
+        '<div class="topic">📌 ' + data.topic + ' <span style="opacity:.6">· ' + data.mode_label + '</span></div>';
+    }
+    const hasTopic = !!data.topic;
+    document.getElementById('pauseBtn').disabled = !hasTopic || data.finished || data.stopped || data.paused;
+    document.getElementById('resumeBtn').disabled = !hasTopic || data.finished || data.stopped || !data.paused;
+    document.getElementById('stopBtn').disabled = !hasTopic || data.finished || data.stopped;
+  } catch (e) {}
+}
+async function submitTopic() {
+  const ta = document.getElementById('topicInput');
+  const topic = ta.value.trim();
+  if (!topic) return;
+  const modeEl = document.querySelector('input[name="mode"]:checked');
+  const mode = modeEl ? modeEl.value : 'discussion';
+  await fetch('/topic', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'topic=' + encodeURIComponent(topic) + '&mode=' + encodeURIComponent(mode)});
+  location.reload();
+}
+async function recheck() {
+  document.getElementById('conn').innerHTML = '<span class="conn-item">⏳ 확인 중...</span>';
+  await fetch('/preflight', {method:'POST'});
+  poll();
+}
+async function ctrl(action) {
+  await fetch('/' + action, {method:'POST'});
+  poll();
+}
+async function stopSession() {
+  if (!confirm('중단할까요? 현재 진행 중인 턴이 끝나면 멈춥니다.')) return;
+  await fetch('/stop', {method:'POST'});
+  poll();
+}
+async function restartSession() {
+  if (!confirm('현재 세션 기록을 지우고 새로 시작할까요?')) return;
+  await fetch('/restart', {method:'POST'});
+  location.reload();
+}
+async function sendMessage() {
+  const ta = document.getElementById('msgText');
+  const text = ta.value.trim();
+  if (!text) return;
+  await fetch('/message', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'text=' + encodeURIComponent(text)});
+  ta.value = '';
+  poll();
+}
+setInterval(poll, 2000);
+poll();
+</script>
+</body>
+</html>
