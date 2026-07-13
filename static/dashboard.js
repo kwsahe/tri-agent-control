@@ -2,9 +2,9 @@ let viewingId = null;
 let lastVersion = null;
 
 const AGENTS = {
-  codex: { label: "Codex", color: "#4f8cff" },
-  antigravity: { label: "Antigravity", color: "#a66cff" },
-  claude: { label: "Claude Code", color: "#ff8a3d" },
+  codex: { label: "Codex", color: "#4f8cff", avatar: "/static/agents/codex.png" },
+  antigravity: { label: "Antigravity", color: "#a66cff", avatar: "/static/agents/antigravity.png" },
+  claude: { label: "Claude Code", color: "#ff8a3d", avatar: "/static/agents/claude.svg" },
 };
 
 function $(id) {
@@ -71,10 +71,26 @@ function renderAgentStack(data) {
     const isOn = enabled.includes(key) || (data.enabled_agents_label || "").includes(info.label);
     const cls = `agent-chip${isOn ? "" : " off"}${active === key ? " active" : ""}`;
     const state = active === key ? (data.active_phase || "작업 중") : (isOn ? "대기" : "꺼짐");
+    const model = (data.agent_setting_labels || {})[key] || "CLI 기본값";
     return `<div class="${cls}" style="--agent-color:${info.color}">
-      <strong>${info.label}</strong><span>${escapeHtml(state)}</span>
+      <div class="agent-chip-identity"><img src="${info.avatar}" alt=""><div><strong>${info.label}</strong><small>${escapeHtml(model)}</small></div></div>
+      <span>${escapeHtml(state)}</span>
     </div>`;
   }).join("");
+}
+
+function syncAgentModelCards() {
+  document.querySelectorAll("[data-agent-card]").forEach((card) => {
+    const checkbox = card.querySelector('input[name="agent"]');
+    if (!checkbox || checkbox.dataset.bound === "true") return;
+    const update = () => {
+      card.classList.toggle("off", !checkbox.checked);
+      card.querySelectorAll("select").forEach((select) => { select.disabled = !checkbox.checked; });
+    };
+    checkbox.dataset.bound = "true";
+    checkbox.addEventListener("change", update);
+    update();
+  });
 }
 
 function syncTargetControls(data) {
@@ -214,7 +230,7 @@ function updateInspector(data) {
     ? data.enabled_agents
     : Object.keys(AGENTS).filter((key) => (data.enabled_agents_label || "").includes(AGENTS[key].label));
   const active = data.active_agent;
-  const agentStackKey = `${enabled.join(",")}_${active}_${data.active_phase}`;
+  const agentStackKey = `${enabled.join(",")}_${active}_${data.active_phase}_${JSON.stringify(data.agent_setting_labels || {})}`;
   if (lastState.agentStackKey !== agentStackKey) {
     renderAgentStack(data);
     lastState.agentStackKey = agentStackKey;
@@ -253,9 +269,30 @@ function updateThinking(data) {
   box.style.display = "flex";
 }
 
+function updateFeedHtml(feedHtml) {
+  const feed = $("feed");
+  const scroller = $("conversationScroll");
+  const previousRows = feed.querySelectorAll(".row").length;
+  const previousTop = scroller.scrollTop;
+  const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+  const followLatest = previousRows === 0 || distanceFromBottom < 120;
+
+  feed.innerHTML = feedHtml;
+  const rows = feed.querySelectorAll(".row");
+  if (previousRows > 0 && rows.length > previousRows) {
+    for (let index = previousRows; index < rows.length; index += 1) {
+      rows[index].classList.add("is-new");
+    }
+  }
+
+  requestAnimationFrame(() => {
+    scroller.scrollTop = followLatest ? scroller.scrollHeight : previousTop;
+  });
+}
+
 function applyState(data) {
   if (lastState.feed_html !== data.feed_html) {
-    $("feed").innerHTML = data.feed_html;
+    updateFeedHtml(data.feed_html);
     lastState.feed_html = data.feed_html;
   }
   if (lastState.status !== data.status) {
@@ -270,6 +307,7 @@ function applyState(data) {
   const currentTopicHtml = data.topic_section_html || renderTopic(data);
   if (lastState.topic_html !== currentTopicHtml) {
     $("topicSection").innerHTML = currentTopicHtml;
+    syncAgentModelCards();
     lastState.topic_html = currentTopicHtml;
   }
 
@@ -337,6 +375,9 @@ async function viewSession(id) {
     $("controlPanel").style.display = "none";
     $("approveBanner").style.display = "none";
     $("thinkingIndicator").style.display = "none";
+    $("conversationScroll").scrollTop = 0;
+    lastState.feed_html = null;
+    lastState.topic_html = null;
     updateInspector(data);
   }
   await loadSessions();
@@ -344,6 +385,8 @@ async function viewSession(id) {
 
 function backToLive() {
   viewingId = null;
+  lastState.feed_html = null;
+  lastState.topic_html = null;
   $("viewingBanner").style.display = "none";
   $("controlPanel").style.display = "flex";
   poll(true);
@@ -413,11 +456,18 @@ async function submitTopic() {
     alert("최소 한 명의 에이전트를 선택해주세요.");
     return;
   }
-  const body = `topic=${encodeURIComponent(topic)}&mode=${encodeURIComponent(mode)}${agents.map((agent) => `&agent=${encodeURIComponent(agent)}`).join("")}`;
+  const params = new URLSearchParams({ topic, mode });
+  agents.forEach((agent) => params.append("agent", agent));
+  Object.keys(AGENTS).forEach((agent) => {
+    const model = document.querySelector(`[name="model_${agent}"]`);
+    const effort = document.querySelector(`[name="effort_${agent}"]`);
+    if (model) params.set(`model_${agent}`, model.value);
+    if (effort) params.set(`effort_${agent}`, effort.value);
+  });
   await fetch("/topic", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+    body: params.toString(),
   });
   location.reload();
 }

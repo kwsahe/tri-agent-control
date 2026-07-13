@@ -222,10 +222,40 @@ PROJECT_SNAPSHOT_MAX_ENTRIES = int(os.environ.get("ROUNDTABLE_SNAPSHOT_MAX_ENTRI
 APPROVAL_TOKEN = "APPROVE"
 
 AGENTS = {
-    "codex": {"label": "Codex", "color": "#4f8cff", "side": "left", "avatar": "/static/agents/codex.svg"},
-    "antigravity": {"label": "Antigravity", "color": "#a66cff", "side": "center", "avatar": "/static/agents/antigravity.svg"},
+    "codex": {"label": "Codex", "color": "#4f8cff", "side": "left", "avatar": "/static/agents/codex.png"},
+    "antigravity": {"label": "Antigravity", "color": "#a66cff", "side": "center", "avatar": "/static/agents/antigravity.png"},
     "claude": {"label": "Claude Code", "color": "#ff8a3d", "side": "right", "avatar": "/static/agents/claude.svg"},
     "user": {"label": "나 (개입)", "color": "#42c991", "side": "center", "avatar": "/static/agents/user.svg"},
+}
+
+MODEL_CATALOG = {
+    "codex": {
+        "models": [
+            ("", "CLI 기본값"),
+            ("gpt-5.6-codex", "GPT-5.6 Codex"),
+            ("gpt-5.5-codex", "GPT-5.5 Codex"),
+            ("gpt-5.4", "GPT-5.4"),
+        ],
+        "efforts": [("", "기본"), ("low", "낮음"), ("medium", "중간"), ("high", "높음"), ("xhigh", "매우 높음")],
+    },
+    "claude": {
+        "models": [("", "CLI 기본값"), ("sonnet", "Sonnet"), ("opus", "Opus"), ("fable", "Fable")],
+        "efforts": [("", "기본"), ("low", "낮음"), ("medium", "중간"), ("high", "높음"), ("xhigh", "매우 높음"), ("max", "최대")],
+    },
+    "antigravity": {
+        "models": [
+            ("", "CLI 기본값"),
+            ("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash · 낮음"),
+            ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash · 중간"),
+            ("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash · 높음"),
+            ("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro · 낮음"),
+            ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro · 높음"),
+            ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet 4.6 · Thinking"),
+            ("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 · Thinking"),
+            ("GPT-OSS 120B (Medium)", "GPT-OSS 120B · 중간"),
+        ],
+        "efforts": [],
+    },
 }
 
 ROLES = "백엔드(로직/API/데이터), 프론트엔드(UI/사용자 경험), 기획·아이디어 정리(설계/전체 조율)"
@@ -322,6 +352,40 @@ CODING_REPORT_STEP = (
 
 
 AGENT_ORDER = ["codex", "antigravity", "claude"]
+
+
+def normalize_agent_settings(settings: dict | None) -> dict:
+    source = settings if isinstance(settings, dict) else {}
+    normalized = {}
+    for agent in AGENT_ORDER:
+        catalog = MODEL_CATALOG[agent]
+        raw = source.get(agent, {}) if isinstance(source.get(agent, {}), dict) else {}
+        valid_models = {value for value, _label in catalog["models"]}
+        valid_efforts = {value for value, _label in catalog["efforts"]}
+        model = raw.get("model", "")
+        effort = raw.get("effort", "")
+        normalized[agent] = {
+            "model": model if model in valid_models else "",
+            "effort": effort if effort in valid_efforts else "",
+        }
+    return normalized
+
+
+def agent_setting_label(agent: str, settings: dict | None) -> str:
+    setting = normalize_agent_settings(settings).get(agent, {})
+    catalog = MODEL_CATALOG[agent]
+    model_labels = dict(catalog["models"])
+    effort_labels = dict(catalog["efforts"])
+    model_label = model_labels.get(setting.get("model", ""), "CLI 기본값")
+    effort = setting.get("effort", "")
+    if effort and catalog["efforts"]:
+        return f"{model_label} · {effort_labels.get(effort, effort)}"
+    return model_label
+
+
+def selected_agent_setting(agent: str) -> dict:
+    state = globals().get("STATE", {})
+    return normalize_agent_settings(state.get("agent_settings", {}))[agent]
 
 
 def normalize_enabled_agents(enabled_agents: list[str] | None) -> list[str]:
@@ -596,10 +660,17 @@ def _finalize_cli_result(tool_name: str, result) -> str:
 
 def ask_codex(prompt: str, mode: str = "discussion") -> str:
     sandbox = "workspace-write" if mode == "coding" else "read-only"
+    setting = selected_agent_setting("codex")
+    args = ["exec"]
+    if setting["model"]:
+        args.extend(["--model", setting["model"]])
+    if setting["effort"]:
+        args.extend(["--config", f'model_reasoning_effort="{setting["effort"]}"'])
+    args.extend(["--sandbox", sandbox, "--skip-git-repo-check", "-"])
     result = run_cli(
         "Codex",
         CODEX_CMD,
-        ["exec", "--sandbox", sandbox, "--skip-git-repo-check", "-"],
+        args,
         timeout=CODEX_TIMEOUT,
         cwd=load_project_path(),
         input_text=prompt,
@@ -609,10 +680,17 @@ def ask_codex(prompt: str, mode: str = "discussion") -> str:
 
 def ask_claude(prompt: str, mode: str = "discussion") -> str:
     permission_mode = "acceptEdits" if mode == "coding" else "plan"
+    setting = selected_agent_setting("claude")
+    args = ["--print"]
+    if setting["model"]:
+        args.extend(["--model", setting["model"]])
+    if setting["effort"]:
+        args.extend(["--effort", setting["effort"]])
+    args.extend(["--permission-mode", permission_mode, prompt])
     result = run_cli(
         "Claude Code",
         CLAUDE_CMD,
-        ["--print", "--permission-mode", permission_mode, prompt],
+        args,
         timeout=CLAUDE_TIMEOUT,
         cwd=load_project_path(),
     )
@@ -625,6 +703,9 @@ def ask_antigravity(prompt: str, mode: str = "discussion") -> str:
     # scratch 워크스페이스를 본다 — --add-dir로 명시적으로 작업 폴더를 알려줘야 한다.
     project_path = load_project_path()
     base_args = ["--add-dir", str(project_path)]
+    setting = selected_agent_setting("antigravity")
+    if setting["model"]:
+        base_args.extend(["--model", setting["model"]])
     if mode == "coding":
         args = base_args + ["--mode", "accept-edits", "--print", prompt]
     else:
@@ -658,6 +739,7 @@ def new_state() -> dict:
         "topic": "",
         "mode": "discussion",
         "enabled_agents": list(AGENT_ORDER),
+        "agent_settings": normalize_agent_settings(None),
         "total_est_tokens": 0,
         "total_elapsed_time": 0.0,
         "active_agent": None,
@@ -686,6 +768,7 @@ def normalize_state(state: dict) -> dict:
     state.setdefault("active_prompt_chars", 0)
     state.setdefault("runtime_events", [])
     state["enabled_agents"] = normalize_enabled_agents(state.get("enabled_agents"))
+    state["agent_settings"] = normalize_agent_settings(state.get("agent_settings"))
     return state
 
 
@@ -728,6 +811,7 @@ def list_sessions() -> list[dict]:
             "topic": data.get("topic", ""),
             "mode": data.get("mode", "discussion"),
             "enabled_agents": normalize_enabled_agents(data.get("enabled_agents")),
+            "agent_settings": normalize_agent_settings(data.get("agent_settings")),
             "finished": data.get("finished", False),
             "created_at": data.get("created_at", ""),
             "message_count": len(data.get("messages", [])),
@@ -1648,7 +1732,47 @@ def connection_status_html() -> str:
 MODE_LABELS = {"discussion": "일반 토론 모드", "coding": "코딩 모드"}
 
 
-def topic_section_html(topic: str, mode: str, enabled_agents: list[str], active_id: str) -> str:
+def select_options_html(options: list[tuple[str, str]], selected: str = "") -> str:
+    return "".join(
+        f'<option value="{html.escape(value)}"{" selected" if value == selected else ""}>'
+        f'{html.escape(label)}</option>'
+        for value, label in options
+    )
+
+
+def agent_model_cards_html(settings: dict | None = None) -> str:
+    normalized = normalize_agent_settings(settings)
+    cards = []
+    for agent in AGENT_ORDER:
+        info = AGENTS[agent]
+        catalog = MODEL_CATALOG[agent]
+        setting = normalized[agent]
+        effort_field = ""
+        if catalog["efforts"]:
+            effort_field = (
+                '<label class="model-field"><span>추론 수준</span>'
+                f'<select name="effort_{agent}">'
+                f'{select_options_html(catalog["efforts"], setting["effort"])}</select></label>'
+            )
+        cards.append(
+            f'<div class="agent-model-card" data-agent-card="{agent}">'
+            f'<label class="agent-toggle"><input type="checkbox" name="agent" value="{agent}" checked>'
+            f'<img src="{html.escape(info["avatar"])}" alt="">'
+            f'<span><strong>{html.escape(info["label"])}</strong><small>사용</small></span></label>'
+            f'<label class="model-field"><span>모델</span><select name="model_{agent}">'
+            f'{select_options_html(catalog["models"], setting["model"])}</select></label>'
+            f'{effort_field}</div>'
+        )
+    return '<div class="agent-model-grid">' + "".join(cards) + "</div>"
+
+
+def topic_section_html(
+    topic: str,
+    mode: str,
+    enabled_agents: list[str],
+    active_id: str,
+    agent_settings: dict | None = None,
+) -> str:
     project_path_line = (
         f'<p>코딩 모드 작업 경로: '
         f'{html.escape(str(load_project_path()))} '
@@ -1658,11 +1782,16 @@ def topic_section_html(topic: str, mode: str, enabled_agents: list[str], active_
     if topic:
         mode_label = MODE_LABELS.get(mode, mode)
         disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
+        settings_label = " · ".join(
+            f'{AGENTS[agent]["label"]}: {agent_setting_label(agent, agent_settings)}'
+            for agent in enabled_agents
+        )
         return (
             f'<div class="topic"><h3>{html.escape(topic)} '
             f'<span style="color:var(--faint);font-weight:500">· {html.escape(mode_label)}</span></h3>'
             f'<p>활성: {html.escape(agent_names(enabled_agents))} · 비활성: '
             f'{html.escape(agent_names(disabled_agents) if disabled_agents else "없음")}</p>'
+            f'<p>모델: {html.escape(settings_label)}</p>'
             f'<p>저장 폴더: {html.escape(str(session_memory_dir(active_id)))}</p>'
             f'{project_path_line if mode == "coding" else ""}</div>'
         )
@@ -1675,11 +1804,7 @@ def topic_section_html(topic: str, mode: str, enabled_agents: list[str], active_
           <label><input type="radio" name="mode" value="discussion" checked> 일반 토론 모드 (읽기 전용, 강점/역할 논의)</label>
           <label><input type="radio" name="mode" value="coding"> 코딩 모드 (실제로 이 폴더 코드를 수정)</label>
         </div>
-        <div class="agent-choice">
-          <label><input type="checkbox" name="agent" value="codex" checked> Codex</label>
-          <label><input type="checkbox" name="agent" value="antigravity" checked> Antigravity</label>
-          <label><input type="checkbox" name="agent" value="claude" checked> Claude Code</label>
-        </div>
+        {agent_model_cards_html(agent_settings)}
         {project_path_line}
         <button onclick="submitTopic()">시작</button>
       </div>"""
@@ -1692,12 +1817,13 @@ def render_dashboard() -> str:
         finished = STATE.get("finished", False)
         mode = STATE.get("mode", "discussion")
         enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
+        agent_settings = normalize_agent_settings(STATE.get("agent_settings"))
         active_id = STATE.get("id", "")
     bubbles = "".join(bubble_html(m) for m in messages) if messages else \
         '<div class="empty-state">아직 대화가 없습니다.</div>'
     paused = CONTROL["paused"]
     stopped = CONTROL["stopped"]
-    topic_section = topic_section_html(topic, mode, enabled_agents, active_id)
+    topic_section = topic_section_html(topic, mode, enabled_agents, active_id, agent_settings)
 
     no_topic = "disabled" if not topic else ""
     pause_disabled = "disabled" if (not topic or finished or stopped or paused) else ""
@@ -1728,6 +1854,7 @@ def state_json_payload() -> dict:
         mode = STATE.get("mode", "discussion")
         active_id = STATE.get("id", "")
         enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
+        agent_settings = normalize_agent_settings(STATE.get("agent_settings"))
         total_est_tokens = STATE.get("total_est_tokens", 0)
         total_elapsed_time = STATE.get("total_elapsed_time", 0.0)
         active_agent = STATE.get("active_agent")
@@ -1742,7 +1869,7 @@ def state_json_payload() -> dict:
     disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
     return {
         "feed_html": bubbles,
-        "topic_section_html": topic_section_html(topic, mode, enabled_agents, active_id),
+        "topic_section_html": topic_section_html(topic, mode, enabled_agents, active_id, agent_settings),
         "status": status_text(),
         "finished": finished,
         "paused": CONTROL["paused"],
@@ -1758,6 +1885,10 @@ def state_json_payload() -> dict:
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
         "enabled_agents": enabled_agents,
+        "agent_settings": agent_settings,
+        "agent_setting_labels": {
+            agent: agent_setting_label(agent, agent_settings) for agent in AGENT_ORDER
+        },
         "enabled_agents_label": html.escape(agent_names(enabled_agents)),
         "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
         "conn_html": connection_status_html(),
@@ -1801,15 +1932,22 @@ def session_detail_payload(session_id: str) -> dict | None:
         is_active = STATE.get("id") == session_id
     mode = data.get("mode", "discussion")
     enabled_agents = normalize_enabled_agents(data.get("enabled_agents"))
+    agent_settings = normalize_agent_settings(data.get("agent_settings"))
     disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
     return {
         "id": session_id,
         "feed_html": bubbles,
-        "topic_section_html": topic_section_html(data.get("topic", ""), mode, enabled_agents, session_id),
+        "topic_section_html": topic_section_html(
+            data.get("topic", ""), mode, enabled_agents, session_id, agent_settings
+        ),
         "topic": html.escape(data.get("topic", "")),
         "mode": mode,
         "mode_label": MODE_LABELS.get(mode, mode),
         "enabled_agents": enabled_agents,
+        "agent_settings": agent_settings,
+        "agent_setting_labels": {
+            agent: agent_setting_label(agent, agent_settings) for agent in AGENT_ORDER
+        },
         "enabled_agents_label": html.escape(agent_names(enabled_agents)),
         "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
         "memory_dir": html.escape(str(session_memory_dir(session_id))),
@@ -2037,6 +2175,13 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             topic = form.get("topic", [""])[0].strip()
             mode = form.get("mode", ["discussion"])[0].strip()
             enabled_agents = normalize_enabled_agents(form.get("agent", []))
+            agent_settings = normalize_agent_settings({
+                agent: {
+                    "model": form.get(f"model_{agent}", [""])[0].strip(),
+                    "effort": form.get(f"effort_{agent}", [""])[0].strip(),
+                }
+                for agent in AGENT_ORDER
+            })
             if mode not in MODE_LABELS:
                 mode = "discussion"
             if topic:
@@ -2044,6 +2189,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     STATE["topic"] = topic
                     STATE["mode"] = mode
                     STATE["enabled_agents"] = enabled_agents
+                    STATE["agent_settings"] = agent_settings
                     STATE["finished"] = False
                     CONTROL["approval_requested"] = False
                     CONTROL["approval_requested_by"] = []

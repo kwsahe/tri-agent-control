@@ -29,6 +29,48 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(args[-1], "-")
         self.assertEqual(kwargs["input_text"], "가" * 12000)
 
+    def test_selected_codex_model_and_effort_are_forwarded(self):
+        roundtable.STATE["agent_settings"]["codex"] = {
+            "model": "gpt-5.6-codex",
+            "effort": "medium",
+        }
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_codex("테스트")
+        args = run_cli.call_args.args[2]
+        self.assertIn("gpt-5.6-codex", args)
+        self.assertIn('model_reasoning_effort="medium"', args)
+
+    def test_selected_claude_model_and_effort_are_forwarded(self):
+        roundtable.STATE["agent_settings"]["claude"] = {
+            "model": "opus",
+            "effort": "high",
+        }
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_claude("테스트")
+        args = run_cli.call_args.args[2]
+        self.assertEqual(args[args.index("--model") + 1], "opus")
+        self.assertEqual(args[args.index("--effort") + 1], "high")
+
+    def test_selected_antigravity_preset_is_forwarded(self):
+        preset = "Gemini 3.5 Flash (High)"
+        roundtable.STATE["agent_settings"]["antigravity"] = {
+            "model": preset,
+            "effort": "",
+        }
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_antigravity("테스트")
+        args = run_cli.call_args.args[2]
+        self.assertEqual(args[args.index("--model") + 1], preset)
+
+    def test_unknown_model_settings_fall_back_to_cli_defaults(self):
+        settings = roundtable.normalize_agent_settings({
+            "codex": {"model": "unknown", "effort": "extreme"},
+        })
+        self.assertEqual(settings["codex"], {"model": "", "effort": ""})
+
     def test_cli_output_falls_back_to_windows_korean_encoding(self):
         message = "명령줄이 너무 깁니다."
         self.assertEqual(roundtable.decode_cli_output(message.encode("cp949")), message)
