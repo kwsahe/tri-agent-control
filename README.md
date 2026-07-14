@@ -1,148 +1,217 @@
-# 🗣️ Agent Roundtable — Codex · Antigravity · Claude Code
+# TriAgent Control
 
-세 개의 AI 코딩 CLI(**Codex**, **Antigravity**, **Claude Code**)를 브라우저 대시보드 하나로
-동시에 굴리는 로컬 오케스트레이터입니다. 셋은 서로의 발언을 모두 보고, 반박하고, 역할을
-나눈 뒤, 실제로 프로젝트 코드를 함께 작성합니다. 사용자는 터미널이 아니라 **HTML
-대시보드만 보면서** 진행 상황을 확인하고 통제합니다.
+Codex, Antigravity, Claude Code를 하나의 웹 대시보드에서 실행하고 관제하는 로컬 멀티 에이전트 오케스트레이터입니다. 세 모델이 같은 대화 문맥을 공유하며 토론, 역할 분담, 실제 코딩, 검증과 최종 보고를 수행합니다. 사용자는 실행 중에도 대상 모델을 선택해 질문하거나 방향을 바꾸고, 승인·보류·중단을 직접 결정할 수 있습니다.
 
-## 핵심 아이디어
+## 주요 기능
 
-- 실행 중인 모델의 추론/도구/명령/파일 변경 이벤트를 `Thinking` 작업 로그에서 확인할 수 있습니다.
-- 완료된 답변의 `작업 로그`를 펼치면 해당 턴에서 확인하거나 수정한 파일을 다시 볼 수 있습니다.
-- 세션 제목이나 목록의 연필 버튼으로 세션 이름을 수정할 수 있습니다.
-- Usage 영역은 CLI가 실제 사용량을 제공하면 실제 토큰을, 아니면 문자 기반 추정치를 표시합니다.
-- 각 모델에는 모든 전문 대신 활성 모델별 최신 발언 1개와 사용자 최신 개입 1개가 축약 전달됩니다.
-- 중단 시 실행 중인 CLI 프로세스도 즉시 종료되며, 실패한 턴은 해당 단계만 재시도할 수 있습니다.
-- 세션별 실제 토큰·비용 예산을 설정하고 한도에 도달하면 자동으로 일시정지합니다.
-- 코딩 턴마다 unified diff 체크포인트를 저장하고 파일별로 해당 턴의 변경을 되돌릴 수 있습니다.
-- 코딩 단계 종료 후 감지된 Python/Node 테스트와 빌드를 자동 실행해 Validation 패널에 남깁니다.
-- 세션명·주제·태그 검색, 즐겨찾기, 보관, 삭제와 대화/설정을 유지한 세션 분기를 지원합니다.
-- 모델 호출 전에 최종 프롬프트와 공유 문맥, 예상 토큰을 미리 확인할 수 있습니다.
-- 승인 대기, 완료, 실패, 예산 초과 시 브라우저 데스크톱 알림을 받을 수 있습니다.
+### 세 모델 통합 관제
 
-- 셋은 사용자(팀장)가 고용한 AI 개발 직원이라는 공통 지침([`TEAM_PROMPT.md`](TEAM_PROMPT.md))을
-  매 턴마다 읽고 답변한다.
-- 모든 대화는 서로에게 공개되고, 동의하지 않으면 반박할 수 있다.
-- 마지막엔 항상 한 명(Claude Code)이 논의/작업 결과를 정리해서 **최종 보고**를 사용자에게
-  전달한다.
-- **일반 토론 모드**(읽기 전용, 강점·역할 논의)와 **코딩 모드**(실제로 파일을 쓰는 모드) 두
-  가지로 동작한다.
-- 코딩 모드가 실제로 작업할 폴더는 [`PROJECT_PATH.txt`](PROJECT_PATH.txt) 한 줄로 지정한다 —
-  이 도구 자체를 다른 프로젝트 폴더에 복사할 필요 없이, 경로만 바꾸면 그 프로젝트에서 동작한다.
+- Codex, Antigravity, Claude Code 연결 상태와 CLI 버전을 확인합니다.
+- 세 모델 중 필요한 모델만 활성화해 세션을 시작할 수 있습니다.
+- 모델별 세부 모델과 추론 강도 또는 프리셋을 선택할 수 있습니다.
+- 비활성 모델 정보도 나머지 모델의 프롬프트에 전달됩니다.
+- 각 모델의 공식 아이콘, 현재 상태, 선택 모델을 대시보드에 표시합니다.
+
+### 토론과 코딩
+
+- **토론 모드**: 프로젝트 분석, 강점 공유, 반론, 역할 분담과 최종 정리를 수행합니다.
+- **코딩 모드**: `PROJECT_PATH.txt`가 가리키는 실제 프로젝트를 읽고 수정합니다.
+- 실행 중에도 토론 모드와 코딩 모드를 전환할 수 있습니다.
+- 코딩 지시는 계획 보고로 끝내지 않고 파일 수정과 가능한 검증까지 수행하도록 별도 실행 의도로 전달됩니다.
+- 코딩 턴 전후의 파일 변경을 감지하고 unified diff 체크포인트를 저장합니다.
+- 체크포인트에서 선택한 파일만 해당 턴 이전 상태로 되돌릴 수 있습니다.
+
+### 사용자 개입과 승인
+
+- 질문, 방향 수정, 코딩 실행, 멈추고 답변, 참고 메모 중 개입 유형을 선택할 수 있습니다.
+- Codex, Antigravity, Claude Code 중 답변할 모델만 지정할 수 있습니다.
+- 개입 요청은 정규 진행 단계보다 먼저 처리됩니다.
+- 모델이 응답 마지막에 `APPROVE`를 출력하면 토큰은 채팅에서 숨겨지고 승인 창이 열립니다.
+- 승인, 거절, 보류를 선택할 수 있으며 보류 상태에서 추가 질문이나 수정 지시를 보낼 수 있습니다.
+- 중단 시 실행 중인 CLI 하위 프로세스도 함께 종료합니다.
+- 실패한 턴과 보류된 개입 요청은 재시도할 수 있습니다.
+
+### 에이전트 간 호출
+
+모델이 자신의 담당 범위를 벗어난 검토나 후속 작업이 필요하다고 판단하면 다른 모델을 직접 호출할 수 있습니다.
+
+```text
+CALL_AGENT: codex|antigravity|claude | discussion|coding | 구체적인 요청
+```
+
+- 호출은 공유 개입 큐에 등록되고 대상 모델이 이어서 처리합니다.
+- 자기 자신, 비활성 모델, 중복 호출은 무시합니다.
+- 토론 턴에서 코딩 권한을 임의로 위임할 수 없습니다.
+- 무한 왕복을 막기 위해 호출 깊이는 2단계, 세션당 호출은 12회로 제한합니다.
+- 호출자, 대상, 모드와 요청 내용은 `Agent Calls` 패널에 기록됩니다.
+
+### 실시간 작업 로그
+
+- 모델 실행 중 `Thinking` 카드와 경과 시간을 표시합니다.
+- CLI의 추론, 도구 호출, 명령 실행, 파일 읽기·수정, 사용량 이벤트를 실시간으로 보여줍니다.
+- 완료된 답변에서 해당 턴의 작업 로그와 변경 파일을 펼쳐볼 수 있습니다.
+- 최근 어떤 모델의 대화가 프롬프트에 전달됐는지 표시합니다.
+- Python/Node 프로젝트의 테스트·린트·빌드 명령을 감지해 자동 실행하고 `Validation` 패널에 결과를 남깁니다.
+
+### 토큰 사용량 관제
+
+- 전체 세션의 실제 토큰, 경과 시간과 비용을 표시합니다.
+- 모델별 세션 누적 점유율의 합계를 100%로 계산해 진행 막대로 보여줍니다.
+- 각 모델은 최신 턴의 컨텍스트 사용량을 모델별 한도로 나눈 현재 컨텍스트 사용률도 별도로 표시합니다.
+- `모델별 토큰 추정량` 버튼을 누르면 모델별 상세 카드를 열 수 있습니다.
+- 상세 카드에는 점유율, 턴 수, 추정 토큰, 입력, 캐시, 출력과 비용이 표시됩니다.
+- CLI가 실제 사용량을 제공하면 실제 값을 사용하고, 제공하지 않는 모델은 `~`가 붙은 문자 기반 추정값을 사용합니다.
+- 상세 창을 열어둔 상태에서도 폴링 데이터에 맞춰 값이 갱신됩니다.
+- 자동 토큰·비용 제한은 기본적으로 비활성화되어 있습니다.
+
+### 세션과 메모리
+
+- 세션 이름 수정, 검색, 태그, 즐겨찾기, 보관, 삭제와 분기를 지원합니다.
+- 분기한 세션은 기존 대화와 설정을 유지한 채 별도 세션으로 이어집니다.
+- 모든 대화는 세션별 Markdown 원문과 압축 메모리에 저장됩니다.
+- 세션마다 `Profile.md`와 모델별 역할 프로필을 생성합니다.
+- 대시보드에서 `Profile.md`를 열고 수정해 저장할 수 있습니다.
+- 전체 대화를 매번 프롬프트에 넣지 않고 최근 대화와 압축 요약만 전달해 입력 크기를 제한합니다.
+- 최종 프롬프트, 공유 문맥과 예상 토큰을 실행 전에 미리 볼 수 있습니다.
 
 ## 요구 사항
 
-세 CLI가 모두 로컬에 설치·로그인되어 있어야 합니다.
+- Python 3.10 이상
+- 별도 Python 패키지 없이 표준 라이브러리만으로 실행 가능
+- 사용할 모델의 CLI 설치와 로그인
 
-| CLI | 확인 명령 |
-|---|---|
-| [Codex](https://github.com/openai/codex) | `codex --version` |
-| [Antigravity](https://antigravity.google/) (`agy`) | `agy --version` |
-| [Claude Code](https://claude.com/claude-code) | `claude --version` |
+| 모델 | 기본 명령 | 확인 명령 |
+|---|---|---|
+| [Codex](https://github.com/openai/codex) | `codex` | `codex --version` |
+| [Antigravity](https://antigravity.google/) | `agy` | `agy --version` |
+| [Claude Code](https://claude.com/claude-code) | `claude` | `claude --version` |
 
-Python 3.10+ (표준 라이브러리만 사용, 추가 패키지 설치 불필요).
+모든 CLI를 설치할 필요는 없습니다. 세션 시작 시 연결된 모델만 선택할 수 있습니다.
+
+## 시작하기
+
+1. 코딩 대상 프로젝트 경로를 `PROJECT_PATH.txt` 한 줄에 입력합니다.
+2. 서버를 실행합니다.
+
+```powershell
+python roundtable.py
+```
+
+3. 자동으로 열린 [http://127.0.0.1:8765/](http://127.0.0.1:8765/)에서 주제, 모드, 참여 모델과 세부 모델을 선택합니다.
+4. **시작**을 누르고 대화와 작업 로그를 확인합니다.
+
+기본 포트가 사용 중이면 다음 포트를 순서대로 시도합니다. 실제 URL은 터미널에 출력됩니다.
+
+## 기본 실행 흐름
+
+### 토론 모드
+
+1. 활성 모델이 순서대로 프로젝트와 자신의 강점을 분석합니다.
+2. 서로의 분석을 확인하고 반론 또는 보완 의견을 냅니다.
+3. 담당 영역과 파일 범위를 합의해 역할을 선언합니다.
+4. 역할을 세션 `Profile.md`에 저장합니다.
+5. 보고 담당 모델이 논의 결과와 다음 행동을 정리합니다.
+
+### 코딩 모드
+
+토론과 역할 합의 후 각 모델이 담당 범위의 실제 파일을 수정합니다. 파일 변경, 작업 로그와 체크포인트를 기록하고 자동 검증을 실행한 뒤 최종 결과를 보고합니다.
+
+> 코딩 모드는 실제 프로젝트 파일을 변경합니다. 실행 전에 대상 프로젝트를 커밋하거나 별도 브랜치에서 시작하는 것을 권장합니다.
+
+## 프롬프트와 메모리 절약
+
+각 CLI 호출은 독립 실행이므로 모델이 이전 턴을 영구 학습한 상태로 유지되지는 않습니다. TriAgent Control은 다음 정보만 압축해 전달합니다.
+
+- `TEAM_PROMPT.md` 최대 1,400자
+- `brief.md` 최근 6줄
+- 활성 모델별 최신 발언과 최근 사용자 개입
+- 최근 대화 최대 2개, 1,600자
+- 메모리 문맥 최대 1,800자
+- 전체 프롬프트 기본 최대 5,000자
+- 저장·표시하는 모델 답변 기본 최대 2,000자
+
+`full.md`와 `Profile.md` 전문은 매번 넣지 않고 경로만 알려줍니다. 과거 근거가 필요한 코딩 작업에서만 모델이 직접 읽습니다.
 
 ## 테스트
 
 ```powershell
+python -m py_compile roundtable.py
+node --check static/dashboard.js
 python -m unittest discover -s tests -v
-$env:PYTHONPATH='.'; python tests\live_smoke.py
 ```
 
-첫 명령은 상태·모드·CLI 전달 방식 회귀 테스트를 실행합니다. 두 번째 명령은 전용
-`.roundtable-smoke` 폴더에서 세 CLI의 실제 읽기와 쓰기를 각각 검증하고 생성물을 정리합니다.
+현재 회귀 테스트는 상태 정규화, 모델 설정 전달, CLI 스트림 파싱, 개입과 승인, 모드 전환, 토큰 집계, 예산 차단 복구, 에이전트 호출, 작업 실패와 재시도를 검증합니다.
 
-## 시작하기
+실제 CLI 읽기·쓰기 확인은 별도 스모크 테스트로 실행할 수 있습니다.
 
-```bash
-python roundtable.py
+```powershell
+$env:PYTHONPATH='.'
+python tests\live_smoke.py
 ```
 
-실행하면:
+스모크 테스트는 `.roundtable-smoke` 폴더를 사용하고 생성물을 정리합니다.
 
-1. 터미널에 세 CLI 연결 확인 로그가 찍힙니다.
-2. 브라우저가 자동으로 열립니다 (`http://127.0.0.1:8765/`).
-3. 대시보드에서 주제를 입력하고 모드를 고른 뒤 **시작** 버튼을 누르면 바로 진행됩니다.
-   시작 전에 Codex / Antigravity / Claude Code 중 이번 세션에 참여시킬 에이전트만 선택할 수 있습니다.
-
-이후 모든 제어(일시정지/재개, 중단, 새 세션, 연결 재확인)는 브라우저에서만 하면 됩니다.
-대화 중에는 단순 메모가 아니라 질문 / 방향 수정 / 멈추고 답변 / 참고 중 하나로 개입할 수
-있고, 답변할 대상 모델(Codex / Antigravity / Claude Code)을 직접 고를 수 있습니다.
-질문·방향 수정·멈추고 답변은 다음 정규 단계보다 먼저 선택한 에이전트들이 순서대로 답변합니다.
-어느 에이전트든 사용자 승인이 필요하면 응답 마지막 줄에 `APPROVE`를 출력합니다. 이 토큰은
-채팅에서 숨겨지고 승인 창이 열리며, 사용자가 승인하거나 거절하기 전에는 다음 단계로 진행하지
-않습니다. 보류한 뒤 질문/수정 요청을 보내는 것도 가능합니다.
-우측 패널에서 현재 세션의 토론 모드 / 코딩 모드를 전환할 수 있으며, `Profile.md`를 열어
-세션별 역할 분담 내용을 직접 수정하고 저장할 수 있습니다.
-
-### 프롬프트와 메모리
-
-각 CLI 호출은 독립 실행이라 모델 자체가 이전 턴을 학습한 상태로 유지되지는 않습니다. 대신
-`TEAM_PROMPT.md`는 매 턴 최대 1,400자만 넣고, `brief.md`의 최근 6줄과 최근 대화 2개만
-압축해서 전달합니다. `full.md`와 `Profile.md` 전문은 매 턴 넣지 않고 경로만 알려주며,
-과거 근거가 꼭 필요한 작업에서만 모델이 직접 읽게 합니다. 전체 입력은 기본 5,000자,
-화면에 저장하는 모델 답변은 기본 2,000자로 제한합니다.
-
-## 두 가지 모드
-
-### 일반 토론 모드
-읽기 전용으로 동작합니다. 순서대로:
-1. Codex → Antigravity → Claude Code가 각자 자신 있는 영역을 이야기 (서로 반박 가능)
-2. 같은 순서로 역할을 선언 (백엔드 / 프론트엔드 / 기획·아이디어 정리 — 셋이 겹치지 않게)
-3. Claude Code가 최종 보고로 결론을 정리
-
-### 코딩 모드
-위 토론 6단계에 이어서, 각자 선언한 역할에 맞는 작업을 **`PROJECT_PATH.txt`에 적힌
-폴더에 실제로 반영**합니다 (Codex `workspace-write`, Claude Code `acceptEdits`,
-Antigravity `accept-edits`). 마지막에 무엇이 어떻게 바뀌었는지 최종 보고가 올라옵니다.
-
-> ⚠️ 코딩 모드는 실제로 파일을 만들고 수정합니다. 처음 써보는 프로젝트라면 먼저
-> `git commit`을 해두거나 별도 브랜치를 파서 실행하는 걸 권장합니다. 되돌리기 어려운
-> 대량 변경이 생길 수 있습니다.
-
-## 커스터마이징 (전부 텍스트 파일 수정만으로 가능)
+## 설정 파일
 
 | 파일 | 역할 |
 |---|---|
-| `TEAM_PROMPT.md` | 세 에이전트가 매 턴 읽는 공통 지침. 규칙/말투/우선순위를 자유롭게 수정 |
-| `PROJECT_PATH.txt` | 코딩 모드가 실제로 작업할 프로젝트 폴더 경로 (실행 중 변경해도 다음 턴부터 반영) |
-| `dashboard_template.html` | 대시보드 화면 자체 (HTML/CSS/JS). 디자인만 바꾸고 싶으면 이 파일만 수정 |
+| `TEAM_PROMPT.md` | 세 모델이 공유하는 공통 규칙과 우선순위 |
+| `PROJECT_PATH.txt` | 코딩 모드가 실제로 작업할 프로젝트 경로 |
+| `dashboard_template.html` | 대시보드 HTML 구조 |
+| `static/dashboard.css` | 대시보드 스타일과 반응형 레이아웃 |
+| `static/dashboard.js` | 폴링, 제어, 세션과 상세 UI 동작 |
+| `static/agents/` | 모델과 사용자 아이콘 |
 
-## 생성되는 파일 (커밋 대상 아님)
+## 생성 데이터
 
-| 파일 | 내용 |
+| 경로 | 내용 |
 |---|---|
-| `roundtable_state.json` | 현재 세션 상태 (재개용) |
-| `roundtable.html` | 마지막 화면 스냅샷 |
-| `roundtable_log.md` | 모든 세션의 대화 기록 (append-only) |
-| `roundtable_memory/<세션ID>/full.md` | 세션 전체 대화 원문 기록 |
-| `roundtable_memory/<세션ID>/brief.md` | 프롬프트에 넣기 위한 압축 요약 기록 |
-| `roundtable_memory/<세션ID>/Profile.md` | 세션별 역할 분담/강점/조율 프로필 |
-| `roundtable_memory/<세션ID>/profiles/*_Profile.md` | 세션별 모델 개별 역할 프로필 |
-| `CODEX_Profile.md` / `ANTIGRAVITY_Profile.md` / `CLAUDE_Profile.md` | 세션마다 쌓이는 각 에이전트의 강점/역할 이력 |
+| `roundtable_state.json` | 현재 세션 상태와 재개 정보 |
+| `roundtable.html` | 마지막으로 렌더링한 정적 화면 스냅샷 |
+| `roundtable_log.md` | 전체 세션의 append-only 대화 로그 |
+| `sessions/<세션ID>.json` | 세션 상태 저장본 |
+| `sessions/<세션ID>.md` | 세션별 대화 기록 |
+| `roundtable_memory/<세션ID>/full.md` | 전체 대화 원문 |
+| `roundtable_memory/<세션ID>/brief.md` | 프롬프트용 압축 요약 |
+| `roundtable_memory/<세션ID>/Profile.md` | 세션 역할 분담 프로필 |
+| `roundtable_memory/<세션ID>/profiles/*_Profile.md` | 모델별 역할 프로필 |
+| `roundtable_memory/<세션ID>/checkpoints/` | 코딩 턴별 diff 체크포인트 |
+| `CODEX_Profile.md`, `ANTIGRAVITY_Profile.md`, `CLAUDE_Profile.md` | 모델별 누적 역할 이력 |
 
-## 환경변수 (선택)
+## 환경변수
 
 | 변수 | 기본값 | 설명 |
-|---|---|---|
-| `CLAUDE_CMD` / `CODEX_CMD` / `AGY_CMD` | `claude` / `codex` / `agy` | 각 CLI 실행 명령 |
-| `CLAUDE_TIMEOUT_SECONDS` / `CODEX_TIMEOUT_SECONDS` / `AGY_TIMEOUT_SECONDS` | 600 / 900 / 600 | 각 CLI 응답 대기 시간 |
-| `ROUNDTABLE_PORT` | 8765 | 대시보드 서버 포트 (사용 중이면 자동으로 다음 포트 시도) |
-| `ROUNDTABLE_TRANSCRIPT_WINDOW` | 2 | 매 턴 프롬프트에 직접 넣는 최근 메시지 개수 |
-| `ROUNDTABLE_MEMORY_BRIEF_LINES` | 6 | 매 턴 프롬프트에 넣는 압축 요약 줄 수 |
-| `ROUNDTABLE_TRANSCRIPT_MAX_CHARS` | 1600 | 최근 대화 문맥의 최대 문자 수 |
-| `ROUNDTABLE_MEMORY_CONTEXT_MAX_CHARS` | 1800 | 경로와 압축 메모리 문맥의 최대 문자 수 |
-| `ROUNDTABLE_TEAM_PROMPT_MAX_CHARS` | 1400 | 공통 지침의 최대 문자 수 |
-| `ROUNDTABLE_PROMPT_MAX_CHARS` | 5000 | CLI에 전달하는 전체 프롬프트의 최대 문자 수 |
-| `ROUNDTABLE_OUTPUT_MAX_CHARS` | 2000 | 저장·표시하는 에이전트 응답의 최대 문자 수 |
-| `ROUNDTABLE_SNAPSHOT_MAX_ENTRIES` | 20000 | 코딩 턴 전후 파일 변경 감지 시 확인할 최대 항목 수 |
+|---|---:|---|
+| `CODEX_CMD` / `AGY_CMD` / `CLAUDE_CMD` | `codex` / `agy` / `claude` | CLI 실행 명령 |
+| `CODEX_TIMEOUT_SECONDS` | 900 | Codex 응답 제한 시간 |
+| `AGY_TIMEOUT_SECONDS` / `CLAUDE_TIMEOUT_SECONDS` | 600 | Antigravity와 Claude 응답 제한 시간 |
+| `ROUNDTABLE_PORT` | 8765 | 로컬 대시보드 시작 포트 |
+| `ROUNDTABLE_TRANSCRIPT_WINDOW` | 2 | 직접 전달하는 최근 메시지 수 |
+| `ROUNDTABLE_MEMORY_BRIEF_LINES` | 6 | 압축 메모리 줄 수 |
+| `ROUNDTABLE_TRANSCRIPT_MAX_CHARS` | 1600 | 최근 대화 최대 문자 수 |
+| `ROUNDTABLE_MEMORY_CONTEXT_MAX_CHARS` | 1800 | 메모리 문맥 최대 문자 수 |
+| `ROUNDTABLE_TEAM_PROMPT_MAX_CHARS` | 1400 | 공통 지침 최대 문자 수 |
+| `ROUNDTABLE_PROMPT_MAX_CHARS` | 5000 | 최종 프롬프트 최대 문자 수 |
+| `ROUNDTABLE_OUTPUT_MAX_CHARS` | 2000 | 저장할 모델 답변 최대 문자 수 |
+| `ROUNDTABLE_SNAPSHOT_MAX_ENTRIES` | 20000 | 파일 변경 감지 최대 항목 수 |
+| `CODEX_CONTEXT_TOKENS` | 258400 | Codex 컨텍스트 사용률 계산 기준 |
+| `CLAUDE_CONTEXT_TOKENS` | 128000 | Claude 컨텍스트 사용률 계산 기준 |
+| `AGY_CONTEXT_TOKENS` | 1048576 | Antigravity Gemini 계열 컨텍스트 사용률 계산 기준 |
 
-## 파일 구조
+## 프로젝트 구조
 
+```text
+roundtable.py            CLI 실행, 상태 관리, 작업 큐와 로컬 HTTP 서버
+dashboard_template.html  대시보드 문서 구조
+static/dashboard.css     대시보드 디자인과 반응형 레이아웃
+static/dashboard.js      실시간 상태 갱신과 사용자 제어
+static/agents/            모델 아이콘
+tests/                    회귀 및 실제 CLI 스모크 테스트
+TEAM_PROMPT.md            세 모델 공통 지침
+PROJECT_PATH.txt          코딩 대상 프로젝트 경로
+orchestrate.py            이전 2모델 협업 실험 스크립트
 ```
-roundtable.py            메인 오케스트레이터 (연결 확인, 대화 루프, 로컬 HTTP 서버)
-dashboard_template.html  대시보드 화면
-TEAM_PROMPT.md           공통 지침
-PROJECT_PATH.txt         코딩 대상 폴더 경로 (로컬 전용, git에는 커밋 안 됨)
-orchestrate.py           (이전 실험용) TODO.md 기반 Codex↔Claude Code 2자 협업 루프
-```
+
+## 보안 범위
+
+서버는 기본적으로 `127.0.0.1`에만 바인딩됩니다. 코딩 모드는 로컬 CLI 권한으로 대상 프로젝트를 수정하므로, 각 CLI의 권한 설정과 `PROJECT_PATH.txt` 경로를 실행 전에 확인하세요.

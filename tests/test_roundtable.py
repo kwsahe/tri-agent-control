@@ -151,6 +151,44 @@ class RoundtableTests(unittest.TestCase):
         }
         self.assertEqual(roundtable.actual_token_count(usage), 6506)
 
+    def test_claude_context_uses_latest_iteration_instead_of_cumulative_usage(self):
+        messages = [{
+            "agent": "claude",
+            "meta": {
+                "est_tokens": 2381,
+                "actual_usage": {
+                    "input_tokens": 49,
+                    "cache_creation_input_tokens": 59920,
+                    "cache_read_input_tokens": 1015972,
+                    "output_tokens": 15860,
+                    "iterations": [{
+                        "input_tokens": 2,
+                        "cache_creation_input_tokens": 1949,
+                        "cache_read_input_tokens": 57971,
+                        "output_tokens": 702,
+                    }],
+                },
+            },
+        }]
+
+        context = roundtable.agent_context_summary(messages)["claude"]
+
+        self.assertEqual(context["used_tokens"], 60624)
+        self.assertEqual(context["limit_tokens"], 128000)
+        self.assertEqual(context["percent"], 47.4)
+        self.assertFalse(context["estimated"])
+
+    def test_context_usage_falls_back_to_latest_estimate(self):
+        messages = [
+            {"agent": "antigravity", "meta": {"est_tokens": 2100}},
+            {"agent": "antigravity", "meta": {"est_tokens": 2500}},
+        ]
+
+        context = roundtable.agent_context_summary(messages)["antigravity"]
+
+        self.assertEqual(context["used_tokens"], 2500)
+        self.assertTrue(context["estimated"])
+
     def test_budget_limit_reports_token_and_cost_overruns(self):
         state = {"budget": {"token_limit": 100, "cost_limit_usd": 1.0}, "total_actual_tokens": 100, "total_actual_cost_usd": 0.2}
         self.assertIn("토큰 예산", roundtable.budget_exceeded_reason(state))

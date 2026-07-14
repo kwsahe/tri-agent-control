@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Agent Roundtable — Codex, Antigravity & Claude Code
+TriAgent Control — Codex, Antigravity & Claude Code
 
 브라우저에 뜨는 대시보드 하나로 모든 걸 한다 (주제 입력도 그 안의 한 섹션일 뿐,
 별도로 안 가로막는다):
@@ -248,6 +248,9 @@ TEAM_PROMPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TEAM_PROMPT_MAX_CHARS", "
 PROMPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_PROMPT_MAX_CHARS", "5000"))
 OUTPUT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_OUTPUT_MAX_CHARS", "2000"))
 PROJECT_SNAPSHOT_MAX_ENTRIES = int(os.environ.get("ROUNDTABLE_SNAPSHOT_MAX_ENTRIES", "20000"))
+CODEX_CONTEXT_TOKENS = int(os.environ.get("CODEX_CONTEXT_TOKENS", "258400"))
+CLAUDE_CONTEXT_TOKENS = int(os.environ.get("CLAUDE_CONTEXT_TOKENS", "128000"))
+AGY_CONTEXT_TOKENS = int(os.environ.get("AGY_CONTEXT_TOKENS", "1048576"))
 
 APPROVAL_TOKEN = "APPROVE"
 MAX_DELEGATION_DEPTH = 2
@@ -2630,6 +2633,7 @@ def state_json_payload() -> dict:
         "delegation_history": delegation_history,
         "delegation_count": STATE.get("delegation_count", 0),
         "agent_usage": agent_usage_summary(messages),
+        "context_usage": agent_context_summary(messages, agent_settings),
     }
 
 
@@ -2684,6 +2688,52 @@ def agent_usage_summary(messages: list[dict]) -> dict:
     return summary
 
 
+def context_limit_for_agent(agent: str, agent_settings: dict | None = None) -> int:
+    if agent == "codex":
+        return CODEX_CONTEXT_TOKENS
+    if agent == "claude":
+        return CLAUDE_CONTEXT_TOKENS
+    setting = normalize_agent_settings(agent_settings).get("antigravity", {})
+    model = setting.get("model", "")
+    if model.startswith("Claude ") or model.startswith("GPT-OSS"):
+        return CLAUDE_CONTEXT_TOKENS
+    return AGY_CONTEXT_TOKENS
+
+
+def latest_context_token_count(agent: str, messages: list[dict]) -> tuple[int, bool]:
+    for message in reversed(messages):
+        if message.get("agent") != agent:
+            continue
+        meta = message.get("meta") or {}
+        usage = meta.get("actual_usage") or {}
+        if usage:
+            if agent == "claude" and usage.get("iterations"):
+                usage = usage["iterations"][-1]
+            tokens = actual_token_count(usage)
+            if tokens > 0:
+                return tokens, False
+        estimated = int(meta.get("est_tokens", 0) or 0)
+        if estimated > 0:
+            return estimated, True
+    return 0, True
+
+
+def agent_context_summary(
+    messages: list[dict], agent_settings: dict | None = None
+) -> dict[str, dict]:
+    summary = {}
+    for agent in AGENT_ORDER:
+        used, estimated = latest_context_token_count(agent, messages)
+        limit = max(1, context_limit_for_agent(agent, agent_settings))
+        summary[agent] = {
+            "used_tokens": used,
+            "limit_tokens": limit,
+            "percent": round((used / limit) * 100, 1),
+            "estimated": estimated,
+        }
+    return summary
+
+
 def session_detail_payload(session_id: str) -> dict | None:
     data = load_session(session_id)
     if data is None:
@@ -2729,6 +2779,7 @@ def session_detail_payload(session_id: str) -> dict | None:
         "budget": data.get("budget", {"token_limit": 0, "cost_limit_usd": 0.0}),
         "total_elapsed_time": round(data.get("total_elapsed_time", 0.0), 1),
         "agent_usage": agent_usage_summary(messages),
+        "context_usage": agent_context_summary(messages, agent_settings),
         "active_work_log": [],
         "active_usage": {},
         "validation_results": data.get("validation_results", []),
@@ -3384,7 +3435,7 @@ def start_server() -> tuple[HTTPServer, int]:
 # ──────────────────────────────────────────
 
 def main() -> None:
-    print("\U0001f680 Agent Roundtable — Codex, Antigravity & Claude Code")
+    print("\U0001f680 TriAgent Control — Codex, Antigravity & Claude Code")
     print(f"   Codex: {command_label(CODEX_CMD)}")
     print(f"   Antigravity: {command_label(AGY_CMD)}")
     print(f"   Claude Code: {command_label(CLAUDE_CMD)}")

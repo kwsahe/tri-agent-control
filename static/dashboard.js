@@ -86,12 +86,14 @@ function updateStatsBoard(tokens, time) {
 
 function buildAgentUsageRows(data) {
   const usage = data.agent_usage || {};
+  const contexts = data.context_usage || {};
   const rows = Object.entries(AGENTS).map(([key, info]) => {
     const row = usage[key] || {};
+    const context = contexts[key] || {};
     const actualInput = Number(row.input_tokens || 0) + Number(row.cache_creation_input_tokens || 0) + Number(row.cache_read_input_tokens || 0);
     const actual = actualInput + Number(row.output_tokens || 0);
     const estimated = Number(row.estimated_tokens || 0);
-    return { key, info, row, actual, estimated, tokens: actual > 0 ? actual : estimated };
+    return { key, info, row, context, actual, estimated, tokens: actual > 0 ? actual : estimated };
   });
   const total = rows.reduce((sum, item) => sum + item.tokens, 0);
   rows.forEach((item) => {
@@ -103,13 +105,19 @@ function buildAgentUsageRows(data) {
 function renderAgentUsage(data) {
   const { rows } = buildAgentUsageRows(data);
 
-  $("agentUsage").innerHTML = rows.map(({ info, row, actual, tokens, percent }) => {
+  $("agentUsage").innerHTML = rows.map(({ info, row, context, actual, tokens, percent }) => {
     const percentText = percent > 0 && percent < 0.1 ? "<0.1%" : `${percent.toFixed(1)}%`;
     const tokenText = actual > 0 ? formatTokens(tokens) : `~${formatTokens(tokens)}`;
+    const contextPercent = Number(context.percent || 0);
+    const contextTokenText = `${context.estimated ? "~" : ""}${formatTokens(context.used_tokens || 0)} / ${formatTokens(context.limit_tokens || 0)}`;
     return `<div class="agent-usage-row" style="--agent-color:${info.color}">
-      <div class="agent-usage-head"><span>${info.label}<small>${row.turns || 0} turns</small></span><strong>${percentText} · ${tokenText}</strong></div>
+      <div class="agent-usage-head"><span>${info.label}<small>${row.turns || 0} turns</small></span><strong>점유 ${percentText} · ${tokenText}</strong></div>
       <div class="agent-usage-track" role="progressbar" aria-label="${info.label} 토큰 점유율" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(1)}">
         <span style="width:${Math.min(100, percent).toFixed(2)}%"></span>
+      </div>
+      <div class="agent-context-meta"><span>현재 컨텍스트</span><strong>${contextPercent.toFixed(1)}% · ${contextTokenText}</strong></div>
+      <div class="agent-context-track" role="progressbar" aria-label="${info.label} 현재 컨텍스트 사용률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${contextPercent.toFixed(1)}">
+        <span style="width:${Math.min(100, contextPercent).toFixed(2)}%"></span>
       </div>
     </div>`;
   }).join("");
@@ -118,16 +126,20 @@ function renderAgentUsage(data) {
 function renderTokenDetails(data) {
   const { rows, total } = buildAgentUsageRows(data);
   $("tokenDetailsSummary").textContent = `세션 집계 ${formatTokens(total)} tokens · 세 모델 합계 100%`;
-  $("tokenDetailsGrid").innerHTML = rows.map(({ info, row, actual, estimated, tokens, percent }) => {
+  $("tokenDetailsGrid").innerHTML = rows.map(({ info, row, context, actual, estimated, tokens, percent }) => {
     const cacheTokens = Number(row.cache_creation_input_tokens || 0)
       + Number(row.cache_read_input_tokens || 0)
       + Number(row.cached_input_tokens || 0);
     const percentText = percent > 0 && percent < 0.1 ? "<0.1%" : `${percent.toFixed(1)}%`;
+    const contextPercent = Number(context.percent || 0);
+    const contextTokens = `${context.estimated ? "~" : ""}${formatTokens(context.used_tokens || 0)} / ${formatTokens(context.limit_tokens || 0)}`;
     return `<article class="token-model-card" style="--agent-color:${info.color}">
-      <header><img src="${info.avatar}" alt=""><div><strong>${info.label}</strong><span>${actual > 0 ? "실제 사용량 기준" : "추정 사용량 기준"}</span></div></header>
-      <div class="token-model-total"><strong>${percentText}</strong><span>${actual > 0 ? formatTokens(tokens) : `~${formatTokens(tokens)}`} tokens</span></div>
-      <div class="token-model-track"><span style="width:${Math.min(100, percent).toFixed(2)}%"></span></div>
+      <header><img src="${info.avatar}" alt=""><div><strong>${info.label}</strong><span>${context.estimated ? "컨텍스트 추정값" : "최신 실제 컨텍스트"}</span></div></header>
+      <div class="token-model-total"><strong>${contextPercent.toFixed(1)}%</strong><span>${contextTokens} tokens</span></div>
+      <div class="token-model-track"><span style="width:${Math.min(100, contextPercent).toFixed(2)}%"></span></div>
       <dl>
+        <div><dt>세션 점유율</dt><dd>${percentText}</dd></div>
+        <div><dt>세션 집계</dt><dd>${actual > 0 ? formatTokens(tokens) : `~${formatTokens(tokens)}`}</dd></div>
         <div><dt>턴</dt><dd>${formatTokens(row.turns || 0)}</dd></div>
         <div><dt>추정 토큰</dt><dd>~${formatTokens(estimated)}</dd></div>
         <div><dt>입력</dt><dd>${actual > 0 ? formatTokens(row.input_tokens || 0) : "-"}</dd></div>
@@ -345,7 +357,7 @@ function updateInspector(data) {
   $("budgetWarning").textContent = data.budget_exceeded || "";
   $("budgetWarning").style.display = data.budget_exceeded ? "block" : "none";
   $("retryBtn").style.display = data.can_retry ? "inline-flex" : "none";
-  const usageKey = JSON.stringify(data.agent_usage || {});
+  const usageKey = JSON.stringify([data.agent_usage || {}, data.context_usage || {}]);
   if (lastState.agentUsageKey !== usageKey) {
     renderAgentUsage(data);
     if ($("tokenDetailsDialog")?.open) renderTokenDetails(data);
@@ -607,7 +619,7 @@ async function loadPromptPreview() {
 async function enableNotifications() {
   if (!("Notification" in window)) { alert("이 브라우저는 알림을 지원하지 않습니다."); return; }
   const permission = await Notification.requestPermission();
-  if (permission === "granted") new Notification("Agent Roundtable", { body: "알림을 활성화했습니다." });
+  if (permission === "granted") new Notification("TriAgent Control", { body: "알림을 활성화했습니다." });
 }
 
 function notifyTransition(title, body) {

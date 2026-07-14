@@ -1326,6 +1326,36 @@ select:focus {
   transition: width 220ms ease;
 }
 
+.agent-context-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.agent-context-meta strong {
+  color: var(--text);
+  font-weight: 600;
+  text-align: right;
+}
+
+.agent-context-track {
+  height: 7px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--agent-color) 28%, transparent);
+  border-radius: 4px;
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.agent-context-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--agent-color);
+  transition: width 220ms ease;
+}
+
 .usage-detail-button {
   width: 100%;
   margin-top: 12px;
