@@ -29,6 +29,18 @@
   box-sizing: border-box;
 }
 
+a:focus-visible,
+button:focus-visible,
+summary:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid #9bbcff;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 input,
 select,
 textarea {
@@ -1315,6 +1327,36 @@ select:focus {
   margin-bottom: 10px;
 }
 
+.supporting-card summary.card-title {
+  margin-bottom: 0;
+  cursor: pointer;
+  list-style: none;
+}
+
+.supporting-card summary.card-title::-webkit-details-marker {
+  display: none;
+}
+
+.supporting-card summary.card-title::after {
+  content: "▸";
+  float: right;
+  color: var(--faint);
+  transition: transform 0.16s ease;
+}
+
+.supporting-card[open] summary.card-title::after {
+  transform: rotate(90deg);
+}
+
+.supporting-card[open] summary.card-title {
+  margin-bottom: 10px;
+}
+
+.supporting-card .memory-path,
+.supporting-card .runtime-log {
+  margin-top: 4px;
+}
+
 .metric-row {
   display: flex;
   align-items: center;
@@ -1761,11 +1803,16 @@ select:focus {
 
 @media (max-width: 1320px) {
   .app-shell {
-    grid-template-columns: 232px minmax(0, 1fr);
+    grid-template-columns: 216px minmax(0, 1fr) 240px;
   }
 
   .inspector {
-    display: none;
+    padding: 14px 11px;
+  }
+
+  .agent-toggle small,
+  .agent-chip-identity small {
+    max-width: 108px;
   }
 }
 
@@ -1850,6 +1897,7 @@ select:focus {
 
   .session-tools input[type="search"] {
     grid-column: 1 / -1;
+    min-height: 34px;
   }
 
   .session-tools label {
@@ -1896,6 +1944,9 @@ select:focus {
 
   .thread-header > .icon-button {
     grid-row: 2;
+    width: 34px;
+    min-width: 34px;
+    min-height: 34px;
   }
 
   .thread-header > .icon-button:nth-of-type(1) {
@@ -1977,9 +2028,10 @@ select:focus {
   .composer {
     margin: 8px auto 9px;
     padding: 8px;
-    gap: 8px;
-    max-height: 42dvh;
+    gap: 6px;
+    max-height: min(50dvh, 340px);
     overflow-y: auto;
+    scrollbar-gutter: stable;
   }
 
   .composer,
@@ -2059,5 +2111,9 @@ select:focus {
 
   .approve-actions button {
     flex: 0 0 auto;
+  }
+
+  .inspector {
+    display: none;
   }
 }

@@ -13,17 +13,17 @@
       <div class="brand-mark">AR</div>
       <div>
         <h1>TriAgent Control</h1>
-        <p>Three-model control center</p>
+        <p>세 모델 운영 센터</p>
       </div>
     </div>
     <button class="new-session" onclick="restartSession()" title="새 세션" aria-label="새 세션"><svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>새 세션</button>
     <div class="session-tools">
-      <input id="sessionSearch" type="search" placeholder="세션 검색" oninput="applySessionFilters()">
+      <input id="sessionSearch" type="search" placeholder="세션 검색" aria-label="세션 검색" oninput="applySessionFilters()">
       <label><input id="favoriteOnly" type="checkbox" onchange="applySessionFilters()"> 즐겨찾기</label>
       <label><input id="showArchived" type="checkbox" onchange="applySessionFilters()"> 보관함</label>
     </div>
-    <div class="sidebar-section-title">Sessions</div>
-    <div class="session-list" id="sessionList"></div>
+    <div class="sidebar-section-title">세션</div>
+    <div class="session-list" id="sessionList" aria-live="polite"></div>
   </aside>
 
   <main class="thread">
@@ -44,9 +44,14 @@
           </div>
         </div>
       </div>
-      <div class="header-state">
-        <div class="mode-pill" id="headerMode">준비</div>
-        <div class="status-pill" id="status">__STATUS__</div>
+      <div class="header-state" aria-label="현재 세션 운영 상태">
+        <div class="status-pill" id="headerConnection">연결 · 확인 중</div>
+        <div class="mode-pill" id="headerMode">모드 · 준비</div>
+        <div class="status-pill" id="status" role="status" aria-live="polite">상태 · __STATUS__</div>
+        <div class="status-pill active-agent-pill" id="headerAgent" aria-live="polite">
+          <span id="headerAgentName">모델 · 대기</span>
+          <span id="headerPhase">· 호출 전</span>
+        </div>
       </div>
       <button class="icon-button" onclick="openRoleDialog()" title="모델 역할 설정" aria-label="모델 역할 설정">
         <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-7 8v-1c0-2.76 3.13-5 7-5s7 2.24 7 5v1H5zm14.5-8.5V9H17V7h2.5V4.5h2V7H24v2h-2.5v2.5h-2z"/></svg>
@@ -61,12 +66,13 @@
 
     <section class="viewing-banner" id="viewingBanner" style="display:none">
       <span>지난 세션을 읽는 중입니다.</span>
+      <button onclick="activateViewedSession()">이 세션 활성화</button>
       <button class="ghost compact" onclick="backToLive()">현재 세션</button>
     </section>
 
     <div class="conversation-scroll" id="conversationScroll">
       <section id="topicSection">__TOPIC_SECTION__</section>
-      <section class="feed" id="feed">__FEED__</section>
+      <section class="feed" id="feed" aria-label="에이전트 대화">__FEED__</section>
 
       <section class="approve-banner" id="approveBanner" style="display:none">
         <p id="approveHint">위 확인 요청을 검토하고, 실제 코딩을 진행해도 될지 승인해주세요.</p>
@@ -98,6 +104,7 @@
         <button id="resumeBtn" class="ghost" onclick="ctrl('resume')" __RESUME_DISABLED__><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>재개</button>
         <button id="stopBtn" class="danger" onclick="stopSession()" __STOP_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>중단</button>
         <button id="retryBtn" class="ghost" onclick="retryFailedTurn()" style="display:none"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>실패 턴 재시도</button>
+        <button id="continueNextBtn" class="ghost" onclick="continueNextAgent()" style="display:none"><svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zm9-12v12h2V6h-2z"/></svg>변경 유지·다음 모델</button>
         <button class="ghost" onclick="restartSession()"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>새 세션</button>
         <button class="ghost" onclick="openPromptPreview()">프롬프트 미리보기</button>
         <select id="composerModeSelect" aria-label="채팅 모드">
@@ -134,13 +141,13 @@
 
   <aside class="inspector" aria-label="세션 메타">
     <div class="inspector-card live-card" id="liveCard">
-      <div class="card-title">Live</div>
+      <div class="card-title">실시간</div>
       <div class="live-line" id="liveLine">대기 중</div>
       <div class="live-detail" id="liveDetail">모델 호출이 시작되면 여기에 표시됩니다.</div>
     </div>
 
     <div class="inspector-card">
-      <div class="card-title">Session</div>
+      <div class="card-title">세션</div>
       <div class="metric-row">
         <span>상태</span>
         <strong id="sideStatus">__STATUS__</strong>
@@ -176,7 +183,7 @@
     </div>
 
     <div class="inspector-card workspace-card">
-      <div class="card-title">Work Area</div>
+      <div class="card-title">작업 영역</div>
       <p class="workspace-path" id="workspacePath">작업 폴더를 불러오는 중입니다.</p>
       <div class="workspace-permission">
         <select id="workspaceAccess" aria-label="작업 폴더 권한">
@@ -192,18 +199,18 @@
     </div>
 
     <div class="inspector-card">
-      <div class="card-title">Usage</div>
+      <div class="card-title">사용량</div>
       <div class="usage-grid">
         <div>
-          <span>Tokens</span>
+          <span>토큰</span>
           <strong id="statTokens">0</strong>
         </div>
         <div>
-          <span>Time</span>
+          <span>시간</span>
           <strong id="statTime">0.0s</strong>
         </div>
         <div>
-          <span>Cost</span>
+          <span>비용</span>
           <strong id="statCost">$0.0000</strong>
         </div>
       </div>
@@ -217,19 +224,19 @@
     </div>
 
     <div class="inspector-card">
-      <div class="card-title">Agents</div>
+      <div class="card-title">모델</div>
       <div class="agent-stack" id="agentStack"></div>
     </div>
 
     <div class="inspector-card role-card">
-      <div class="card-title">Roles</div>
+      <div class="card-title">역할</div>
       <div class="role-controls" id="roleControls"></div>
       <button class="ghost compact role-save-button" id="roleSaveButton" onclick="saveAgentRoles()">역할 적용</button>
       <p class="role-note">중복 배정 불가 · 실행 중 변경 불가</p>
     </div>
 
-    <div class="inspector-card">
-      <div class="card-title">Memory</div>
+    <details class="inspector-card supporting-card">
+      <summary class="card-title">메모리</summary>
       <p class="memory-path" id="memoryPath">세션 시작 후 표시됩니다.</p>
       <p class="memory-path" id="profilePath">Profile.md도 여기에 표시됩니다.</p>
       <p class="memory-path" id="rolesPath">Roles.md도 여기에 표시됩니다.</p>
@@ -241,28 +248,28 @@
           <button class="ghost compact" onclick="closeProfileEditor()">닫기</button>
         </div>
       </div>
-    </div>
+    </details>
 
-    <div class="inspector-card">
-      <div class="card-title">Runtime</div>
-      <div class="runtime-log" id="runtimeLog"></div>
-    </div>
+    <details class="inspector-card supporting-card">
+      <summary class="card-title">실행 기록</summary>
+      <div class="runtime-log" id="runtimeLog" aria-live="polite"></div>
+    </details>
 
-    <div class="inspector-card">
-      <div class="card-title">Agent Calls</div>
+    <details class="inspector-card supporting-card">
+      <summary class="card-title">에이전트 호출</summary>
       <div class="runtime-log" id="agentCallLog"><div class="runtime-empty">아직 에이전트 호출이 없습니다.</div></div>
-    </div>
+    </details>
 
-    <div class="inspector-card">
-      <div class="card-title">Validation</div>
+    <details class="inspector-card supporting-card">
+      <summary class="card-title">검증</summary>
       <div class="runtime-log" id="validationLog"><div class="runtime-empty">아직 검증 결과가 없습니다.</div></div>
-    </div>
+    </details>
   </aside>
 </div>
 
 <dialog id="promptPreviewDialog" class="prompt-dialog">
   <div class="dialog-header"><strong>최종 프롬프트 미리보기</strong><button class="icon-button" onclick="closePromptPreview()" aria-label="닫기">×</button></div>
-  <div class="preview-controls"><select id="previewAgent" onchange="loadPromptPreview()"><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="claude">Claude Code</option></select><span id="previewStats"></span></div>
+  <div class="preview-controls"><select id="previewAgent" aria-label="미리 볼 모델" onchange="loadPromptPreview()"><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="claude">Claude Code</option></select><span id="previewStats"></span></div>
   <pre id="promptPreviewText"></pre>
 </dialog>
 <dialog id="roleDialog" class="role-dialog">
@@ -283,9 +290,9 @@
   <input id="sessionActionId" type="hidden">
   <label class="dialog-field"><span>태그</span><input id="sessionTagsInput" placeholder="쉼표로 구분"></label>
   <div class="dialog-checks"><label><input id="sessionFavoriteInput" type="checkbox"> 즐겨찾기</label><label><input id="sessionArchivedInput" type="checkbox"> 보관</label></div>
-  <div class="dialog-actions"><button onclick="saveSessionMeta()">저장</button><button class="ghost" onclick="renameManagedSession()">이름 수정</button><button class="ghost" onclick="cloneManagedSession()">분기</button><button class="danger" onclick="deleteManagedSession()">삭제</button></div>
+  <div class="dialog-actions"><button id="activateSessionButton" onclick="activateManagedSession()">활성화</button><button onclick="saveSessionMeta()">저장</button><button class="ghost" onclick="renameManagedSession()">이름 수정</button><button class="ghost" onclick="cloneManagedSession()">분기</button><button class="danger" onclick="deleteManagedSession()">삭제</button></div>
 </dialog>
 
-<script src="/static/dashboard.js?v=20260715-responsive-test"></script>
+<script src="/static/dashboard.js?v=20260719-session-activation"></script>
 </body>
 </html>

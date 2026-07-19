@@ -36,6 +36,7 @@ TriAgent Control — Codex, Antigravity & Claude Code
 """
 
 import html
+import importlib.util
 import inspect
 import difflib
 import fnmatch
@@ -425,15 +426,17 @@ PROPOSAL_STEPS = [
 CODING_WORK_STEPS = [
     ("codex", "작업 수행",
      "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을 이 프로젝트 코드에 실제로 "
-     "반영해. 파일을 만들거나 수정해도 좋다. 작업이 끝나면 어떤 파일을 어떻게 바꿨는지 "
-     "요약해서 보고해.", "coding"),
+     "반영해. 직전 확인 요청에서 네 모델에 배정된 대상 파일과 기능만 수정하고 다른 모델을 호출하지 마. "
+     "작업이 끝나면 어떤 파일을 어떻게 바꿨는지 요약해서 보고해.", "coding"),
     ("antigravity", "작업 수행",
      "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을, Codex가 방금 한 작업과 "
-     "겹치거나 충돌하지 않게 이 프로젝트 코드에 실제로 반영해. 작업이 끝나면 어떤 파일을 "
+     "겹치거나 충돌하지 않게 이 프로젝트 코드에 실제로 반영해. 직전 확인 요청에서 네 모델에 "
+     "배정된 대상 파일과 기능만 수정하고 다른 모델을 호출하지 마. 작업이 끝나면 어떤 파일을 "
      "어떻게 바꿨는지 요약해서 보고해.", "coding"),
     ("claude", "작업 수행",
      "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을, Codex·Antigravity가 방금 "
-     "한 작업과 겹치거나 충돌하지 않게 이 프로젝트 코드에 실제로 반영해. 작업이 끝나면 "
+     "한 작업과 겹치거나 충돌하지 않게 이 프로젝트 코드에 실제로 반영해. 직전 확인 요청에서 "
+     "네 모델에 배정된 대상 파일과 기능만 수정하고 다른 모델을 호출하지 마. 작업이 끝나면 "
      "어떤 파일을 어떻게 바꿨는지 요약해서 보고해.", "coding"),
 ]
 
@@ -702,7 +705,7 @@ def turn_project_access(cli_mode: str, state: dict | None = None) -> str:
     if cli_mode == "coding":
         return "write"
     if current.get("mode") in {"coding", "continuous"}:
-        return "write"
+        return "read"
     return normalize_discussion_project_access(current.get("discussion_project_access"))
 
 
@@ -853,7 +856,11 @@ def decode_cli_output(value: bytes | str | None) -> str:
 def snapshot_project_tree(root: Path) -> tuple[dict[str, tuple], bool]:
     """코딩 턴 전후 비교용 경량 파일 트리 스냅샷."""
     entries: dict[str, tuple] = {}
-    skipped_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+    skipped_dirs = {
+        ".git", "node_modules", ".venv", "venv", "__pycache__",
+        ".pytest_cache", ".ruff_cache", ".codex_pytest_tmp", ".agents",
+        "roundtable_memory", "sessions",
+    }
     if not root.is_dir():
         return entries, False
     truncated = False
@@ -903,7 +910,11 @@ def compare_project_snapshots(before: dict[str, tuple], after: dict[str, tuple])
 def capture_project_texts(root: Path, max_total_bytes: int = 5_000_000) -> dict[str, str]:
     contents: dict[str, str] = {}
     total = 0
-    skipped_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+    skipped_dirs = {
+        ".git", "node_modules", ".venv", "venv", "__pycache__",
+        ".pytest_cache", ".ruff_cache", ".codex_pytest_tmp", ".agents",
+        "roundtable_memory", "sessions",
+    }
     for current, dirs, files in os.walk(root):
         dirs[:] = [name for name in dirs if name not in skipped_dirs]
         for name in files:
@@ -967,7 +978,10 @@ def detect_validation_commands(root: Path) -> list[tuple[str, list[str]]]:
         if scripts.get("build"):
             commands.append(("npm run build", [npm, "run", "build"]))
     if (root / "tests").is_dir() and any((root / "tests").glob("test*.py")):
-        commands.append(("Python unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests"]))
+        if importlib.util.find_spec("pytest") is not None:
+            commands.append(("Python pytest", [sys.executable, "-m", "pytest", "-q"]))
+        else:
+            commands.append(("Python unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests"]))
     return commands[:2]
 
 
@@ -1228,6 +1242,22 @@ def is_incomplete_tool_response(text: str) -> bool:
     return bool(_INCOMPLETE_TOOL_RESPONSE_RE.search(text.strip()))
 
 
+def should_honor_approval_request(
+    requested: bool, session_mode: str, phase: str
+) -> bool:
+    if not requested or session_mode == "continuous":
+        return False
+    if session_mode == "coding" and (
+        phase in {"개선안 제안", "최종 보고"} or phase.startswith("호출 답변")
+    ):
+        return False
+    return True
+
+
+def allow_agent_calls(session_mode: str, phase: str) -> bool:
+    return not (session_mode == "coding" and phase == "작업 수행")
+
+
 def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str:
     project_access = turn_project_access(mode)
     sandbox = "workspace-write" if project_access == "write" else "read-only"
@@ -1337,7 +1367,11 @@ def ask_antigravity(prompt: str, mode: str = "discussion", event_callback=None) 
             "--print", prompt,
         ]
     else:
-        args = base_args + ["--mode", "plan", "--sandbox", "--print", prompt]
+        args = base_args + [
+            "--mode", "plan",
+            "--sandbox",
+            "--print", prompt,
+        ]
     result = run_cli(
         "Antigravity", AGY_CMD, args, timeout=AGY_TIMEOUT, cwd=project_path,
         stream_events=True, event_callback=event_callback,
@@ -2038,9 +2072,53 @@ def role_scope_violations(agent: str, changed_paths: list[dict], state: dict) ->
     violations = []
     for item in changed_paths:
         path = str(item.get("path", "")).replace("\\", "/")
+        top_level = path.rstrip("/").split("/", 1)[0]
+        if top_level in {
+            ".pytest_cache", ".ruff_cache", ".codex_pytest_tmp", ".agents",
+            "__pycache__", "roundtable_memory", "sessions",
+        }:
+            continue
+        if path in {"TODO.md", "AGENTS.md"}:
+            continue
         if path and not any(fnmatch.fnmatch(path.lower(), pattern.lower()) for pattern in patterns):
             violations.append(path)
     return violations
+
+
+def can_continue_after_failed_step(state: dict, messages: list[dict]) -> bool:
+    if not messages or state.get("active_agent"):
+        return False
+    last = messages[-1]
+    if (last.get("meta") or {}).get("failure_kind") not in {"role_scope", "cli"}:
+        return False
+    steps = steps_for_mode(
+        state.get("mode", "discussion"),
+        normalize_enabled_agents(state.get("enabled_agents")),
+    )
+    step_index = int(state.get("step_index", 0))
+    if step_index >= len(steps):
+        return False
+    expected_agent, expected_phase, _instruction, _cli_mode = steps[step_index]
+    actual_phase = str(last.get("phase", "")).split(" · 사이클 ", 1)[0]
+    return last.get("agent") == expected_agent and actual_phase == expected_phase
+
+
+def continue_after_failed_step() -> dict:
+    with STATE_LOCK:
+        if not can_continue_after_failed_step(STATE, STATE.get("messages", [])):
+            return {"error": "다음 단계로 넘길 수 있는 실패 턴이 없습니다."}
+        skipped = STATE["messages"][-1]
+        STATE["step_index"] = int(STATE.get("step_index", 0)) + 1
+        CONTROL["paused"] = False
+        CONTROL["stopped"] = False
+        save_state(STATE)
+    add_runtime_event(
+        f"{AGENTS[skipped['agent']]['label']} 실패 턴의 변경을 유지하고 다음 모델로 진행"
+    )
+    start_worker_if_needed(force=True)
+    payload = state_json_payload()
+    payload["success"] = True
+    return payload
 
 
 def update_agent_roles(roles: dict) -> dict:
@@ -2137,6 +2215,8 @@ def unresolved_approval_requests(messages: list[dict]) -> list[dict]:
             break
         if not message.get("meta", {}).get("approval_requested"):
             continue
+        if message.get("phase") == "최종 보고":
+            continue
         agent = message.get("agent", "")
         if agent not in AGENTS:
             continue
@@ -2173,7 +2253,7 @@ def orphaned_approval_followup_agents(messages: list[dict]) -> list[str]:
 
 
 _restored_approval_requesters = unresolved_approval_requesters(STATE.get("messages", []))
-if _restored_approval_requesters:
+if _restored_approval_requesters and not STATE.get("finished", False):
     CONTROL["approval_requested"] = True
     CONTROL["approval_requested_by"] = _restored_approval_requesters
     CONTROL["awaiting_approval"] = True
@@ -2340,15 +2420,15 @@ def bubble_html(m: dict) -> str:
             entries = []
             for event in work_log[-20:]:
                 paths = event.get("paths") or []
-                path_html = "".join(f'<code>{html.escape(path)}</code>' for path in paths[:10])
+                path_html = "".join(f'<code class="log-path">{html.escape(path)}</code>' for path in paths[:10])
                 entries.append(
-                    f'<li class="work-{html.escape(event.get("kind", "log"))}">'
-                    f'<span>{html.escape(event.get("time", ""))}</span>'
-                    f'<p>{html.escape(event.get("text", ""))}</p>{path_html}</li>'
+                    f'<li class="work-log-item work-{html.escape(event.get("kind", "log"))}">'
+                    f'<span class="log-time">{html.escape(event.get("time", ""))}</span>'
+                    f'<p class="log-text">{html.escape(event.get("text", ""))}</p>{path_html}</li>'
                 )
             work_html = (
-                f'<details class="turn-work-log"><summary>작업 로그 {len(work_log)}개</summary>'
-                f'<ol>{"".join(entries)}</ol></details>'
+                f'<details class="turn-work-log collapsible-section"><summary class="section-summary">작업 로그 <span class="badge">{len(work_log)}</span></summary>'
+                f'<ol class="work-log-list">{"".join(entries)}</ol></details>'
             )
         shared_context = meta.get("shared_context", [])
         if shared_context:
@@ -2359,24 +2439,31 @@ def bubble_html(m: dict) -> str:
         if meta.get("turn_diff"):
             checkpoint = html.escape(meta.get("checkpoint_path", ""))
             file_choices = "".join(
-                f'<label><input type="checkbox" value="{html.escape(item["path"])}">'
-                f'{html.escape(item["change"])} {html.escape(item["path"])}</label>'
+                f'<label class="file-choice-label"><input type="checkbox" value="{html.escape(item["path"])}">'
+                f'<span class="change-type">{html.escape(item["change"])}</span> <span class="file-path">{html.escape(item["path"])}</span></label>'
                 for item in meta.get("changed_paths", []) if not item["path"].endswith("/")
             )
             work_html += (
-                f'<details class="turn-diff"><summary>코드 변경 Diff</summary>'
-                f'<p>{checkpoint}</p><pre>{html.escape(meta["turn_diff"])}</pre>'
+                f'<details class="turn-diff collapsible-section"><summary class="section-summary">코드 변경 Diff</summary>'
+                f'<div class="diff-container">'
+                f'<div class="checkpoint-info">체크포인트: <code>{checkpoint}</code></div>'
+                f'<pre class="diff-content"><code>{html.escape(meta["turn_diff"])}</code></pre>'
                 f'<div class="file-review" data-checkpoint="{checkpoint}">{file_choices}'
-                f'<button class="danger compact" onclick="rollbackSelectedFiles(this)">선택 변경 되돌리기</button>'
-                f'</div></details>'
+                f'<button class="danger compact rollback-btn" onclick="rollbackSelectedFiles(this)">선택 변경 되돌리기</button>'
+                f'</div></div></details>'
             )
         if meta.get("agent_calls"):
             calls_html = "".join(
-                f'<li><strong>{html.escape(AGENTS.get(call["target"], {}).get("label", call["target"]))}</strong>'
-                f' · {html.escape(call["mode"])} · {html.escape(call["task"])}</li>'
+                f'<li class="agent-call-item"><strong class="agent-label">{html.escape(AGENTS.get(call["target"], {}).get("label", call["target"]))}</strong>'
+                f' · <span class="call-mode">{html.escape(call["mode"])}</span> · <span class="call-task">{html.escape(call["task"])}</span></li>'
                 for call in meta["agent_calls"]
             )
-            work_html += f'<div class="agent-calls"><span>후속 에이전트 호출</span><ul>{calls_html}</ul></div>'
+            work_html += (
+                f'<details class="turn-agent-calls collapsible-section">'
+                f'<summary class="section-summary">후속 에이전트 호출 <span class="badge">{len(meta["agent_calls"])}</span></summary>'
+                f'<ul class="agent-calls-list">{calls_html}</ul>'
+                f'</details>'
+            )
 
     return f"""
     <div class="row {side}{highlight_class}">
@@ -2657,6 +2744,16 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
     if not CONTROL["intervention_pending"]:
         return False
     with STATE_LOCK:
+        first_item = (
+            CONTROL["intervention_queue"][0]
+            if CONTROL["intervention_queue"] else None
+        )
+        if (
+            first_item
+            and first_item.get("retry_blocked")
+            and CONTROL["paused"]
+        ):
+            return False
         item = CONTROL["intervention_queue"].pop(0) if CONTROL["intervention_queue"] else None
         CONTROL["intervention_pending"] = bool(CONTROL["intervention_queue"])
         CONTROL["intervention_intent"] = CONTROL["intervention_queue"][0]["intent"] if CONTROL["intervention_queue"] else ""
@@ -2692,6 +2789,7 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
         ):
             retry_item = dict(item)
             retry_item["targets"] = targets[target_index:]
+            retry_item["retry_blocked"] = True
             with STATE_LOCK:
                 if not CONTROL["stopped"]:
                     CONTROL["intervention_queue"].insert(0, retry_item)
@@ -2944,12 +3042,17 @@ def run_step(
         0.0,
     )
     call_clean_text, agent_calls = extract_agent_calls(raw_text, agent, cli_mode)
+    if not allow_agent_calls(state_snapshot.get("mode", "discussion"), phase):
+        agent_calls = []
     visible_text, approval_requested = extract_approval_token(call_clean_text)
     requested_role = extract_role_selection(visible_text) if phase in {"역할 선언", "역할 확정"} else ""
     if phase in {"역할 선언", "역할 확정"}:
         visible_text = strip_role_selection(visible_text)
-    if state_snapshot.get("mode") == "continuous":
-        approval_requested = False
+    approval_requested = should_honor_approval_request(
+        approval_requested,
+        state_snapshot.get("mode", "discussion"),
+        phase,
+    )
     text, output_truncated = clip_agent_output(visible_text)
     if approval_requested and not text:
         text = "사용자 승인을 요청했습니다."
@@ -3423,6 +3526,11 @@ def state_json_payload() -> dict:
     can_retry = bool(
         CONTROL["paused"] and last_model_message and not (last_model_message.get("meta") or {}).get("ok", True)
     )
+    can_continue_next = bool(
+        CONTROL["paused"]
+        and can_continue_after_failed_step(state_snapshot, messages)
+        and not budget_exceeded_reason(state_snapshot)
+    )
     return {
         "feed_html": bubbles,
         "topic_section_html": topic_section_html(
@@ -3487,6 +3595,7 @@ def state_json_payload() -> dict:
         "active_prompt_chars": active_prompt_chars,
         "runtime_events": runtime_events,
         "can_retry": can_retry,
+        "can_continue_next": can_continue_next,
         "active_work_log": active_work_log,
         "active_usage": active_usage,
         "validation_results": validation_results,
@@ -3784,6 +3893,72 @@ def clone_session(session_id: str) -> dict:
     return {"success": True, "id": clone["id"], "name": clone["name"]}
 
 
+def activate_session(session_id: str) -> dict:
+    with STATE_LOCK:
+        if STATE.get("active_agent") or CONTROL["worker_running"]:
+            return {"error": "모델이 실행 중일 때는 세션을 전환할 수 없습니다. 먼저 중단해주세요."}
+        already_active = STATE.get("id") == session_id
+    if already_active:
+        payload = state_json_payload()
+        payload["success"] = True
+        payload["already_active"] = True
+        return payload
+
+    source = load_session(session_id)
+    if source is None:
+        return {"error": "세션을 찾을 수 없습니다."}
+
+    activated = normalize_state(json.loads(json.dumps(source, ensure_ascii=False)))
+    activated["active_agent"] = None
+    activated["active_phase"] = None
+    activated["active_started_at"] = None
+    activated["active_cli_mode"] = None
+    activated["active_prompt_chars"] = 0
+    activated["active_work_log"] = []
+    activated["active_usage"] = {}
+
+    workspace = Path(activated.get("workspace_path") or load_project_path()).expanduser()
+    if not workspace.is_dir() or not os.access(workspace, os.R_OK):
+        return {"error": f"세션의 작업 폴더를 사용할 수 없습니다: {workspace}"}
+    access = "write" if activated.get("mode") in {"coding", "continuous"} else activated.get("workspace_access", "read")
+    if access == "write" and not os.access(workspace, os.W_OK):
+        return {"error": f"세션의 작업 폴더에 쓰기 권한이 없습니다: {workspace}"}
+    save_project_path(workspace.resolve())
+    activated["workspace_path"] = str(workspace.resolve())
+    activated["workspace_access"] = access
+
+    pending_interventions = list(activated.get("pending_interventions", []))
+    approval_requesters = (
+        unresolved_approval_requesters(activated.get("messages", []))
+        if not activated.get("finished", False)
+        else []
+    )
+    with STATE_LOCK:
+        STATE.clear()
+        STATE.update(activated)
+        save_state(STATE)
+        CONTROL["paused"] = not activated.get("finished", False)
+        CONTROL["stopped"] = False
+        CONTROL["worker_running"] = False
+        CONTROL["worker_session_id"] = None
+        CONTROL["worker_start_pending"] = False
+        CONTROL["awaiting_approval"] = bool(approval_requesters)
+        CONTROL["approval_deferred"] = False
+        CONTROL["approval_requested"] = bool(approval_requesters)
+        CONTROL["approval_requested_by"] = approval_requesters
+        CONTROL["approval_rejected"] = False
+        CONTROL["approval_seen_messages"] = len(activated.get("messages", []))
+        CONTROL["intervention_queue"] = pending_interventions
+        CONTROL["intervention_pending"] = bool(pending_interventions)
+        CONTROL["intervention_intent"] = pending_interventions[0].get("intent", "") if pending_interventions else ""
+        CONTROL["intervention_seen_messages"] = len(activated.get("messages", []))
+
+    add_runtime_event(f"세션 활성화: {activated.get('name') or activated.get('topic') or session_id}")
+    payload = state_json_payload()
+    payload["success"] = True
+    return payload
+
+
 def prompt_preview_payload(agent: str) -> dict:
     if agent not in AGENT_ORDER:
         return {"error": "모델을 선택해주세요."}
@@ -3907,14 +4082,13 @@ def switch_mode(mode: str) -> dict:
     return payload
 
 
-def maybe_autostart_worker() -> None:
+def prepare_manual_resume_after_startup() -> None:
     with STATE_LOCK:
         has_topic = bool(STATE.get("topic"))
         not_finished = not STATE.get("finished", False)
-    if CONTROL["intervention_pending"] and has_topic:
-        start_worker_if_needed(force=True)
-    elif has_topic and not_finished and not CONTROL["stopped"]:
-        start_worker_if_needed()
+        if has_topic and not_finished:
+            CONTROL["paused"] = True
+            CONTROL["stopped"] = False
 
 
 # ──────────────────────────────────────────
@@ -4042,7 +4216,6 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             agent = parse_qs(parsed.query).get("agent", ["codex"])[0]
             self._send_json(prompt_preview_payload(agent))
             return
-        maybe_autostart_worker()
         self._send_html(render_dashboard())
 
     def do_POST(self) -> None:
@@ -4166,6 +4339,11 @@ class RoundtableHandler(BaseHTTPRequestHandler):
         if self.path == "/session/clone":
             form = self._read_form()
             self._send_json(clone_session(form.get("id", [""])[0].strip()))
+            return
+
+        if self.path == "/session/activate":
+            form = self._read_form()
+            self._send_json(activate_session(form.get("id", [""])[0].strip()))
             return
 
         if self.path == "/checkpoint/rollback":
@@ -4303,6 +4481,10 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             self._send_json(state_json_payload())
             return
 
+        if self.path == "/continue-next":
+            self._send_json(continue_after_failed_step())
+            return
+
         if self.path == "/budget":
             form = self._read_form()
             try:
@@ -4401,13 +4583,13 @@ def main() -> None:
     print(f"   코딩 대상 폴더: {load_project_path()}  (바꾸려면 {PROJECT_PATH_FILE.name} 수정)")
     preflight()
 
+    prepare_manual_resume_after_startup()
     render_html_snapshot()
     server, port = start_server()
     url = f"http://127.0.0.1:{port}/"
     print(f"\n\U0001f310 브라우저에서 모든 것을 통제하세요: {url}")
     print("   (주제 입력, 일시정지/재개, 메시지 개입, 중단 — 전부 이 페이지에서 합니다)")
     webbrowser.open(url)
-    maybe_autostart_worker()
 
     try:
         server.serve_forever(poll_interval=0.5)

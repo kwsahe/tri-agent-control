@@ -10,6 +10,12 @@ const AGENTS = {
   claude: { label: "Claude Code", color: "#ff8a3d", avatar: "/static/agents/claude.svg" },
 };
 
+const MODE_LABELS = {
+  discussion: "토론",
+  coding: "코딩",
+  continuous: "무제한 코딩",
+};
+
 function $(id) {
   return document.getElementById(id);
 }
@@ -26,7 +32,7 @@ function formatTokens(value) {
 }
 
 function formatTime(value) {
-  return `${Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 1 })}s`;
+  return `${Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 1 })}초`;
 }
 
 function estimateCost(tokens) {
@@ -69,8 +75,9 @@ function applySessionFilters() {
     const cls = `session-item${s.id === (viewingId || sessionsActiveId) ? " active" : ""}`;
     const status = !s.topic ? "준비" : (s.finished ? "완료" : (s.id === sessionsActiveId ? "진행 중" : "보류"));
     const tags = (s.tags || []).map((tag) => `<span>#${escapeHtml(tag)}</span>`).join("");
+    const isCurrent = s.id === (viewingId || sessionsActiveId);
     return `<div class="session-row">
-      <button class="${cls}" onclick="viewSession('${s.id}')">
+      <button class="${cls}" onclick="viewSession('${s.id}')" aria-current="${isCurrent ? "page" : "false"}" aria-label="${escapeHtml(s.name || s.topic)} · ${status}">
         <span class="s-topic">${s.favorite ? "★ " : ""}${escapeHtml(s.name || s.topic)}</span>
         <span class="s-meta">${status} · ${escapeHtml(s.mode_label)} · ${s.message_count}개</span>
         <span class="s-tags">${tags}</span>
@@ -113,7 +120,7 @@ function renderAgentUsage(data) {
     const contextPercent = Number(context.percent || 0);
     const contextTokenText = `${context.estimated ? "~" : ""}${formatTokens(context.used_tokens || 0)} / ${formatTokens(context.limit_tokens || 0)}`;
     return `<div class="agent-usage-row" style="--agent-color:${info.color}">
-      <div class="agent-usage-head"><span>${info.label}<small>${row.turns || 0} turns</small></span><strong>점유 ${percentText} · ${tokenText}</strong></div>
+      <div class="agent-usage-head"><span>${info.label}<small>${row.turns || 0}턴</small></span><strong>점유 ${percentText} · ${tokenText}</strong></div>
       <div class="agent-usage-track" role="progressbar" aria-label="${info.label} 토큰 점유율" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(1)}">
         <span style="width:${Math.min(100, percent).toFixed(2)}%"></span>
       </div>
@@ -127,7 +134,7 @@ function renderAgentUsage(data) {
 
 function renderTokenDetails(data) {
   const { rows, total } = buildAgentUsageRows(data);
-  $("tokenDetailsSummary").textContent = `세션 집계 ${formatTokens(total)} tokens · 세 모델 합계 100%`;
+  $("tokenDetailsSummary").textContent = `세션 집계 ${formatTokens(total)}토큰 · 세 모델 합계 100%`;
   $("tokenDetailsGrid").innerHTML = rows.map(({ info, row, context, actual, estimated, tokens, percent }) => {
     const cacheTokens = Number(row.cache_creation_input_tokens || 0)
       + Number(row.cache_read_input_tokens || 0)
@@ -137,8 +144,8 @@ function renderTokenDetails(data) {
     const contextTokens = `${context.estimated ? "~" : ""}${formatTokens(context.used_tokens || 0)} / ${formatTokens(context.limit_tokens || 0)}`;
     return `<article class="token-model-card" style="--agent-color:${info.color}">
       <header><img src="${info.avatar}" alt=""><div><strong>${info.label}</strong><span>${context.estimated ? "컨텍스트 추정값" : "최신 실제 컨텍스트"}</span></div></header>
-      <div class="token-model-total"><strong>${contextPercent.toFixed(1)}%</strong><span>${contextTokens} tokens</span></div>
-      <div class="token-model-track"><span style="width:${Math.min(100, contextPercent).toFixed(2)}%"></span></div>
+      <div class="token-model-total"><strong>${contextPercent.toFixed(1)}%</strong><span>${contextTokens}토큰</span></div>
+      <div class="token-model-track" role="progressbar" aria-label="${info.label} 컨텍스트 사용률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${contextPercent.toFixed(1)}"><span style="width:${Math.min(100, contextPercent).toFixed(2)}%"></span></div>
       <dl>
         <div><dt>세션 점유율</dt><dd>${percentText}</dd></div>
         <div><dt>세션 집계</dt><dd>${actual > 0 ? formatTokens(tokens) : `~${formatTokens(tokens)}`}</dd></div>
@@ -258,7 +265,7 @@ function renderAgentCalls(calls) {
   }
   $("agentCallLog").innerHTML = calls.slice(-10).reverse().map((call) => `
     <div class="runtime-item">
-      <span>${escapeHtml(call.time || "")} · ${escapeHtml(call.mode || "discussion")}</span>
+      <span>${escapeHtml(call.time || "")} · ${escapeHtml(MODE_LABELS[call.mode] || call.mode || "토론")}</span>
       <p><strong>${escapeHtml(AGENTS[call.source]?.label || call.source)}</strong> → <strong>${escapeHtml(AGENTS[call.target]?.label || call.target)}</strong><br>${escapeHtml(call.task || "")}</p>
     </div>`).join("");
 }
@@ -326,6 +333,9 @@ function updateLiveCard(data) {
     $("liveDetail").textContent = data.intervention_pending
       ? "사용자 개입을 처리할 준비 중입니다."
       : "모델 호출이 시작되면 여기에 표시됩니다.";
+    $("headerAgentName").textContent = "모델 · 대기";
+    $("headerPhase").textContent = data.intervention_pending ? "· 개입 대기" : "· 호출 전";
+    $("headerAgent").dataset.agent = "";
     return;
   }
   const agent = AGENTS[data.active_agent] || { label: data.active_agent, color: "#4f8cff" };
@@ -333,6 +343,10 @@ function updateLiveCard(data) {
   $("liveCard").style.setProperty("--live-color", agent.color);
   $("liveLine").textContent = `${agent.label} · ${data.active_phase || "생각 중"}`;
   $("liveDetail").textContent = `${formatTime(data.active_elapsed)} · ${data.active_cli_mode || "-"} · 입력 ${formatTokens(data.active_prompt_chars)}자`;
+  $("headerAgentName").textContent = `모델 · ${agent.label}`;
+  $("headerPhase").textContent = `· ${data.active_phase || "작업 중"}`;
+  $("headerAgent").dataset.agent = data.active_agent;
+  $("headerAgent").style.setProperty("--agent-color", agent.color);
 }
 
 function updateInspector(data) {
@@ -348,7 +362,7 @@ function updateInspector(data) {
   }
   if (lastState.sideMode !== data.mode_label) {
     $("sideMode").textContent = data.mode_label || "-";
-    $("headerMode").textContent = data.mode_label || "준비";
+    $("headerMode").textContent = `모드 · ${data.mode_label || "준비"}`;
     $("headerMode").dataset.mode = data.mode || "discussion";
     lastState.sideMode = data.mode_label;
   }
@@ -406,12 +420,13 @@ function updateInspector(data) {
     lastState.total_elapsed_time = data.total_elapsed_time;
   }
   if (Number(data.total_actual_tokens || 0) > 0) {
-    $("statTokens").textContent = `${formatTokens(data.total_actual_tokens)} actual`;
+    $("statTokens").textContent = `${formatTokens(data.total_actual_tokens)} 실측`;
     $("statCost").textContent = `$${Number(data.total_actual_cost_usd || 0).toFixed(4)}`;
   }
   $("budgetWarning").textContent = data.budget_exceeded || "";
   $("budgetWarning").style.display = data.budget_exceeded ? "block" : "none";
   $("retryBtn").style.display = data.can_retry ? "inline-flex" : "none";
+  $("continueNextBtn").style.display = data.can_continue_next ? "inline-flex" : "none";
   const usageKey = JSON.stringify([data.agent_usage || {}, data.context_usage || {}]);
   if (lastState.agentUsageKey !== usageKey) {
     renderAgentUsage(data);
@@ -523,17 +538,35 @@ function updateFeedHtml(feedHtml) {
   });
 }
 
+function updateConnectionSummary() {
+  const items = Array.from(document.querySelectorAll("#conn .conn-item"));
+  const connected = items.filter((item) => item.textContent.trim().startsWith("✅")).length;
+  const failed = items.filter((item) => item.textContent.trim().startsWith("❌")).length;
+  const target = $("headerConnection");
+  if (!items.length || (!connected && !failed)) {
+    target.textContent = "연결 · 확인 중";
+    target.dataset.connection = "pending";
+    return;
+  }
+  target.textContent = failed
+    ? `연결 · ${connected}/${items.length} 정상`
+    : `연결 · 모두 정상 (${connected})`;
+  target.dataset.connection = failed ? "error" : "ok";
+}
+
 function applyState(data) {
   if (lastState.feed_html !== data.feed_html) {
     updateFeedHtml(data.feed_html);
     lastState.feed_html = data.feed_html;
   }
   if (lastState.status !== data.status) {
-    $("status").textContent = data.status;
+    $("status").textContent = `상태 · ${data.status || "준비"}`;
+    $("status").dataset.status = data.status || "준비";
     lastState.status = data.status;
   }
   if (lastState.conn_html !== data.conn_html) {
     $("conn").innerHTML = `<div class="conn-list">${data.conn_html}</div><button class="ghost compact" onclick="recheck()"><svg viewBox="0 0 24 24" style="margin-right:4px"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>다시 확인</button>`;
+    updateConnectionSummary();
     lastState.conn_html = data.conn_html;
   }
   
@@ -640,6 +673,8 @@ function openSessionActions(id) {
   $("sessionTagsInput").value = (session.tags || []).join(", ");
   $("sessionFavoriteInput").checked = !!session.favorite;
   $("sessionArchivedInput").checked = !!session.archived;
+  $("activateSessionButton").disabled = id === sessionsActiveId;
+  $("activateSessionButton").textContent = id === sessionsActiveId ? "현재 활성" : "활성화";
   $("sessionActionsDialog").showModal();
 }
 
@@ -671,6 +706,35 @@ async function cloneManagedSession() {
   if (data.error) alert(data.error); else location.reload();
 }
 
+async function activateSession(id) {
+  if (!id || id === sessionsActiveId) return;
+  const session = sessionsById[id] || {};
+  const label = session.name || session.topic || "선택한 세션";
+  if (!confirm(`"${label}" 세션을 활성화할까요?\nCLI는 자동 실행되지 않습니다.`)) return;
+  const response = await fetch("/session/activate", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ id }).toString(),
+  });
+  const data = await response.json();
+  if (data.error) {
+    alert(data.error);
+    return;
+  }
+  viewingId = null;
+  lastVersion = null;
+  closeSessionActions();
+  location.reload();
+}
+
+async function activateManagedSession() {
+  await activateSession($("sessionActionId").value);
+}
+
+async function activateViewedSession() {
+  await activateSession(viewingId);
+}
+
 async function deleteManagedSession() {
   const id = $("sessionActionId").value;
   if (!confirm("이 세션과 저장된 메모리를 삭제할까요?")) return;
@@ -690,7 +754,7 @@ async function loadPromptPreview() {
   const response = await fetch(`/prompt-preview.json?agent=${encodeURIComponent($("previewAgent").value)}`);
   const data = await response.json();
   if (data.error) { $("promptPreviewText").textContent = data.error; return; }
-  $("previewStats").textContent = `${data.phase} · ${formatTokens(data.characters)}자 · 추정 ${formatTokens(data.estimated_tokens)} tokens · 공유 ${data.shared_context.join(", ") || "없음"}`;
+  $("previewStats").textContent = `${data.phase} · ${formatTokens(data.characters)}자 · 추정 ${formatTokens(data.estimated_tokens)}토큰 · 공유 ${data.shared_context.join(", ") || "없음"}`;
   $("promptPreviewText").textContent = data.prompt;
 }
 
@@ -911,6 +975,14 @@ async function stopSession() {
 
 async function retryFailedTurn() {
   const response = await fetch("/retry", { method: "POST" });
+  const data = await response.json();
+  if (data.error) alert(data.error);
+  else applyState(data);
+}
+
+async function continueNextAgent() {
+  if (!confirm("현재 변경을 유지하고 실패한 턴을 건너뛸까요?")) return;
+  const response = await fetch("/continue-next", { method: "POST" });
   const data = await response.json();
   if (data.error) alert(data.error);
   else applyState(data);
