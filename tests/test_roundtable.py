@@ -144,6 +144,17 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(roundtable.turn_project_access("discussion", state), "read")
         self.assertEqual(roundtable.turn_project_access("coding", state), "write")
 
+    def test_antigravity_read_only_review_auto_approves_sandboxed_commands(self):
+        roundtable.STATE["mode"] = "continuous"
+        roundtable.STATE["workspace_access"] = "write"
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_antigravity("검토", "discussion")
+        args = run_cli.call_args.args[2]
+        self.assertIn("--sandbox", args)
+        self.assertIn("--dangerously-skip-permissions", args)
+        self.assertEqual(args[args.index("--mode") + 1], "plan")
+
     def test_coding_proposals_wait_for_combined_confirmation(self):
         self.assertFalse(
             roundtable.should_honor_approval_request(True, "coding", "개선안 제안")
@@ -491,6 +502,38 @@ class RoundtableTests(unittest.TestCase):
         ]
         self.assertEqual(roundtable.role_scope_violations("codex", changed, state), [])
 
+    def test_role_scope_ignores_virtual_environment(self):
+        state = roundtable.new_state()
+        state["agent_roles"]["codex"] = "backend"
+        changed = [
+            {"path": "app.py", "change": "modified"},
+            {"path": ".venv/", "change": "created"},
+            {"path": "venv/Lib/site-packages/cache.py", "change": "modified"},
+        ]
+        self.assertEqual(roundtable.role_scope_violations("codex", changed, state), [])
+
+    def test_role_scope_ignores_pytest_runtime_directories(self):
+        state = roundtable.new_state()
+        state["agent_roles"]["codex"] = "backend"
+        changed = [
+            {"path": "db.py", "change": "modified"},
+            {"path": ".pytest_work_20260720/", "change": "created"},
+            {"path": ".test_tmp_run/app.db", "change": "created"},
+        ]
+        self.assertEqual(roundtable.role_scope_violations("codex", changed, state), [])
+
+    def test_qa_role_allows_pytest_configuration_in_pyproject(self):
+        state = roundtable.new_state()
+        state["agent_roles"]["antigravity"] = "qa"
+        changed = [
+            {"path": "tests/test_app.py", "change": "modified"},
+            {"path": "pyproject.toml", "change": "modified"},
+        ]
+        self.assertEqual(
+            roundtable.role_scope_violations("antigravity", changed, state),
+            [],
+        )
+
     def test_failed_workflow_step_can_continue_without_repeating(self):
         state = roundtable.new_state()
         state.update(
@@ -514,6 +557,8 @@ class RoundtableTests(unittest.TestCase):
         prompt = roundtable.role_prompt("claude", state)
         self.assertIn("프론트엔드 개발자", prompt)
         self.assertIn("다른 역할의 작업을 대신 수행", prompt)
+        self.assertIn("허용 파일 패턴:", prompt)
+        self.assertIn("담당 밖 파일 수정까지 요청하더라도 거절", prompt)
 
     def test_unassigned_role_does_not_enforce_file_scope(self):
         state = roundtable.new_state()
@@ -966,6 +1011,7 @@ class RoundtableTests(unittest.TestCase):
             existing.write_text("after with different size", encoding="utf-8")
             (root / "created.txt").write_text("new", encoding="utf-8")
             (root / ".git").mkdir()
+            (root / ".venv").mkdir()
             after, after_truncated = roundtable.snapshot_project_tree(root)
 
         changes = {
@@ -975,7 +1021,8 @@ class RoundtableTests(unittest.TestCase):
         self.assertFalse(before_truncated or after_truncated)
         self.assertIn(("existing.txt", "수정"), changes)
         self.assertIn(("created.txt", "생성"), changes)
-        self.assertIn((".git/", "생성"), changes)
+        self.assertNotIn((".git/", "생성"), changes)
+        self.assertNotIn((".venv/", "생성"), changes)
 
     def test_disabled_agent_cannot_be_an_intervention_target(self):
         roundtable.STATE["enabled_agents"] = ["codex", "claude"]

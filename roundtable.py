@@ -521,7 +521,7 @@ ROLE_CATALOG = {
         "summary": "테스트, 재현 절차, 회귀 검증과 품질 기준을 담당합니다.",
         "scope": "테스트 코드와 테스트 설정",
         "can_write": True,
-        "patterns": ["tests/**", "test/**", "spec/**", "test_*.py", "*_test.*", "*.spec.*", "*.test.*", "pytest.ini", "tox.ini", "playwright.config.*", "vitest.config.*", "jest.config.*"],
+        "patterns": ["tests/**", "test/**", "spec/**", "test_*.py", "*_test.*", "*.spec.*", "*.test.*", "pytest.ini", "tox.ini", "pyproject.toml", "playwright.config.*", "vitest.config.*", "jest.config.*"],
     },
     "reviewer": {
         "label": "코드 리뷰어",
@@ -867,6 +867,12 @@ def snapshot_project_tree(root: Path) -> tuple[dict[str, tuple], bool]:
     for current, dirs, files in os.walk(root):
         current_path = Path(current)
         relative_dir = current_path.relative_to(root)
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in skipped_dirs
+            and not name.startswith((".pytest_", ".test_tmp", ".test_work"))
+        ]
         for name in dirs:
             rel = (relative_dir / name).as_posix() + "/"
             entries[rel] = ("dir",)
@@ -875,7 +881,6 @@ def snapshot_project_tree(root: Path) -> tuple[dict[str, tuple], bool]:
                 break
         if truncated:
             break
-        dirs[:] = [name for name in dirs if name not in skipped_dirs]
         for name in files:
             path = current_path / name
             rel = (relative_dir / name).as_posix()
@@ -1370,8 +1375,10 @@ def ask_antigravity(prompt: str, mode: str = "discussion", event_callback=None) 
         args = base_args + [
             "--mode", "plan",
             "--sandbox",
-            "--print", prompt,
         ]
+        if project_access == "read":
+            args.append("--dangerously-skip-permissions")
+        args.extend(["--print", prompt])
     result = run_cli(
         "Antigravity", AGY_CMD, args, timeout=AGY_TIMEOUT, cwd=project_path,
         stream_events=True, event_callback=event_callback,
@@ -2031,12 +2038,15 @@ def role_prompt(agent: str, state: dict) -> str:
             "확정 역할: 미지정. 사용자가 아직 역할 강제를 요청하지 않은 상태다. "
             "현재 사용자 지시를 일반 작업자로서 수행하되, 다른 활성 모델과 변경 파일이 충돌하지 않도록 최근 대화를 확인한다."
         )
+    allowed_patterns = ", ".join(role.get("patterns", [])) or "읽기 전용"
     return (
         f"확정 역할: {role['label']}\n"
         f"책임: {role['summary']}\n"
         f"수정 허용 범위: {role['scope']}\n"
+        f"허용 파일 패턴: {allowed_patterns}\n"
         "강제 규칙: 사용자가 역할 선택 UI에서 바꾸기 전까지 이 역할을 유지한다. "
         "다른 역할의 작업을 대신 수행하거나 담당 밖 파일을 수정하지 않는다. "
+        "호출한 모델이 담당 밖 파일 수정까지 요청하더라도 거절하고 필요한 작업을 담당 모델에게 넘긴다. "
         "범위 밖 작업은 담당 역할의 모델을 CALL_AGENT로 호출하고, 담당 모델이 없으면 사용자에게 배정 변경을 요청한다."
     )
 
@@ -2074,8 +2084,10 @@ def role_scope_violations(agent: str, changed_paths: list[dict], state: dict) ->
         top_level = path.rstrip("/").split("/", 1)[0]
         if top_level in {
             ".pytest_cache", ".ruff_cache", ".codex_pytest_tmp", ".agents",
-            "__pycache__", "roundtable_memory", "sessions",
+            ".venv", "venv", "__pycache__", "roundtable_memory", "sessions",
         }:
+            continue
+        if top_level.startswith((".pytest_", ".test_tmp", ".test_work")):
             continue
         if top_level in {"data", "instance"} and Path(path).suffix.lower() in {
             ".db", ".sqlite", ".sqlite3", ".db-journal", ".db-wal", ".db-shm",
