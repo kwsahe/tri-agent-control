@@ -74,6 +74,21 @@
       <section id="topicSection">__TOPIC_SECTION__</section>
       <section class="feed" id="feed" aria-label="에이전트 대화">__FEED__</section>
 
+      <section class="user-question-banner" id="userQuestionBanner" style="display:none" aria-live="assertive">
+        <div class="user-question-heading">
+          <strong>사용자 답변 필요</strong>
+          <span id="userQuestionSource"></span>
+        </div>
+        <p class="user-question-reason" id="userQuestionReason"></p>
+        <p class="user-question-text" id="userQuestionText"></p>
+        <div class="user-question-options" id="userQuestionOptions"></div>
+        <textarea id="userQuestionAnswer" placeholder="선택에 덧붙일 내용이나 자유 답변을 입력하세요"></textarea>
+        <button id="userQuestionSubmit" onclick="submitQuestionAnswer()">
+          <svg viewBox="0 0 24 24"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg>
+          답변하고 계속
+        </button>
+      </section>
+
       <section class="approve-banner" id="approveBanner" style="display:none">
         <p id="approveHint">위 확인 요청을 검토하고, 실제 코딩을 진행해도 될지 승인해주세요.</p>
         <div class="approve-actions">
@@ -110,7 +125,6 @@
         <select id="composerModeSelect" aria-label="채팅 모드">
           <option value="discussion">토론 모드</option>
           <option value="coding">코딩 모드</option>
-          <option value="continuous">무제한 코딩</option>
         </select>
         <button class="ghost" onclick="changeSessionMode('composer')">모드 전환</button>
         <select id="composerDiscussionAccess" aria-label="토론 프로젝트 접근">
@@ -157,14 +171,21 @@
         <strong id="sideMode">-</strong>
       </div>
       <div class="metric-row" id="sideCycleRow" style="display:none">
-        <span>반복</span>
-        <strong id="sideCycle">사이클 1</strong>
+        <span>진행</span>
+        <strong id="sideCycle">계획·승인</strong>
+      </div>
+      <div class="metric-row" id="sideCodingLimitRow" style="display:none">
+        <span>자동 한도</span>
+        <strong id="sideCodingLimit">3회 · 45분</strong>
+      </div>
+      <div class="metric-row" id="sideCodingStopRow" style="display:none">
+        <span>종료 이유</span>
+        <strong id="sideCodingStop">-</strong>
       </div>
       <div class="mode-switcher">
         <select id="sessionModeSelect" aria-label="세션 모드">
           <option value="discussion">토론 모드</option>
           <option value="coding">코딩 모드</option>
-          <option value="continuous">무제한 코딩</option>
         </select>
         <button class="ghost compact" onclick="changeSessionMode()">전환</button>
       </div>

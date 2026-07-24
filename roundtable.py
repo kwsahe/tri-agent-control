@@ -59,6 +59,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from triagent.domain import workflow
+
 for stream in (sys.stdout, sys.stderr):
     try:
         stream.reconfigure(encoding="utf-8", errors="replace")
@@ -447,7 +449,7 @@ CODING_REPORT_STEP = (
     "discussion",
 )
 
-CONTINUOUS_CODING_STEPS = [
+GOAL_CODING_STEPS = [
     ("codex", "개발 진행",
      "현재 프로젝트 상태, 최근 교차 검토와 통합 결론을 먼저 확인해. 아직 완성되지 않은 항목 중 가장 중요한 담당 작업을 "
      "계획 보고로 끝내지 말고 실제 코드로 구현해. 기존 변경과 충돌하지 않게 수정하고 가능한 검증을 실행한 뒤 변경 파일과 결과만 간결하게 보고해.",
@@ -470,9 +472,11 @@ CONTINUOUS_CODING_STEPS = [
 ]
 
 
-def continuous_coding_steps(enabled_agents: list[str]) -> list[tuple[str, str, str, str]]:
+def goal_coding_steps(enabled_agents: list[str]) -> list[tuple[str, str, str, str]]:
     enabled = normalize_enabled_agents(enabled_agents)
-    steps = [step for step in CONTINUOUS_CODING_STEPS if step[0] in enabled]
+    steps = order_steps_by_agents(
+        [step for step in GOAL_CODING_STEPS if step[0] in enabled], enabled
+    )
     reporter = reporter_for(enabled)
     steps.append((
         reporter,
@@ -483,6 +487,40 @@ def continuous_coding_steps(enabled_agents: list[str]) -> list[tuple[str, str, s
         "discussion",
     ))
     return steps
+
+
+DEFAULT_CODING_LIMITS = {
+    "max_cycles": 3,
+    "max_minutes": 45,
+    "max_tokens": 200_000,
+    "max_changed_files": 50,
+    "max_diff_lines": 2_000,
+    "max_consecutive_failures": 2,
+    "max_same_error": 2,
+}
+
+
+def normalize_coding_limits(value: dict | None) -> dict:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        key: max(1, int(raw.get(key, default) or default))
+        for key, default in DEFAULT_CODING_LIMITS.items()
+    }
+
+
+def normalize_coding_progress(value: dict | None) -> dict:
+    raw = value if isinstance(value, dict) else {}
+    changed_paths = [
+        str(path) for path in raw.get("changed_paths", [])
+        if isinstance(path, str) and path
+    ][:500]
+    return {
+        "changed_paths": list(dict.fromkeys(changed_paths)),
+        "diff_lines": max(0, int(raw.get("diff_lines", 0) or 0)),
+        "consecutive_failures": max(0, int(raw.get("consecutive_failures", 0) or 0)),
+        "same_error_count": max(0, int(raw.get("same_error_count", 0) or 0)),
+        "last_error_signature": str(raw.get("last_error_signature", ""))[:500],
+    }
 
 
 AGENT_ORDER = ["codex", "antigravity", "claude"]
@@ -704,7 +742,7 @@ def turn_project_access(cli_mode: str, state: dict | None = None) -> str:
     current = state if isinstance(state, dict) else globals().get("STATE", {})
     if cli_mode == "coding":
         return "write"
-    if current.get("mode") in {"coding", "continuous"}:
+    if current.get("mode") == "coding":
         return "read"
     return normalize_discussion_project_access(current.get("discussion_project_access"))
 
@@ -719,6 +757,29 @@ def cli_working_directory(cli_mode: str) -> Path:
 def normalize_enabled_agents(enabled_agents: list[str] | None) -> list[str]:
     enabled = [a for a in (enabled_agents or AGENT_ORDER) if a in AGENT_ORDER]
     return enabled or list(AGENT_ORDER)
+
+
+def prioritize_start_agent(enabled_agents: list[str] | None, start_agent: str = "") -> list[str]:
+    enabled = normalize_enabled_agents(enabled_agents)
+    if start_agent not in enabled:
+        return enabled
+    return [start_agent, *[agent for agent in enabled if agent != start_agent]]
+
+
+def order_steps_by_agents(
+    steps: list[tuple[str, str, str, str]],
+    enabled_agents: list[str],
+) -> list[tuple[str, str, str, str]]:
+    """Keep phase order stable while honoring the selected agent order within each phase."""
+    enabled = normalize_enabled_agents(enabled_agents)
+    phases = list(dict.fromkeys(step[1] for step in steps))
+    return [
+        step
+        for phase in phases
+        for agent in enabled
+        for step in steps
+        if step[1] == phase and step[0] == agent
+    ]
 
 
 def reporter_for(enabled_agents: list[str]) -> str:
@@ -760,16 +821,18 @@ def make_confirm_step(enabled_agents: list[str]) -> tuple[str, str, str, str]:
 
 def steps_for_mode(mode: str, enabled_agents: list[str] | None = None) -> list[tuple[str, str, str, str]]:
     enabled = normalize_enabled_agents(enabled_agents)
-    if mode == "continuous":
-        return continuous_coding_steps(enabled)
-    discussion_steps = [
+    discussion_steps = order_steps_by_agents([
         (agent, phase, instruction + (role_choice_instruction() if phase in {"역할 선언", "역할 확정"} else ""), cli_mode)
         for agent, phase, instruction, cli_mode in DISCUSSION_STEPS
         if agent in enabled
-    ]
+    ], enabled)
     if mode == "coding":
-        proposal_steps = [step for step in PROPOSAL_STEPS if step[0] in enabled and step[1] != CONFIRM_PHASE]
-        coding_steps = [step for step in CODING_WORK_STEPS if step[0] in enabled]
+        proposal_steps = order_steps_by_agents(
+            [step for step in PROPOSAL_STEPS if step[0] in enabled and step[1] != CONFIRM_PHASE], enabled
+        )
+        coding_steps = order_steps_by_agents(
+            [step for step in CODING_WORK_STEPS if step[0] in enabled], enabled
+        )
         return discussion_steps + proposal_steps + [make_confirm_step(enabled)] + coding_steps + [make_report_step(enabled, coding=True)]
     return discussion_steps + [make_report_step(enabled)]
 
@@ -1250,7 +1313,7 @@ def is_incomplete_tool_response(text: str) -> bool:
 def should_honor_approval_request(
     requested: bool, session_mode: str, phase: str
 ) -> bool:
-    if not requested or session_mode == "continuous":
+    if not requested or "목표 사이클" in phase:
         return False
     if session_mode == "coding" and (
         phase in {"개선안 제안", "최종 보고"} or phase.startswith("호출 답변")
@@ -1416,6 +1479,7 @@ def new_state() -> dict:
         "mode": "discussion",
         "discussion_project_access": "read",
         "enabled_agents": list(AGENT_ORDER),
+        "start_agent": AGENT_ORDER[0],
         "agent_settings": normalize_agent_settings(None),
         "agent_roles": normalize_agent_roles(None),
         "role_history": [],
@@ -1439,11 +1503,22 @@ def new_state() -> dict:
         "delegation_count": 0,
         "delegation_history": [],
         "pending_interventions": [],
-        "continuous_stopped": False,
+        "coding_stage": "planning",
+        "coding_cycle": 0,
+        "coding_cycle_step": 0,
+        "coding_started_at": None,
+        "coding_limits": normalize_coding_limits(None),
+        "coding_progress": normalize_coding_progress(None),
+        "coding_stopped": False,
+        "coding_stop_reason": "",
+        "workflow_status": workflow.IDLE,
+        "pending_user_question": None,
+        "user_question_history": [],
     }
 
 
 def normalize_state(state: dict) -> dict:
+    legacy_continuous = state.get("mode") == "continuous"
     state.setdefault("id", new_session_id())
     state.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
     state.setdefault("name", state.get("topic") or "새 세션")
@@ -1460,13 +1535,15 @@ def normalize_state(state: dict) -> dict:
     state.setdefault("finished", False)
     state.setdefault("topic", "")
     state.setdefault("mode", "discussion")
+    if state["mode"] == "continuous":
+        state["mode"] = "coding"
     state["discussion_project_access"] = normalize_discussion_project_access(
         state.get("discussion_project_access")
     )
     state.setdefault("workspace_path", str(load_project_path()))
     state.setdefault("workspace_access", "write")
     state["workspace_access"] = "write" if state.get("workspace_access") == "write" else "read"
-    if state.get("mode") in {"coding", "continuous"}:
+    if state.get("mode") == "coding":
         state["discussion_project_access"] = "write"
         state["workspace_access"] = "write"
     state.setdefault("total_est_tokens", 0)
@@ -1492,7 +1569,50 @@ def normalize_state(state: dict) -> dict:
     state.setdefault("delegation_history", [])
     state.setdefault("pending_interventions", [])
     state["continuous_stopped"] = bool(state.get("continuous_stopped", False))
-    state["enabled_agents"] = normalize_enabled_agents(state.get("enabled_agents"))
+    saved_workflow_status = state.get("workflow_status")
+    if not saved_workflow_status and state.get("finished"):
+        saved_workflow_status = workflow.COMPLETED
+    elif not saved_workflow_status and state.get("continuous_stopped"):
+        saved_workflow_status = workflow.CANCELLED
+    state["workflow_status"] = workflow.normalize_workflow_status(
+        saved_workflow_status, has_topic=bool(state.get("topic"))
+    )
+    state["pending_user_question"] = workflow.normalize_user_question(
+        state.get("pending_user_question")
+    )
+    if state["pending_user_question"]:
+        state["workflow_status"] = workflow.WAITING_FOR_USER_RESPONSE
+    state.setdefault("user_question_history", [])
+    if not isinstance(state["user_question_history"], list):
+        state["user_question_history"] = []
+    state["enabled_agents"] = prioritize_start_agent(
+        state.get("enabled_agents"), state.get("start_agent", "")
+    )
+    state["start_agent"] = state["enabled_agents"][0]
+    state["coding_limits"] = normalize_coding_limits(state.get("coding_limits"))
+    state["coding_progress"] = normalize_coding_progress(state.get("coding_progress"))
+    state["coding_stopped"] = bool(
+        state.get("coding_stopped", False) or state.get("continuous_stopped", False)
+    )
+    state.setdefault("coding_stop_reason", "")
+    state.setdefault("coding_started_at", None)
+    if legacy_continuous:
+        legacy_index = max(0, int(state.get("step_index", 0)))
+        cycle_steps = goal_coding_steps(state["enabled_agents"])
+        state["coding_stage"] = "iteration"
+        state["coding_cycle"] = (legacy_index // max(1, len(cycle_steps))) + 1
+        state["coding_cycle_step"] = legacy_index % max(1, len(cycle_steps))
+        state["step_index"] = len(steps_for_mode("coding", state["enabled_agents"]))
+    else:
+        state["coding_stage"] = (
+            state.get("coding_stage")
+            if state.get("coding_stage") in {"planning", "iteration"}
+            else "planning"
+        )
+        state["coding_cycle"] = max(0, int(state.get("coding_cycle", 0) or 0))
+        state["coding_cycle_step"] = max(0, int(state.get("coding_cycle_step", 0) or 0))
+    if state["coding_stage"] == "iteration" and not state.get("coding_started_at"):
+        state["coding_started_at"] = time.time()
     state["agent_settings"] = normalize_agent_settings(state.get("agent_settings"))
     state["agent_roles"] = normalize_agent_roles(state.get("agent_roles"))
     state.setdefault("role_history", [])
@@ -1505,7 +1625,12 @@ def normalize_state(state: dict) -> dict:
 def load_state() -> dict:
     if STATE_PATH.exists():
         try:
-            state = normalize_state(json.loads(STATE_PATH.read_text(encoding="utf-8")))
+            raw_state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            state = normalize_state(
+                json.loads(json.dumps(raw_state, ensure_ascii=False))
+            )
+            if state != raw_state:
+                save_state(state)
             # 프로세스가 새로 시작됐다면 이전 프로세스의 실행 중 표시는 더 이상 유효하지 않다.
             state["active_agent"] = None
             state["active_phase"] = None
@@ -1520,14 +1645,23 @@ def load_state() -> dict:
     return new_state()
 
 
+def atomic_write_json(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(state, ensure_ascii=False, indent=2)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temp_path.write_text(payload, encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def save_state(state: dict) -> None:
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(STATE_PATH, state)
     SESSIONS_DIR.mkdir(exist_ok=True)
     session_id = state.get("id")
     if session_id:
-        (SESSIONS_DIR / f"{session_id}.json").write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        atomic_write_json(SESSIONS_DIR / f"{session_id}.json", state)
 
 
 def list_sessions() -> list[dict]:
@@ -1971,6 +2105,11 @@ def compose_agent_prompt(
         "직접 해결할 수 있으면 호출하지 않는다. 자신은 호출하지 않는다.\n"
         f"사용자 승인이 꼭 필요하면 설명을 마친 뒤 마지막 줄에 {APPROVAL_TOKEN}만 쓴다. "
         f"승인이 필요하지 않으면 {APPROVAL_TOKEN}를 쓰지 않는다.\n\n"
+        "사용자 판단 없이는 안전하게 진행할 수 없으면 추측하지 말고 답변 마지막에 JSON 객체를 쓴다. "
+        '형식: {"action":"STOP_AND_ASK_USER","reason":"중단 이유","question":"질문",'
+        '"options":[{"id":"A","label":"선택지","risk":"위험"}],'
+        '"recommended_option":"A","blocking":true}. '
+        "blocking은 반드시 true이며, 이 신호를 쓴 뒤 추가 작업을 진행하지 않는다.\n\n"
     )
     policy_blocks = [block for block in (project_context, role_context) if block]
     policy_block = "\n\n" + "\n\n".join(policy_blocks) if policy_blocks else ""
@@ -2002,7 +2141,7 @@ STATE: dict = load_state()
 _RESTORED_INTERVENTIONS = list(STATE.get("pending_interventions", []))
 CONTROL = {
     "paused": False,
-    "stopped": bool(STATE.get("mode") == "continuous" and STATE.get("continuous_stopped")),
+    "stopped": bool(STATE.get("mode") == "coding" and STATE.get("coding_stopped")),
     "worker_running": False,
     "worker_session_id": None,
     "worker_start_pending": False,
@@ -2017,6 +2156,88 @@ CONTROL = {
     "intervention_intent": _RESTORED_INTERVENTIONS[0].get("intent", "") if _RESTORED_INTERVENTIONS else "",
     "intervention_queue": _RESTORED_INTERVENTIONS,
 }
+
+
+def waiting_for_user_response(state: dict | None = None) -> bool:
+    current = state if state is not None else STATE
+    return (
+        current.get("workflow_status") == workflow.WAITING_FOR_USER_RESPONSE
+        and bool(current.get("pending_user_question"))
+    )
+
+
+def register_user_question(agent: str, phase: str, question_data: dict) -> bool:
+    question = workflow.normalize_user_question(question_data)
+    if not question:
+        return False
+    with STATE_LOCK:
+        if waiting_for_user_response(STATE):
+            return False
+        question.update({
+            "source_agent": agent,
+            "source_phase": phase,
+            "asked_at": datetime.now().isoformat(timespec="seconds"),
+            "resume_step_index": int(STATE.get("step_index", 0)) + 1,
+        })
+        STATE["pending_user_question"] = question
+        STATE["workflow_status"] = workflow.WAITING_FOR_USER_RESPONSE
+        save_state(STATE)
+    add_runtime_event(
+        f"{AGENTS.get(agent, {}).get('label', agent)}의 사용자 질문으로 자동 진행을 중단했습니다."
+    )
+    return True
+
+
+def answer_pending_user_question(option_id: str = "", answer: str = "") -> dict:
+    option_id = option_id.strip()
+    answer = answer.strip()
+    with STATE_LOCK:
+        question = workflow.normalize_user_question(STATE.get("pending_user_question"))
+        if not question or not waiting_for_user_response(STATE):
+            return {"error": "현재 답변을 기다리는 질문이 없습니다."}
+
+        options = {item["id"]: item for item in question["options"]}
+        if options and option_id not in options:
+            return {"error": "제시된 선택지 중 하나를 선택해주세요.", "question": question}
+        if not options and not answer:
+            return {"error": "질문에 대한 답변을 입력해주세요.", "question": question}
+
+        selected = options.get(option_id)
+        response_text = selected["label"] if selected else answer
+        if selected and answer:
+            response_text = f"{response_text}\n\n추가 답변: {answer}"
+        history_item = {
+            **question,
+            "selected_option": option_id,
+            "answer": answer,
+            "answered_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        session_id = STATE.get("id")
+
+    if not add_message(
+        "user", "질문 답변", response_text, expected_session_id=session_id
+    ):
+        return {"error": "답변을 세션에 기록하지 못했습니다. 다시 시도해주세요."}
+
+    with STATE_LOCK:
+        if STATE.get("id") != session_id or not waiting_for_user_response(STATE):
+            return {"error": "답변을 기록하는 동안 활성 세션이 변경되었습니다."}
+        STATE["user_question_history"].append(history_item)
+        STATE["pending_user_question"] = None
+        STATE["workflow_status"] = (
+            workflow.CODING
+            if STATE.get("mode") == "coding"
+            else workflow.DEBATING
+        )
+        CONTROL["paused"] = False
+        CONTROL["stopped"] = False
+        save_state(STATE)
+
+    add_runtime_event("사용자 답변이 기록되어 중단된 워크플로를 재개합니다.")
+    start_worker_if_needed(force=True)
+    payload = state_json_payload()
+    payload["success"] = True
+    return payload
 
 
 def workspace_access_mode() -> str:
@@ -2204,7 +2425,7 @@ def update_workspace_selection(path_text: str, access: str) -> dict:
     if not os.access(candidate, os.R_OK):
         return {"error": "선택한 폴더에 읽기 권한이 없습니다."}
     with STATE_LOCK:
-        coding_session = STATE.get("mode") in {"coding", "continuous"}
+        coding_session = STATE.get("mode") == "coding"
     access = "write" if coding_session or access == "write" else "read"
     if access == "write" and not os.access(candidate, os.W_OK):
         return {"error": "선택한 폴더에 쓰기 권한이 없습니다."}
@@ -2272,6 +2493,8 @@ if _restored_approval_requesters and not STATE.get("finished", False):
     CONTROL["approval_requested"] = True
     CONTROL["approval_requested_by"] = _restored_approval_requesters
     CONTROL["awaiting_approval"] = True
+    if not waiting_for_user_response(STATE):
+        STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
 
 _orphaned_approval_agents = orphaned_approval_followup_agents(STATE.get("messages", []))
 if _orphaned_approval_agents and not any(
@@ -2338,6 +2561,8 @@ def mark_approval_requested(agent: str, phase: str) -> None:
         requesters = CONTROL.setdefault("approval_requested_by", [])
         if requester not in requesters:
             requesters.append(requester)
+        STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
+        save_state(STATE)
 
 
 # ──────────────────────────────────────────
@@ -2499,6 +2724,8 @@ def bubble_html(m: dict) -> str:
 def status_text() -> str:
     if not STATE.get("topic"):
         return "주제 입력 대기"
+    if waiting_for_user_response(STATE):
+        return "사용자 답변 대기 중"
     active_agent = STATE.get("active_agent")
     if active_agent:
         label = AGENTS.get(active_agent, {}).get("label", active_agent)
@@ -2518,8 +2745,8 @@ def status_text() -> str:
         return "\U0001f6d1 사용자 승인 대기 중"
     if CONTROL["paused"]:
         return "일시정지"
-    if STATE.get("mode") == "continuous":
-        return "무제한 코딩 진행 중"
+    if STATE.get("mode") == "coding" and STATE.get("coding_stage") == "iteration":
+        return f"목표 기반 코딩 · 사이클 {max(1, int(STATE.get('coding_cycle', 1) or 1))}"
     return "진행 중..."
 
 
@@ -2544,6 +2771,34 @@ def budget_exceeded_reason(state: dict) -> str | None:
         return f"실제 토큰 예산 {token_limit:,}개에 도달했습니다."
     if cost_limit and float(state.get("total_actual_cost_usd", 0.0) or 0.0) >= cost_limit:
         return f"비용 예산 ${cost_limit:.2f}에 도달했습니다."
+    return None
+
+
+def coding_limit_reason(state: dict) -> str | None:
+    if state.get("mode") != "coding" or state.get("coding_stage") != "iteration":
+        return None
+    limits = normalize_coding_limits(state.get("coding_limits"))
+    progress = normalize_coding_progress(state.get("coding_progress"))
+    cycle = max(1, int(state.get("coding_cycle", 1) or 1))
+    if cycle > limits["max_cycles"]:
+        return f"최대 목표 사이클 {limits['max_cycles']}회 완료"
+    started_at = float(state.get("coding_started_at", 0) or 0)
+    if started_at and time.time() - started_at >= limits["max_minutes"] * 60:
+        return f"최대 실행 시간 {limits['max_minutes']}분 도달"
+    used_tokens = max(
+        int(state.get("total_actual_tokens", 0) or 0),
+        int(state.get("total_est_tokens", 0) or 0),
+    )
+    if used_tokens >= limits["max_tokens"]:
+        return f"최대 토큰 {limits['max_tokens']:,} 도달"
+    if len(progress["changed_paths"]) >= limits["max_changed_files"]:
+        return f"최대 변경 파일 {limits['max_changed_files']}개 도달"
+    if progress["diff_lines"] >= limits["max_diff_lines"]:
+        return f"최대 diff {limits['max_diff_lines']:,}줄 도달"
+    if progress["consecutive_failures"] >= limits["max_consecutive_failures"]:
+        return f"연속 실패 {limits['max_consecutive_failures']}회 도달"
+    if progress["same_error_count"] >= limits["max_same_error"]:
+        return f"동일 오류 {limits['max_same_error']}회 반복"
     return None
 
 
@@ -2837,6 +3092,12 @@ def approve_pending_work() -> bool:
         request["agent"] for request in approval_requests if request["phase"] != CONFIRM_PHASE
     ))
     with STATE_LOCK:
+        if not waiting_for_user_response(STATE):
+            STATE["workflow_status"] = (
+                workflow.CODING
+                if STATE.get("mode") == "coding"
+                else workflow.DEBATING
+            )
         if followup_agents:
             CONTROL["intervention_queue"].append({
                 "intent": "execute",
@@ -2869,6 +3130,8 @@ def wait_for_user_approval(session_id: str) -> bool:
         CONTROL["approval_deferred"] = False
         CONTROL["approval_rejected"] = False
         CONTROL["approval_seen_messages"] = len(STATE["messages"])
+        STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
+        save_state(STATE)
     separator("사용자 승인 대기 중 — 승인해야 다음 단계가 진행됩니다")
     while CONTROL["awaiting_approval"] and not CONTROL["stopped"]:
         with STATE_LOCK:
@@ -2911,7 +3174,9 @@ def run_step(
 ) -> bool:
     requested_cli_mode = cli_mode
     with STATE_LOCK:
-        budget_reason = None if STATE.get("mode") == "continuous" else budget_exceeded_reason(STATE)
+        if waiting_for_user_response(STATE):
+            return False
+        budget_reason = budget_exceeded_reason(STATE)
     if budget_reason:
         CONTROL["paused"] = True
         add_runtime_event(f"예산 초과로 자동 일시정지: {budget_reason}", level="error")
@@ -2994,6 +3259,9 @@ def run_step(
         STATE["active_prompt_chars"] = len(prompt)
         STATE["active_work_log"] = []
         STATE["active_usage"] = {}
+        STATE["workflow_status"] = (
+            workflow.CODING if cli_mode == "coding" else workflow.DEBATING
+        )
         save_state(STATE)
     add_active_work_event(agent, {"kind": "status", "text": "CLI 프로세스 시작"})
     if shared_messages:
@@ -3056,10 +3324,14 @@ def run_step(
         (event.get("cost_usd") for event in reversed(work_log) if event.get("cost_usd") is not None),
         0.0,
     )
-    call_clean_text, agent_calls = extract_agent_calls(raw_text, agent, cli_mode)
+    question_clean_text, pending_question = workflow.extract_stop_and_ask_user(raw_text)
+    call_clean_text, agent_calls = extract_agent_calls(question_clean_text, agent, cli_mode)
     if not allow_agent_calls(state_snapshot.get("mode", "discussion"), phase):
         agent_calls = []
     visible_text, approval_requested = extract_approval_token(call_clean_text)
+    if pending_question:
+        agent_calls = []
+        approval_requested = False
     requested_role = extract_role_selection(visible_text) if phase in {"역할 선언", "역할 확정"} else ""
     if phase in {"역할 선언", "역할 확정"}:
         visible_text = strip_role_selection(visible_text)
@@ -3069,6 +3341,8 @@ def run_step(
         phase,
     )
     text, output_truncated = clip_agent_output(visible_text)
+    if pending_question and not text:
+        text = pending_question["question"]
     if approval_requested and not text:
         text = "사용자 승인을 요청했습니다."
     est_tokens = estimate_tokens(prompt, raw_text)
@@ -3106,12 +3380,11 @@ def run_step(
         "actual_usage": actual_usage,
         "actual_cost_usd": actual_cost_usd,
         "agent_calls": agent_calls,
+        "user_question_requested": bool(pending_question),
         "delegation_depth": delegation_depth,
-        "continuous_cycle": (
-            (int(state_snapshot.get("step_index", 0)) // max(1, len(steps_for_mode(
-                "continuous", normalize_enabled_agents(state_snapshot.get("enabled_agents"))
-            )))) + 1
-            if state_snapshot.get("mode") == "continuous" else 0
+        "coding_cycle": (
+            max(1, int(state_snapshot.get("coding_cycle", 1) or 1))
+            if state_snapshot.get("coding_stage") == "iteration" else 0
         ),
         "shared_context": [
             {
@@ -3126,6 +3399,27 @@ def run_step(
     with STATE_LOCK:
         same_session = STATE.get("id") == session_id
         if same_session:
+            if state_snapshot.get("mode") == "coding":
+                progress = normalize_coding_progress(STATE.get("coding_progress"))
+                progress["changed_paths"] = list(dict.fromkeys([
+                    *progress["changed_paths"],
+                    *(item["path"] for item in changed_paths),
+                ]))[:500]
+                progress["diff_lines"] += len(turn_diff.splitlines())
+                if failed:
+                    signature = (
+                        "role_scope:" + ",".join(scope_violations)
+                        if scope_violations else raw_text.strip()[:500]
+                    )
+                    progress["consecutive_failures"] += 1
+                    progress["same_error_count"] = (
+                        progress["same_error_count"] + 1
+                        if signature == progress["last_error_signature"] else 1
+                    )
+                    progress["last_error_signature"] = signature
+                else:
+                    progress["consecutive_failures"] = 0
+                STATE["coding_progress"] = progress
             STATE["active_agent"] = None
             STATE["active_phase"] = None
             STATE["active_started_at"] = None
@@ -3166,6 +3460,8 @@ def run_step(
         meta["role_label"] = role_label(selected_role)
         meta["role_auto_selected"] = True
     added = add_message(agent, phase, text, meta, expected_session_id=session_id)
+    if added and not failed and pending_question:
+        register_user_question(agent, phase, pending_question)
     if added and not failed and phase in {"역할 선언", "역할 확정"}:
         announce_roles_if_complete(expected_session_id=session_id)
     if added and not failed and agent_calls:
@@ -3180,18 +3476,63 @@ def worker_loop(session_id: str) -> None:
             with STATE_LOCK:
                 if STATE.get("id") != session_id:
                     break
+                if waiting_for_user_response(STATE):
+                    break
                 mode = STATE.get("mode", "discussion")
                 enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
-                steps = steps_for_mode(mode, enabled_agents)
-                step_index = STATE["step_index"]
-                continuous = mode == "continuous"
+                coding_iteration = (
+                    mode == "coding" and STATE.get("coding_stage") == "iteration"
+                )
+                steps = (
+                    goal_coding_steps(enabled_agents)
+                    if coding_iteration else steps_for_mode(mode, enabled_agents)
+                )
+                step_index = (
+                    int(STATE.get("coding_cycle_step", 0))
+                    if coding_iteration else int(STATE.get("step_index", 0))
+                )
+                cycle_number = (
+                    max(1, int(STATE.get("coding_cycle", 1) or 1))
+                    if coding_iteration else 0
+                )
+                limit_reason = coding_limit_reason(STATE) if coding_iteration else None
             if CONTROL["approval_requested"]:
                 if not wait_for_user_approval(session_id):
                     break
                 continue
             if process_pending_intervention(session_id):
                 continue
-            if not continuous and step_index >= len(steps):
+            if limit_reason:
+                with STATE_LOCK:
+                    if STATE.get("id") == session_id:
+                        STATE["finished"] = True
+                        STATE["coding_stopped"] = True
+                        STATE["coding_stop_reason"] = limit_reason
+                        STATE["workflow_status"] = workflow.COMPLETED
+                        save_state(STATE)
+                add_runtime_event(f"목표 기반 코딩 종료: {limit_reason}")
+                break
+            if mode == "coding" and not coding_iteration and step_index >= len(steps):
+                with STATE_LOCK:
+                    if STATE.get("id") != session_id:
+                        break
+                    STATE["coding_stage"] = "iteration"
+                    STATE["coding_cycle"] = 1
+                    STATE["coding_cycle_step"] = 0
+                    STATE["coding_started_at"] = STATE.get("coding_started_at") or time.time()
+                    STATE["coding_stopped"] = False
+                    STATE["coding_stop_reason"] = ""
+                    STATE["finished"] = False
+                    save_state(STATE)
+                add_runtime_event("계획·승인 단계 완료 · 목표 기반 코딩 사이클 1 시작")
+                continue
+            if coding_iteration and step_index >= len(steps):
+                with STATE_LOCK:
+                    STATE["coding_cycle"] = cycle_number + 1
+                    STATE["coding_cycle_step"] = 0
+                    save_state(STATE)
+                continue
+            if mode != "coding" and step_index >= len(steps):
                 break
             if CONTROL["stopped"]:
                 break
@@ -3204,12 +3545,11 @@ def worker_loop(session_id: str) -> None:
             if process_pending_intervention(session_id):
                 continue
 
-            cycle_index = step_index % len(steps) if continuous else step_index
-            cycle_number = (step_index // len(steps)) + 1 if continuous else 0
+            cycle_index = step_index
             agent, phase, instruction, cli_mode = steps[cycle_index]
-            display_phase = f"{phase} · 사이클 {cycle_number}" if continuous else phase
-            if continuous and cycle_index == 0:
-                add_runtime_event(f"무제한 코딩 사이클 {cycle_number} 시작")
+            display_phase = f"{phase} · 목표 사이클 {cycle_number}" if coding_iteration else phase
+            if coding_iteration and cycle_index == 0:
+                add_runtime_event(f"목표 기반 코딩 사이클 {cycle_number} 시작")
             succeeded = run_step(
                 agent,
                 display_phase,
@@ -3221,30 +3561,60 @@ def worker_loop(session_id: str) -> None:
                 with STATE_LOCK:
                     if STATE.get("id") == session_id:
                         CONTROL["paused"] = True
+                        if not waiting_for_user_response(STATE):
+                            STATE["workflow_status"] = workflow.FAILED
+                        save_state(STATE)
                 break
 
             with STATE_LOCK:
                 if STATE.get("id") != session_id:
                     break
-                STATE["step_index"] += 1
-                next_index = STATE["step_index"]
+                cycle_completed = False
+                if coding_iteration:
+                    STATE["coding_cycle_step"] += 1
+                    if STATE["coding_cycle_step"] >= len(steps):
+                        STATE["coding_cycle"] = cycle_number + 1
+                        STATE["coding_cycle_step"] = 0
+                        cycle_completed = True
+                    next_index = STATE["coding_cycle_step"]
+                else:
+                    STATE["step_index"] += 1
+                    next_index = STATE["step_index"]
                 save_state(STATE)
 
-            next_cycle_index = next_index % len(steps) if continuous else next_index
-            if continuous and next_cycle_index == 0:
-                add_runtime_event(f"무제한 코딩 사이클 {cycle_number} 완료 · 다음 사이클 계속")
+            if coding_iteration and cycle_completed:
+                add_runtime_event(f"목표 기반 코딩 사이클 {cycle_number} 완료")
             should_validate = cli_mode == "coding" and (
-                (continuous and steps[next_cycle_index][1] == "교차 검토")
-                or (not continuous and (
+                (coding_iteration and not cycle_completed and steps[next_index][1] == "교차 검토")
+                or (not coding_iteration and (
                     next_index >= len(steps) or steps[next_index][1] == "최종 보고"
                 ))
             )
             if should_validate:
                 add_runtime_event("자동 검증 시작")
+                with STATE_LOCK:
+                    if STATE.get("id") == session_id:
+                        STATE["workflow_status"] = workflow.VALIDATING
+                        save_state(STATE)
                 validation_results = run_project_validation(load_project_path())
                 with STATE_LOCK:
                     if STATE.get("id") == session_id:
                         STATE["validation_results"] = validation_results
+                        failed_validations = [
+                            result for result in validation_results if not result["ok"]
+                        ]
+                        if failed_validations and mode == "coding":
+                            progress = normalize_coding_progress(STATE.get("coding_progress"))
+                            signature = "validation:" + "|".join(
+                                result["label"] for result in failed_validations
+                            )
+                            progress["consecutive_failures"] += 1
+                            progress["same_error_count"] = (
+                                progress["same_error_count"] + 1
+                                if signature == progress["last_error_signature"] else 1
+                            )
+                            progress["last_error_signature"] = signature
+                            STATE["coding_progress"] = progress
                         save_state(STATE)
                 if not validation_results:
                     add_runtime_event("자동 검증 명령을 찾지 못했습니다.")
@@ -3270,11 +3640,13 @@ def worker_loop(session_id: str) -> None:
                 enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
                 steps = steps_for_mode(mode, enabled_agents)
                 finished = (
-                    mode != "continuous"
+                    mode == "discussion"
                     and STATE["step_index"] >= len(steps)
                     and not CONTROL["stopped"]
-                )
+                ) or bool(STATE.get("finished", False))
                 STATE["finished"] = finished
+                if finished:
+                    STATE["workflow_status"] = workflow.COMPLETED
                 STATE["active_agent"] = None
                 STATE["active_phase"] = None
                 STATE["active_started_at"] = None
@@ -3300,6 +3672,8 @@ def worker_loop(session_id: str) -> None:
 def start_worker_if_needed(force: bool = False) -> None:
     with STATE_LOCK:
         session_id = STATE.get("id")
+        if waiting_for_user_response(STATE):
+            return
         if CONTROL["worker_running"]:
             if CONTROL.get("worker_session_id") != session_id:
                 CONTROL["worker_start_pending"] = True
@@ -3308,8 +3682,9 @@ def start_worker_if_needed(force: bool = False) -> None:
         CONTROL["worker_session_id"] = session_id
         CONTROL["worker_start_pending"] = False
         CONTROL["stopped"] = False
-        if STATE.get("continuous_stopped"):
-            STATE["continuous_stopped"] = False
+        if STATE.get("coding_stopped"):
+            STATE["coding_stopped"] = False
+            STATE["coding_stop_reason"] = ""
             save_state(STATE)
     thread = threading.Thread(target=worker_loop, args=(session_id,), daemon=True)
     thread.start()
@@ -3347,13 +3722,12 @@ def connection_status_html() -> str:
 MODE_LABELS = {
     "discussion": "일반 토론 모드",
     "coding": "코딩 모드",
-    "continuous": "무제한 코딩",
 }
 
 
 def mode_notice_html(mode: str, discussion_project_access: str = "read") -> str:
     mode_label = MODE_LABELS.get(mode, mode)
-    if mode in {"coding", "continuous"}:
+    if mode == "coding":
         access_label = "프로젝트 읽기·쓰기"
     else:
         access_label = discussion_project_access_label(discussion_project_access)
@@ -3389,7 +3763,8 @@ def agent_model_cards_html(settings: dict | None = None) -> str:
             )
         cards.append(
             f'<div class="agent-model-card" data-agent-card="{agent}">'
-            f'<label class="agent-toggle"><input type="checkbox" name="agent" value="{agent}" checked>'
+            f'<label class="agent-toggle"><input type="checkbox" name="agent" value="{agent}" checked '
+            f'onchange="syncDirectAgentButtons()">'
             f'<img src="{html.escape(info["avatar"])}" alt="">'
             f'<span><strong>{html.escape(info["label"])}</strong><small>사용</small></span></label>'
             f'<label class="model-field"><span>모델</span><select name="model_{agent}">'
@@ -3428,10 +3803,11 @@ def topic_section_html(
             f'<span style="color:var(--faint);font-weight:500">· {html.escape(mode_label)}</span></h3>'
             f'<p>활성: {html.escape(agent_names(enabled_agents))} · 비활성: '
             f'{html.escape(agent_names(disabled_agents) if disabled_agents else "없음")}</p>'
+            f'<p>첫 실행 모델: {html.escape(AGENTS[enabled_agents[0]]["label"])}</p>'
             f'<p>모델: {html.escape(settings_label)}</p>'
-            f'<p>프로젝트 접근: {"읽기·쓰기 (코딩 실행)" if mode in {"coding", "continuous"} else html.escape(discussion_access_label)}</p>'
+            f'<p>프로젝트 접근: {"읽기·쓰기 (코딩 실행)" if mode == "coding" else html.escape(discussion_access_label)}</p>'
             f'<p>저장 폴더: {html.escape(str(session_memory_dir(active_id)))}</p>'
-            f'{project_path_line if mode in {"coding", "continuous"} else ""}</div>'
+            f'{project_path_line if mode == "coding" else ""}</div>'
         )
 
     return f"""
@@ -3440,8 +3816,7 @@ def topic_section_html(
         <textarea id="topicInput" placeholder="예: 네이버 쇼핑 최저가 비교 웹앱을 같이 만들 거야" autofocus></textarea>
         <div class="mode-choice">
           <label><input type="radio" name="mode" value="discussion" checked> 일반 토론 모드</label>
-          <label><input type="radio" name="mode" value="coding"> 코딩 모드 (실제로 이 폴더 코드를 수정)</label>
-          <label><input type="radio" name="mode" value="continuous"> 무제한 코딩 (중단할 때까지 구현·검토 반복)</label>
+          <label><input type="radio" name="mode" value="coding"> 코딩 모드 (계획·승인 후 목표 기반 구현·검토 반복)</label>
         </div>
         <div class="discussion-access-choice">
           <strong>일반 토론의 프로젝트 접근</strong>
@@ -3451,7 +3826,19 @@ def topic_section_html(
         </div>
         {agent_model_cards_html(agent_settings)}
         {project_path_line}
-        <button onclick="submitTopic()">시작</button>
+        <div class="direct-agent-start">
+          <strong>Agent 직접 호출</strong>
+          <span>선택한 모델이 첫 턴을 시작합니다.</span>
+          <div class="direct-agent-buttons">
+            {''.join(
+                f'<button type="button" class="direct-agent-button" data-direct-agent="{agent}" '
+                f'onclick="submitTopic(\'{agent}\')" style="--agent-color:{AGENTS[agent]["color"]}">'
+                f'<img src="{html.escape(AGENTS[agent]["avatar"])}" alt="">'
+                f'<span>{html.escape(AGENTS[agent]["label"])}부터 시작</span></button>'
+                for agent in AGENT_ORDER
+            )}
+          </div>
+        </div>
       </div>"""
 
 
@@ -3528,7 +3915,17 @@ def state_json_payload() -> dict:
         validation_results = list(STATE.get("validation_results", []))
         delegation_history = list(STATE.get("delegation_history", []))[-20:]
         workspace_access = STATE.get("workspace_access", "write")
-        step_index = int(STATE.get("step_index", 0))
+        coding_stage = STATE.get("coding_stage", "planning")
+        coding_cycle = max(0, int(STATE.get("coding_cycle", 0) or 0))
+        coding_limits = normalize_coding_limits(STATE.get("coding_limits"))
+        coding_progress = normalize_coding_progress(STATE.get("coding_progress"))
+        coding_stop_reason = str(STATE.get("coding_stop_reason", ""))
+        workflow_status = workflow.normalize_workflow_status(
+            STATE.get("workflow_status"), has_topic=bool(topic)
+        )
+        pending_user_question = workflow.normalize_user_question(
+            STATE.get("pending_user_question")
+        )
         state_snapshot = dict(STATE)
     if active_id and not session_roles_path(active_id).exists():
         ensure_session_memory(state_snapshot)
@@ -3562,6 +3959,8 @@ def state_json_payload() -> dict:
         "approval_rejected": CONTROL["approval_rejected"],
         "intervention_pending": CONTROL["intervention_pending"],
         "intervention_intent": CONTROL["intervention_intent"],
+        "workflow_status": workflow_status,
+        "pending_user_question": pending_user_question,
         "topic": html.escape(topic) if topic else "",
         "session_name": html.escape(session_name),
         "tags": list(STATE.get("tags", [])),
@@ -3572,6 +3971,7 @@ def state_json_payload() -> dict:
         "discussion_project_access": discussion_project_access,
         "discussion_project_access_label": discussion_project_access_label(discussion_project_access),
         "enabled_agents": enabled_agents,
+        "start_agent": enabled_agents[0],
         "agent_settings": agent_settings,
         "agent_roles": agent_roles,
         "role_labels": {agent: role_label(agent_roles[agent]) for agent in AGENT_ORDER},
@@ -3596,7 +3996,7 @@ def state_json_payload() -> dict:
         "total_actual_tokens": total_actual_tokens,
         "total_actual_cost_usd": total_actual_cost_usd,
         "budget": budget,
-        "budget_exceeded": "" if mode == "continuous" else budget_exceeded_reason({
+        "budget_exceeded": budget_exceeded_reason({
             "budget": budget,
             "total_actual_tokens": total_actual_tokens,
             "total_actual_cost_usd": total_actual_cost_usd,
@@ -3616,10 +4016,12 @@ def state_json_payload() -> dict:
         "validation_results": validation_results,
         "delegation_history": delegation_history,
         "delegation_count": STATE.get("delegation_count", 0),
-        "continuous_cycle": (
-            (step_index // max(1, len(steps_for_mode("continuous", enabled_agents)))) + 1
-            if mode == "continuous" else 0
-        ),
+        "coding_stage": coding_stage,
+        "coding_cycle": coding_cycle,
+        "coding_limits": coding_limits,
+        "coding_progress": coding_progress,
+        "coding_stop_reason": coding_stop_reason,
+        "coding_limit_reason": coding_limit_reason(state_snapshot),
         "agent_usage": agent_usage_summary(messages),
         "context_usage": agent_context_summary(messages, agent_settings),
     }
@@ -3793,10 +4195,11 @@ def session_detail_payload(session_id: str) -> dict | None:
         "validation_results": data.get("validation_results", []),
         "delegation_history": data.get("delegation_history", []),
         "delegation_count": data.get("delegation_count", 0),
-        "continuous_cycle": (
-            (int(data.get("step_index", 0)) // max(1, len(steps_for_mode("continuous", enabled_agents)))) + 1
-            if mode == "continuous" else 0
-        ),
+        "coding_stage": data.get("coding_stage", "planning"),
+        "coding_cycle": max(0, int(data.get("coding_cycle", 0) or 0)),
+        "coding_limits": normalize_coding_limits(data.get("coding_limits")),
+        "coding_progress": normalize_coding_progress(data.get("coding_progress")),
+        "coding_stop_reason": data.get("coding_stop_reason", ""),
     }
 
 
@@ -3935,7 +4338,7 @@ def activate_session(session_id: str) -> dict:
     workspace = Path(activated.get("workspace_path") or load_project_path()).expanduser()
     if not workspace.is_dir() or not os.access(workspace, os.R_OK):
         return {"error": f"세션의 작업 폴더를 사용할 수 없습니다: {workspace}"}
-    access = "write" if activated.get("mode") in {"coding", "continuous"} else activated.get("workspace_access", "read")
+    access = "write" if activated.get("mode") == "coding" else activated.get("workspace_access", "read")
     if access == "write" and not os.access(workspace, os.W_OK):
         return {"error": f"세션의 작업 폴더에 쓰기 권한이 없습니다: {workspace}"}
     save_project_path(workspace.resolve())
@@ -3985,7 +4388,11 @@ def prompt_preview_payload(agent: str) -> dict:
         step_index = int(STATE.get("step_index", 0))
     instruction = "현재 주제와 공유된 최신 발언을 검토하고, 자신의 역할에 맞는 다음 의견을 간결하게 정리해라."
     phase = "사용자 미리보기"
-    preview_index = step_index % len(steps) if state.get("mode") == "continuous" and steps else step_index
+    if state.get("mode") == "coding" and state.get("coding_stage") == "iteration":
+        steps = goal_coding_steps(enabled)
+        preview_index = int(state.get("coding_cycle_step", 0))
+    else:
+        preview_index = step_index
     if preview_index < len(steps) and steps[preview_index][0] == agent:
         _agent, phase, instruction, cli_mode = steps[preview_index]
     else:
@@ -4049,33 +4456,40 @@ def save_profile_content(content: str, session_id: str | None = None) -> dict:
 
 
 def switch_mode(mode: str) -> dict:
+    if mode == "continuous":
+        mode = "coding"
     if mode not in MODE_LABELS:
         return {"error": "알 수 없는 모드입니다."}
-    if mode in {"coding", "continuous"} and not os.access(load_project_path(), os.W_OK):
+    if mode == "coding" and not os.access(load_project_path(), os.W_OK):
         return {"error": "코딩 모드는 작업 폴더의 쓰기 권한이 필요합니다."}
     with STATE_LOCK:
+        if waiting_for_user_response(STATE):
+            return {"error": "사용자 질문에 답한 뒤 모드를 전환해주세요."}
         if STATE.get("active_agent"):
             return {"error": "현재 모델 응답이 끝난 뒤 모드를 전환해주세요."}
         previous_mode = STATE.get("mode", "discussion")
         enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
         common_step_count = len([step for step in DISCUSSION_STEPS if step[0] in enabled])
         if previous_mode != mode:
-            if mode == "continuous":
-                STATE["step_index"] = 0
-            elif previous_mode == "continuous":
-                STATE["step_index"] = common_step_count if mode == "coding" else 0
-            elif mode == "coding" and STATE.get("step_index", 0) >= common_step_count:
+            if mode == "coding" and STATE.get("step_index", 0) >= common_step_count:
                 STATE["step_index"] = common_step_count
             elif mode == "discussion" and STATE.get("step_index", 0) > common_step_count:
                 STATE["step_index"] = common_step_count
         STATE["mode"] = mode
-        STATE["continuous_stopped"] = False
-        if mode in {"coding", "continuous"}:
+        if mode == "coding":
             STATE["workspace_access"] = "write"
             STATE["discussion_project_access"] = "write"
+            if previous_mode != "coding":
+                STATE["coding_stage"] = "planning"
+                STATE["coding_cycle"] = 0
+                STATE["coding_cycle_step"] = 0
+                STATE["coding_started_at"] = time.time()
+                STATE["coding_progress"] = normalize_coding_progress(None)
+                STATE["coding_stopped"] = False
+                STATE["coding_stop_reason"] = ""
         step_count = len(steps_for_mode(mode, enabled))
         STATE["finished"] = (
-            mode != "continuous"
+            mode == "discussion"
             and bool(STATE.get("topic"))
             and STATE.get("step_index", 0) >= step_count
         )
@@ -4256,10 +4670,13 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             form = self._read_form()
             topic = form.get("topic", [""])[0].strip()
             mode = form.get("mode", ["discussion"])[0].strip()
+            if mode == "continuous":
+                mode = "coding"
             discussion_project_access = normalize_discussion_project_access(
                 form.get("discussion_project_access", ["read"])[0].strip()
             )
-            enabled_agents = normalize_enabled_agents(form.get("agent", []))
+            requested_start_agent = form.get("start_agent", [""])[0].strip()
+            enabled_agents = prioritize_start_agent(form.get("agent", []), requested_start_agent)
             agent_settings = normalize_agent_settings({
                 agent: {
                     "model": form.get(f"model_{agent}", [""])[0].strip(),
@@ -4275,13 +4692,23 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     if not STATE.get("name") or STATE.get("name") == "새 세션":
                         STATE["name"] = re.sub(r"\s+", " ", topic).strip()[:80]
                     STATE["mode"] = mode
-                    STATE["continuous_stopped"] = False
                     STATE["discussion_project_access"] = (
-                        "write" if mode in {"coding", "continuous"} else discussion_project_access
+                        "write" if mode == "coding" else discussion_project_access
                     )
-                    if mode in {"coding", "continuous"} or discussion_project_access == "write":
+                    if mode == "coding" or discussion_project_access == "write":
                         STATE["workspace_access"] = "write"
                     STATE["enabled_agents"] = enabled_agents
+                    STATE["start_agent"] = enabled_agents[0]
+                    STATE["step_index"] = 0
+                    STATE["coding_stage"] = "planning"
+                    STATE["coding_cycle"] = 0
+                    STATE["coding_cycle_step"] = 0
+                    STATE["coding_started_at"] = time.time() if mode == "coding" else None
+                    STATE["coding_progress"] = normalize_coding_progress(None)
+                    STATE["coding_stopped"] = False
+                    STATE["coding_stop_reason"] = ""
+                    STATE["workflow_status"] = workflow.ANALYZING
+                    STATE["pending_user_question"] = None
                     STATE["agent_settings"] = agent_settings
                     STATE["finished"] = False
                     CONTROL["approval_requested"] = False
@@ -4398,7 +4825,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 current_mode = STATE.get("mode", "discussion")
             effective_intent = intent
-            if intent == "redirect" and source == "composer" and current_mode in {"coding", "continuous"}:
+            if intent == "redirect" and source == "composer" and current_mode == "coding":
                 effective_intent = "execute"
             requested_targets = form.get("target")
             targets = normalize_target_agents(requested_targets)
@@ -4456,6 +4883,11 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/resume":
+            with STATE_LOCK:
+                waiting_for_answer = waiting_for_user_response(STATE)
+            if waiting_for_answer:
+                self._send_json({"error": "대기 중인 질문에 먼저 답해주세요."})
+                return
             CONTROL["paused"] = False
             start_worker_if_needed(force=True)
             self._send_json(state_json_payload())
@@ -4473,8 +4905,10 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
             with STATE_LOCK:
-                if STATE.get("mode") == "continuous":
-                    STATE["continuous_stopped"] = True
+                if STATE.get("mode") == "coding":
+                    STATE["coding_stopped"] = True
+                    STATE["coding_stop_reason"] = "사용자 중단"
+                STATE["workflow_status"] = workflow.CANCELLED
                 persist_intervention_queue_locked()
                 save_state(STATE)
             if cancelled:
@@ -4489,7 +4923,8 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["paused"] = False
             CONTROL["stopped"] = False
             with STATE_LOCK:
-                STATE["continuous_stopped"] = False
+                STATE["coding_stopped"] = False
+                STATE["coding_stop_reason"] = ""
                 save_state(STATE)
             add_runtime_event("실패한 턴을 다시 실행합니다.")
             start_worker_if_needed(force=True)
@@ -4528,8 +4963,20 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/approve":
+            with STATE_LOCK:
+                waiting_for_answer = waiting_for_user_response(STATE)
+            if waiting_for_answer:
+                self._send_json({"error": "승인 요청이 아니라 사용자 답변이 필요한 상태입니다."})
+                return
             approve_pending_work()
             self._send_json(state_json_payload())
+            return
+
+        if self.path == "/answer-question":
+            form = self._read_form()
+            option_id = form.get("option_id", [""])[0]
+            answer = form.get("answer", [""])[0]
+            self._send_json(answer_pending_user_question(option_id, answer))
             return
 
         if self.path == "/reject":
@@ -4548,6 +4995,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
             with STATE_LOCK:
+                STATE["workflow_status"] = workflow.CANCELLED
                 persist_intervention_queue_locked()
             self._send_json(state_json_payload())
             return

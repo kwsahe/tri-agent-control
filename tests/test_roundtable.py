@@ -138,14 +138,14 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(roundtable.turn_project_access("discussion", state), "read")
         self.assertEqual(roundtable.turn_project_access("coding", state), "write")
 
-    def test_continuous_review_turn_is_read_only(self):
+    def test_goal_coding_review_turn_is_read_only(self):
         state = roundtable.new_state()
-        state["mode"] = "continuous"
+        state["mode"] = "coding"
         self.assertEqual(roundtable.turn_project_access("discussion", state), "read")
         self.assertEqual(roundtable.turn_project_access("coding", state), "write")
 
     def test_antigravity_read_only_review_auto_approves_sandboxed_commands(self):
-        roundtable.STATE["mode"] = "continuous"
+        roundtable.STATE["mode"] = "coding"
         roundtable.STATE["workspace_access"] = "write"
         result = subprocess.CompletedProcess([], 0, "정상 응답", "")
         with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
@@ -179,7 +179,7 @@ class RoundtableTests(unittest.TestCase):
     def test_scheduled_coding_step_cannot_delegate_duplicate_work(self):
         self.assertFalse(roundtable.allow_agent_calls("coding", "작업 수행"))
         self.assertTrue(roundtable.allow_agent_calls("coding", "개선안 제안"))
-        self.assertTrue(roundtable.allow_agent_calls("continuous", "개발 진행"))
+        self.assertTrue(roundtable.allow_agent_calls("coding", "개발 진행"))
 
     def test_codex_read_only_turn_keeps_isolated_user_config(self):
         roundtable.STATE["mode"] = "discussion"
@@ -200,21 +200,268 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(roundtable.turn_project_access("discussion", state), "write")
         self.assertEqual(roundtable.discussion_project_access_label("write"), "프로젝트 읽기·쓰기")
 
-    def test_continuous_mode_cycle_contains_development_review_and_synthesis(self):
-        steps = roundtable.steps_for_mode("continuous", roundtable.AGENT_ORDER)
+    def test_goal_coding_cycle_contains_development_review_and_synthesis(self):
+        steps = roundtable.goal_coding_steps(roundtable.AGENT_ORDER)
         self.assertEqual([step[1] for step in steps[:3]], ["개발 진행"] * 3)
         self.assertEqual([step[1] for step in steps[3:6]], ["교차 검토"] * 3)
         self.assertEqual(steps[-1][1], "토론 결과 통합")
         self.assertTrue(all(step[3] == "coding" for step in steps[:3]))
         self.assertTrue(all(step[3] == "discussion" for step in steps[3:]))
 
+    def test_legacy_continuous_session_migrates_to_goal_coding_position(self):
+        state = roundtable.new_state()
+        cycle_length = len(roundtable.goal_coding_steps(roundtable.AGENT_ORDER))
+        state.update(
+            mode="continuous",
+            step_index=cycle_length + 2,
+            continuous_stopped=True,
+        )
+
+        normalized = roundtable.normalize_state(state)
+
+        self.assertEqual(normalized["mode"], "coding")
+        self.assertEqual(normalized["coding_stage"], "iteration")
+        self.assertEqual(normalized["coding_cycle"], 2)
+        self.assertEqual(normalized["coding_cycle_step"], 2)
+        self.assertTrue(normalized["coding_stopped"])
+
+    def test_loading_legacy_session_persists_migrated_mode(self):
+        state = roundtable.new_state()
+        state.update(mode="continuous", step_index=1)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_path = root / "state.json"
+            sessions_dir = root / "sessions"
+            state_path.write_text(
+                roundtable.json.dumps(state, ensure_ascii=False), encoding="utf-8"
+            )
+            with patch.object(roundtable, "STATE_PATH", state_path), patch.object(
+                roundtable, "SESSIONS_DIR", sessions_dir
+            ):
+                loaded = roundtable.load_state()
+
+            saved = roundtable.json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(loaded["mode"], "coding")
+        self.assertEqual(saved["mode"], "coding")
+        self.assertEqual(saved["coding_stage"], "iteration")
+
+    def test_goal_coding_limits_cycles_time_tokens_files_and_diff(self):
+        state = roundtable.new_state()
+        state.update(
+            mode="coding",
+            coding_stage="iteration",
+            coding_cycle=4,
+            coding_started_at=roundtable.time.time(),
+        )
+        self.assertIn("최대 목표 사이클", roundtable.coding_limit_reason(state))
+
+        state["coding_cycle"] = 1
+        state["total_est_tokens"] = state["coding_limits"]["max_tokens"]
+        self.assertIn("최대 토큰", roundtable.coding_limit_reason(state))
+
+        state["total_est_tokens"] = 0
+        state["coding_progress"]["changed_paths"] = [
+            f"file-{index}.txt"
+            for index in range(state["coding_limits"]["max_changed_files"])
+        ]
+        self.assertIn("최대 변경 파일", roundtable.coding_limit_reason(state))
+
+        state["coding_progress"]["changed_paths"] = []
+        state["coding_progress"]["diff_lines"] = state["coding_limits"]["max_diff_lines"]
+        self.assertIn("최대 diff", roundtable.coding_limit_reason(state))
+
+        state["coding_progress"]["diff_lines"] = 0
+        state["coding_started_at"] = (
+            roundtable.time.time() - state["coding_limits"]["max_minutes"] * 60
+        )
+        self.assertIn("최대 실행 시간", roundtable.coding_limit_reason(state))
+
+    def test_selected_agent_starts_each_workflow(self):
+        enabled = roundtable.prioritize_start_agent(
+            roundtable.AGENT_ORDER, "antigravity"
+        )
+
+        self.assertEqual(enabled, ["antigravity", "codex", "claude"])
+        for mode in ("discussion", "coding"):
+            self.assertEqual(roundtable.steps_for_mode(mode, enabled)[0][0], "antigravity")
+
+    def test_disabled_start_agent_falls_back_to_first_enabled_agent(self):
+        enabled = roundtable.prioritize_start_agent(["claude"], "codex")
+
+        self.assertEqual(enabled, ["claude"])
+
+    def test_new_topic_form_has_a_direct_start_button_for_each_agent(self):
+        markup = roundtable.topic_section_html(
+            "", "discussion", roundtable.AGENT_ORDER, "session-id"
+        )
+
+        for agent in roundtable.AGENT_ORDER:
+            self.assertIn(f'data-direct-agent="{agent}"', markup)
+            self.assertIn(f"submitTopic('{agent}')", markup)
+        self.assertNotIn('value="continuous"', markup)
+        self.assertNotIn("무제한 코딩", markup)
+
+    def test_structured_stop_and_ask_user_signal_is_parsed(self):
+        raw = (
+            "저장 형식 선택이 필요합니다.\n"
+            '{"action":"STOP_AND_ASK_USER","reason":"호환성 결정",'
+            '"question":"마이그레이션을 추가할까요?",'
+            '"options":[{"id":"A","label":"기존 유지","risk":"복잡도 증가"},'
+            '{"id":"B","label":"자동 변환","risk":"변환 코드 필요"}],'
+            '"recommended_option":"B","blocking":true}'
+        )
+
+        visible, question = roundtable.workflow.extract_stop_and_ask_user(raw)
+
+        self.assertEqual(visible, "저장 형식 선택이 필요합니다.")
+        self.assertEqual(question["recommended_option"], "B")
+        self.assertEqual(len(question["options"]), 2)
+
+    def test_pending_question_survives_state_normalization(self):
+        state = roundtable.new_state()
+        state["topic"] = "질문 복구"
+        state["pending_user_question"] = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "선택 필요",
+            "question": "A 또는 B?",
+            "options": [{"id": "A", "label": "A안", "risk": "낮음"}],
+            "recommended_option": "A",
+            "blocking": True,
+        }
+
+        normalized = roundtable.normalize_state(state)
+
+        self.assertEqual(
+            normalized["workflow_status"],
+            roundtable.workflow.WAITING_FOR_USER_RESPONSE,
+        )
+        self.assertEqual(normalized["pending_user_question"]["question"], "A 또는 B?")
+
+    def test_state_is_saved_atomically_to_active_and_session_files(self):
+        state = roundtable.new_state()
+        state["topic"] = "원자 저장"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_path = root / "state.json"
+            sessions_dir = root / "sessions"
+            with patch.object(roundtable, "STATE_PATH", state_path), patch.object(
+                roundtable, "SESSIONS_DIR", sessions_dir
+            ):
+                roundtable.save_state(state)
+
+            self.assertEqual(
+                roundtable.json.loads(state_path.read_text(encoding="utf-8"))["topic"],
+                "원자 저장",
+            )
+            self.assertTrue((sessions_dir / f'{state["id"]}.json').is_file())
+            self.assertEqual(list(root.rglob("*.tmp")), [])
+
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_only_one_pending_user_question_is_allowed(self, _save, _event):
+        question = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "선택 필요",
+            "question": "첫 질문",
+            "options": [],
+            "recommended_option": "",
+            "blocking": True,
+        }
+
+        self.assertTrue(roundtable.register_user_question("codex", "검토", question))
+        question["question"] = "두 번째 질문"
+        self.assertFalse(roundtable.register_user_question("claude", "검토", question))
+        self.assertEqual(roundtable.STATE["pending_user_question"]["question"], "첫 질문")
+
+    @patch.object(roundtable.threading, "Thread")
+    def test_worker_does_not_start_while_waiting_for_user_response(self, thread):
+        roundtable.STATE["workflow_status"] = roundtable.workflow.WAITING_FOR_USER_RESPONSE
+        roundtable.STATE["pending_user_question"] = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "선택 필요",
+            "question": "진행할까요?",
+            "options": [],
+            "recommended_option": "",
+            "blocking": True,
+        }
+
+        roundtable.start_worker_if_needed(force=True)
+
+        thread.assert_not_called()
+        self.assertFalse(roundtable.CONTROL["worker_running"])
+
+    def test_invalid_question_option_keeps_session_waiting(self):
+        roundtable.STATE["workflow_status"] = roundtable.workflow.WAITING_FOR_USER_RESPONSE
+        roundtable.STATE["pending_user_question"] = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "선택 필요",
+            "question": "진행 방식을 선택하세요.",
+            "options": [{"id": "A", "label": "안전안", "risk": "느림"}],
+            "recommended_option": "A",
+            "blocking": True,
+        }
+
+        result = roundtable.answer_pending_user_question("B", "")
+
+        self.assertIn("error", result)
+        self.assertTrue(roundtable.waiting_for_user_response(roundtable.STATE))
+
+    @patch.object(roundtable, "state_json_payload", return_value={})
+    @patch.object(roundtable, "start_worker_if_needed")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "add_message")
+    @patch.object(roundtable, "save_state")
+    def test_valid_question_answer_resumes_without_changing_step(
+        self, _save, add_message, _event, start_worker, _payload
+    ):
+        roundtable.STATE.update(
+            topic="답변 테스트",
+            mode="coding",
+            step_index=7,
+            workflow_status=roundtable.workflow.WAITING_FOR_USER_RESPONSE,
+            pending_user_question={
+                "action": "STOP_AND_ASK_USER",
+                "reason": "선택 필요",
+                "question": "진행 방식을 선택하세요.",
+                "options": [{"id": "A", "label": "안전안", "risk": "느림"}],
+                "recommended_option": "A",
+                "blocking": True,
+            },
+        )
+
+        result = roundtable.answer_pending_user_question("A", "호환성을 유지해줘.")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(roundtable.STATE["step_index"], 7)
+        self.assertIsNone(roundtable.STATE["pending_user_question"])
+        self.assertEqual(roundtable.STATE["workflow_status"], roundtable.workflow.CODING)
+        add_message.assert_called_once()
+        start_worker.assert_called_once_with(force=True)
+
+    @patch.object(roundtable, "save_state")
+    def test_general_chat_does_not_resolve_pending_question(self, _save):
+        roundtable.STATE["workflow_status"] = roundtable.workflow.WAITING_FOR_USER_RESPONSE
+        roundtable.STATE["pending_user_question"] = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "선택 필요",
+            "question": "진행할까요?",
+            "options": [],
+            "recommended_option": "",
+            "blocking": True,
+        }
+
+        roundtable.add_message("user", "사용자 개입 · 질문", "상세 설명을 먼저 해줘.")
+
+        self.assertTrue(roundtable.waiting_for_user_response(roundtable.STATE))
+
     @patch.object(roundtable, "start_worker_if_needed")
     def test_server_startup_requires_manual_resume(self, start_worker):
         roundtable.STATE.update(
             topic="저장된 작업",
             finished=False,
-            mode="continuous",
-            continuous_stopped=False,
+            mode="coding",
+            coding_stopped=False,
         )
         roundtable.CONTROL.update(paused=False, stopped=False)
 
@@ -242,14 +489,17 @@ class RoundtableTests(unittest.TestCase):
     @patch.object(roundtable, "run_project_validation", return_value=[])
     @patch.object(roundtable, "add_runtime_event")
     @patch.object(roundtable, "save_state")
-    def test_continuous_worker_wraps_into_next_cycle(
+    def test_goal_coding_worker_wraps_into_next_cycle(
         self, _save_state, _event, validation, _render
     ):
         roundtable.STATE.update(
             topic="반복 개발",
-            mode="continuous",
+            mode="coding",
+            coding_stage="iteration",
+            coding_cycle=1,
+            coding_cycle_step=0,
+            coding_started_at=roundtable.time.time(),
             enabled_agents=list(roundtable.AGENT_ORDER),
-            step_index=0,
             finished=False,
         )
         roundtable.CONTROL.update(
@@ -259,7 +509,7 @@ class RoundtableTests(unittest.TestCase):
             intervention_pending=False,
             worker_session_id=roundtable.STATE["id"],
         )
-        cycle = roundtable.steps_for_mode("continuous", roundtable.AGENT_ORDER)
+        cycle = roundtable.goal_coding_steps(roundtable.AGENT_ORDER)
         phases = []
 
         def fake_run_step(_agent, phase, _instruction, _cli_mode, **_kwargs):
@@ -271,17 +521,86 @@ class RoundtableTests(unittest.TestCase):
         with patch.object(roundtable, "run_step", side_effect=fake_run_step):
             roundtable.worker_loop(roundtable.STATE["id"])
 
-        self.assertIn("개발 진행 · 사이클 1", phases[0])
-        self.assertIn("토론 결과 통합 · 사이클 1", phases[len(cycle) - 1])
-        self.assertIn("개발 진행 · 사이클 2", phases[len(cycle)])
-        self.assertEqual(roundtable.STATE["step_index"], len(cycle) + 1)
+        self.assertIn("개발 진행 · 목표 사이클 1", phases[0])
+        self.assertIn("토론 결과 통합 · 목표 사이클 1", phases[len(cycle) - 1])
+        self.assertIn("개발 진행 · 목표 사이클 2", phases[len(cycle)])
+        self.assertEqual(roundtable.STATE["coding_cycle"], 2)
+        self.assertEqual(roundtable.STATE["coding_cycle_step"], 1)
         self.assertFalse(roundtable.STATE["finished"])
         validation.assert_called_once()
+
+    @patch.object(roundtable, "render_html_snapshot")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_coding_planning_transitions_to_goal_iteration(
+        self, _save_state, _event, _render
+    ):
+        planning_steps = roundtable.steps_for_mode("coding", ["codex"])
+        roundtable.STATE.update(
+            topic="목표 코딩",
+            mode="coding",
+            enabled_agents=["codex"],
+            coding_stage="planning",
+            step_index=len(planning_steps),
+            finished=False,
+        )
+        roundtable.CONTROL.update(
+            stopped=False,
+            paused=False,
+            approval_requested=False,
+            intervention_pending=False,
+            worker_session_id=roundtable.STATE["id"],
+        )
+        phases = []
+
+        def fake_run_step(_agent, phase, _instruction, _cli_mode, **_kwargs):
+            phases.append(phase)
+            roundtable.CONTROL["stopped"] = True
+            return True
+
+        with patch.object(roundtable, "run_step", side_effect=fake_run_step):
+            roundtable.worker_loop(roundtable.STATE["id"])
+
+        self.assertEqual(roundtable.STATE["coding_stage"], "iteration")
+        self.assertEqual(roundtable.STATE["coding_cycle"], 1)
+        self.assertEqual(roundtable.STATE["coding_cycle_step"], 1)
+        self.assertIn("목표 사이클 1", phases[0])
+
+    @patch.object(roundtable, "render_html_snapshot")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    @patch.object(roundtable, "run_step")
+    def test_goal_limit_finishes_without_starting_another_agent(
+        self, run_step, _save_state, _event, _render
+    ):
+        roundtable.STATE.update(
+            topic="한도 테스트",
+            mode="coding",
+            enabled_agents=["codex"],
+            coding_stage="iteration",
+            coding_cycle=4,
+            coding_cycle_step=0,
+            coding_started_at=roundtable.time.time(),
+            finished=False,
+        )
+        roundtable.CONTROL.update(
+            stopped=False,
+            paused=False,
+            approval_requested=False,
+            intervention_pending=False,
+            worker_session_id=roundtable.STATE["id"],
+        )
+
+        roundtable.worker_loop(roundtable.STATE["id"])
+
+        run_step.assert_not_called()
+        self.assertTrue(roundtable.STATE["finished"])
+        self.assertIn("최대 목표 사이클", roundtable.STATE["coding_stop_reason"])
 
     @patch.object(roundtable, "start_worker_if_needed")
     @patch.object(roundtable, "add_runtime_event")
     @patch.object(roundtable, "save_state")
-    def test_switching_to_continuous_mode_starts_fresh_writable_cycle(
+    def test_switching_to_coding_mode_starts_planning_with_goal_limits(
         self, _save_state, _event, start_worker
     ):
         roundtable.STATE.update(
@@ -290,15 +609,16 @@ class RoundtableTests(unittest.TestCase):
             step_index=5,
             finished=True,
             workspace_access="read",
-            continuous_stopped=True,
+            coding_stopped=True,
         )
-        payload = roundtable.switch_mode("continuous")
+        payload = roundtable.switch_mode("coding")
         self.assertTrue(payload["success"])
-        self.assertEqual(roundtable.STATE["mode"], "continuous")
-        self.assertEqual(roundtable.STATE["step_index"], 0)
+        self.assertEqual(roundtable.STATE["mode"], "coding")
+        self.assertEqual(roundtable.STATE["coding_stage"], "planning")
         self.assertEqual(roundtable.STATE["workspace_access"], "write")
         self.assertFalse(roundtable.STATE["finished"])
-        self.assertFalse(roundtable.STATE["continuous_stopped"])
+        self.assertFalse(roundtable.STATE["coding_stopped"])
+        self.assertEqual(roundtable.STATE["coding_limits"]["max_cycles"], 3)
         start_worker.assert_called_once_with(force=True)
 
     @patch.object(roundtable, "state_json_payload", return_value={})
@@ -1305,6 +1625,57 @@ class RoundtableTests(unittest.TestCase):
     @patch.object(roundtable, "build_memory_context", return_value="")
     @patch.object(roundtable, "load_team_prompt", return_value="공통 지침")
     @patch.object(roundtable, "save_state")
+    def test_run_step_enters_waiting_state_for_structured_user_question(
+        self, _save, _team, _memory, _event, add_message, _render
+    ):
+        roundtable.STATE.update(topic="질문 감지")
+        session_id = roundtable.STATE["id"]
+        signal = (
+            "두 방식의 결과가 크게 다릅니다.\n"
+            '{"action":"STOP_AND_ASK_USER","reason":"정책 선택 필요",'
+            '"question":"A안으로 진행할까요?",'
+            '"options":[{"id":"A","label":"호환 유지","risk":"복잡도 증가"}],'
+            '"recommended_option":"A","blocking":true}'
+        )
+        with patch.dict(roundtable.ASK_FUNCS, {"codex": lambda _p, _m: signal}):
+            succeeded = roundtable.run_step(
+                "codex", "분석", "확인해라", "discussion",
+                expected_session_id=session_id,
+            )
+
+        self.assertTrue(succeeded)
+        self.assertTrue(roundtable.waiting_for_user_response(roundtable.STATE))
+        self.assertEqual(
+            roundtable.STATE["pending_user_question"]["source_agent"], "codex"
+        )
+        self.assertTrue(add_message.call_args.args[3]["user_question_requested"])
+
+    def test_run_step_does_not_call_cli_while_waiting_for_user_response(self):
+        roundtable.STATE["workflow_status"] = roundtable.workflow.WAITING_FOR_USER_RESPONSE
+        roundtable.STATE["pending_user_question"] = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "선택 필요",
+            "question": "진행할까요?",
+            "options": [],
+            "recommended_option": "",
+            "blocking": True,
+        }
+        ask = Mock(return_value="호출되면 안 됨")
+
+        with patch.dict(roundtable.ASK_FUNCS, {"codex": ask}):
+            succeeded = roundtable.run_step(
+                "codex", "차단 테스트", "실행해라", "coding"
+            )
+
+        self.assertFalse(succeeded)
+        ask.assert_not_called()
+
+    @patch.object(roundtable, "render_html_snapshot")
+    @patch.object(roundtable, "add_message", return_value=True)
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "build_memory_context", return_value="")
+    @patch.object(roundtable, "load_team_prompt", return_value="공통 지침")
+    @patch.object(roundtable, "save_state")
     def test_agent_can_request_approval_with_final_token(
         self,
         _save_state,
@@ -1342,10 +1713,10 @@ class RoundtableTests(unittest.TestCase):
     @patch.object(roundtable, "build_memory_context", return_value="")
     @patch.object(roundtable, "load_team_prompt", return_value="공통 지침")
     @patch.object(roundtable, "save_state")
-    def test_continuous_mode_ignores_agent_approval_token(
+    def test_goal_coding_iteration_ignores_agent_approval_token(
         self, _save_state, _team, _memory, _event, add_message, _render
     ):
-        roundtable.STATE.update(topic="반복 개발", mode="continuous")
+        roundtable.STATE.update(topic="반복 개발", mode="coding", coding_stage="iteration")
         roundtable.CONTROL["approval_requested"] = False
         roundtable.CONTROL["approval_requested_by"] = []
         with patch.dict(
@@ -1353,7 +1724,7 @@ class RoundtableTests(unittest.TestCase):
             {"codex": lambda _prompt, _mode: "계속 진행합니다.\nAPPROVE"},
         ):
             succeeded = roundtable.run_step(
-                "codex", "교차 검토 · 사이클 1", "검토해라", "discussion",
+                "codex", "교차 검토 · 목표 사이클 1", "검토해라", "discussion",
                 expected_session_id=roundtable.STATE["id"],
             )
         self.assertTrue(succeeded)

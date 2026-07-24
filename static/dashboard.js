@@ -13,7 +13,6 @@ const AGENTS = {
 const MODE_LABELS = {
   discussion: "토론",
   coding: "코딩",
-  continuous: "무제한 코딩",
 };
 
 function $(id) {
@@ -50,8 +49,8 @@ function renderTopic(data) {
     <div class="topic">
       <h3>${data.topic} <span style="color:var(--faint);font-weight:500">· ${data.mode_label || "-"}</span></h3>
       <p>활성: ${data.enabled_agents_label || "-"} · 비활성: ${data.disabled_agents_label || "없음"}</p>
-      <p>프로젝트 접근: ${["coding", "continuous"].includes(data.mode) ? "읽기·쓰기 (코딩 실행)" : (data.discussion_project_access_label || "프로젝트 읽기")}</p>
-      ${data.mode === "continuous" ? `<p>현재 반복: 사이클 ${data.continuous_cycle || 1}</p>` : ""}
+      <p>프로젝트 접근: ${data.mode === "coding" ? "읽기·쓰기 (코딩 실행)" : (data.discussion_project_access_label || "프로젝트 읽기")}</p>
+      ${data.mode === "coding" ? `<p>현재 진행: ${data.coding_stage === "iteration" ? `목표 사이클 ${data.coding_cycle || 1} / ${data.coding_limits?.max_cycles || 3}` : "계획·승인"}</p>` : ""}
       <p>저장 폴더: ${data.memory_dir || "-"}</p>
     </div>`;
 }
@@ -373,8 +372,14 @@ function updateInspector(data) {
     $("headerMode").dataset.mode = data.mode || "discussion";
     lastState.sideMode = data.mode_label;
   }
-  $("sideCycleRow").style.display = data.mode === "continuous" ? "flex" : "none";
-  $("sideCycle").textContent = `사이클 ${data.continuous_cycle || 1}`;
+  $("sideCycleRow").style.display = data.mode === "coding" ? "flex" : "none";
+  $("sideCycle").textContent = data.coding_stage === "iteration"
+    ? `목표 사이클 ${data.coding_cycle || 1} / ${data.coding_limits?.max_cycles || 3}`
+    : "계획·승인";
+  $("sideCodingLimitRow").style.display = data.mode === "coding" ? "flex" : "none";
+  $("sideCodingLimit").textContent = `${data.coding_limits?.max_cycles || 3}회 · ${data.coding_limits?.max_minutes || 45}분 · ${formatTokens(data.coding_limits?.max_tokens || 200000)} 토큰`;
+  $("sideCodingStopRow").style.display = data.coding_stop_reason ? "flex" : "none";
+  $("sideCodingStop").textContent = data.coding_stop_reason || "-";
   if ($("sessionModeSelect") && data.mode && $("sessionModeSelect").value !== data.mode) {
     $("sessionModeSelect").value = data.mode;
   }
@@ -385,12 +390,12 @@ function updateInspector(data) {
     const select = $(id);
     if (select && document.activeElement !== select) {
       select.value = data.discussion_project_access || "read";
-      select.disabled = ["coding", "continuous"].includes(data.mode) || !!data.active_agent || !!viewingId;
+      select.disabled = data.mode === "coding" || !!data.active_agent || !!viewingId;
     }
   });
   ["discussionAccessButton", "composerDiscussionAccessButton"].forEach((id) => {
     const button = $(id);
-    if (button) button.disabled = ["coding", "continuous"].includes(data.mode) || !!data.active_agent || !!viewingId;
+    if (button) button.disabled = data.mode === "coding" || !!data.active_agent || !!viewingId;
   });
   if (lastState.sideMessages !== data.message_count) {
     $("sideMessages").textContent = data.message_count || 0;
@@ -408,8 +413,8 @@ function updateInspector(data) {
   if (document.activeElement !== $("workspaceAccess") && data.workspace_access) {
     $("workspaceAccess").value = data.workspace_access;
   }
-  $("workspaceAccess").disabled = ["coding", "continuous"].includes(data.mode) || !!data.active_agent || !!viewingId;
-  $("workspaceAccessButton").disabled = ["coding", "continuous"].includes(data.mode) || !!data.active_agent || !!viewingId;
+  $("workspaceAccess").disabled = data.mode === "coding" || !!data.active_agent || !!viewingId;
+  $("workspaceAccessButton").disabled = data.mode === "coding" || !!data.active_agent || !!viewingId;
   const currentProfilePath = data.profile_path ? `Profile: ${data.profile_path}` : "Profile.md도 여기에 표시됩니다.";
   if (lastState.profilePath !== currentProfilePath) {
     $("profilePath").textContent = currentProfilePath;
@@ -561,6 +566,64 @@ function updateConnectionSummary() {
   target.dataset.connection = failed ? "error" : "ok";
 }
 
+function renderUserQuestion(question) {
+  const banner = $("userQuestionBanner");
+  if (!question) {
+    banner.style.display = "none";
+    return;
+  }
+
+  const source = AGENTS[question.source_agent]?.label || question.source_agent || "에이전트";
+  $("userQuestionSource").textContent = `${source}${question.source_phase ? ` · ${question.source_phase}` : ""}`;
+  $("userQuestionReason").textContent = `중단 이유: ${question.reason}`;
+  $("userQuestionText").textContent = question.question;
+
+  const options = $("userQuestionOptions");
+  options.replaceChildren();
+  (question.options || []).forEach((option) => {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    const content = document.createElement("span");
+    const title = document.createElement("strong");
+    const risk = document.createElement("small");
+    input.type = "radio";
+    input.name = "userQuestionOption";
+    input.value = option.id;
+    input.checked = option.id === question.recommended_option;
+    title.textContent = `${option.id}. ${option.label}`;
+    risk.textContent = option.risk || "별도 위험 정보 없음";
+    content.append(title, risk);
+    label.append(input, content);
+    options.append(label);
+  });
+  banner.style.display = "grid";
+}
+
+async function submitQuestionAnswer() {
+  const selected = document.querySelector('input[name="userQuestionOption"]:checked');
+  const params = new URLSearchParams({
+    option_id: selected?.value || "",
+    answer: $("userQuestionAnswer").value.trim(),
+  });
+  const button = $("userQuestionSubmit");
+  button.disabled = true;
+  try {
+    const response = await fetch("/answer-question", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || "답변을 처리하지 못했습니다.");
+    $("userQuestionAnswer").value = "";
+    await poll(true);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function applyState(data) {
   if (lastState.feed_html !== data.feed_html) {
     updateFeedHtml(data.feed_html);
@@ -586,7 +649,8 @@ function applyState(data) {
 
   const hasTopic = !!data.topic;
   const pauseDisabled = !hasTopic || data.finished || data.stopped || data.paused;
-  const resumeDisabled = !hasTopic || data.finished || data.stopped || !data.paused;
+  const waitingForAnswer = data.workflow_status === "WAITING_FOR_USER_RESPONSE";
+  const resumeDisabled = !hasTopic || data.finished || data.stopped || !data.paused || waitingForAnswer;
   const stopDisabled = !hasTopic || data.finished || data.stopped;
 
   if (lastState.pauseDisabled !== pauseDisabled) {
@@ -602,7 +666,13 @@ function applyState(data) {
     lastState.stopDisabled = stopDisabled;
   }
 
-  const showApprove = (data.awaiting_approval && !data.stopped) ? "block" : "none";
+  const questionKey = JSON.stringify(data.pending_user_question || null);
+  if (lastState.questionKey !== questionKey) {
+    renderUserQuestion(data.pending_user_question);
+    lastState.questionKey = questionKey;
+  }
+
+  const showApprove = (data.awaiting_approval && !data.stopped && !waitingForAnswer) ? "block" : "none";
   if (lastState.showApprove !== showApprove) {
     $("approveBanner").style.display = showApprove;
     lastState.showApprove = showApprove;
@@ -624,6 +694,7 @@ function applyState(data) {
   const notice = lastState.notificationSnapshot;
   if (notice) {
     if (!notice.awaiting && data.awaiting_approval) notifyTransition("승인 대기", `${data.approval_requested_by?.join(", ") || "에이전트"}의 승인이 필요합니다.`);
+    if (!notice.awaitingQuestion && waitingForAnswer) notifyTransition("사용자 답변 필요", data.pending_user_question?.question || "작업 진행에 사용자 판단이 필요합니다.");
     if (!notice.finished && data.finished) notifyTransition("세션 완료", data.session_name || "작업이 완료되었습니다.");
     if (!notice.budget && data.budget_exceeded) notifyTransition("예산 한도 도달", data.budget_exceeded);
     const latestEvent = (data.runtime_events || []).at(-1);
@@ -632,6 +703,7 @@ function applyState(data) {
   const latestError = [...(data.runtime_events || [])].reverse().find((event) => event.level === "error");
   lastState.notificationSnapshot = {
     awaiting: !!data.awaiting_approval,
+    awaitingQuestion: waitingForAnswer,
     finished: !!data.finished,
     budget: !!data.budget_exceeded,
     errorText: latestError?.text || "",
@@ -863,7 +935,18 @@ async function rejectApproval() {
   }
 }
 
-async function submitTopic() {
+function syncDirectAgentButtons() {
+  const enabled = new Set(
+    Array.from(document.querySelectorAll('input[name="agent"]:checked')).map((el) => el.value)
+  );
+  document.querySelectorAll("[data-direct-agent]").forEach((button) => {
+    const available = enabled.has(button.dataset.directAgent);
+    button.disabled = !available;
+    button.setAttribute("aria-disabled", String(!available));
+  });
+}
+
+async function submitTopic(startAgent = "") {
   const topic = $("topicInput").value.trim();
   if (!topic) return;
   const modeEl = document.querySelector('input[name="mode"]:checked');
@@ -875,7 +958,12 @@ async function submitTopic() {
     alert("최소 한 명의 에이전트를 선택해주세요.");
     return;
   }
+  if (!agents.includes(startAgent)) {
+    alert("직접 호출할 Agent를 활성화한 뒤 다시 시도해주세요.");
+    return;
+  }
   const params = new URLSearchParams({ topic, mode, discussion_project_access: discussionProjectAccess });
+  params.set("start_agent", startAgent);
   agents.forEach((agent) => params.append("agent", agent));
   Object.keys(AGENTS).forEach((agent) => {
     const model = document.querySelector(`[name="model_${agent}"]`);
