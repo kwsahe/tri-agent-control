@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import tempfile
@@ -530,10 +531,11 @@ class RoundtableTests(unittest.TestCase):
         validation.assert_called_once()
 
     @patch.object(roundtable, "render_html_snapshot")
+    @patch.object(roundtable, "run_project_validation", return_value=[])
     @patch.object(roundtable, "add_runtime_event")
     @patch.object(roundtable, "save_state")
     def test_coding_planning_transitions_to_goal_iteration(
-        self, _save_state, _event, _render
+        self, _save_state, _event, _validation, _render
     ):
         planning_steps = roundtable.steps_for_mode("coding", ["codex"])
         roundtable.STATE.update(
@@ -699,7 +701,20 @@ class RoundtableTests(unittest.TestCase):
         self.assertIn("현재 세션 모드", notice)
         self.assertIn("코딩 모드", notice)
         self.assertIn("프로젝트 읽기·쓰기", notice)
-        self.assertIn("row center system", notice)
+        self.assertIn('class="row center speaker-system system"', notice)
+
+    def test_bubble_rows_carry_a_speaker_class_per_speaker_kind(self):
+        # antigravity와 user는 둘 다 side="center"라 left/center/right로는 구분되지 않는다.
+        kinds = {
+            agent: roundtable.bubble_html({"agent": agent, "phase": "강점 이야기", "time": "", "text": "테스트"})
+            for agent in ("codex", "antigravity", "claude", "user", "system")
+        }
+        for agent in ("codex", "antigravity", "claude"):
+            self.assertIn("speaker-model", kinds[agent], agent)
+        self.assertIn("speaker-user", kinds["user"])
+        self.assertIn("speaker-system", kinds["system"])
+        self.assertNotIn("speaker-model", kinds["user"])
+        self.assertNotIn("speaker-model", kinds["system"])
 
     @patch.object(roundtable, "add_message", return_value=True)
     @patch.object(roundtable, "save_state")
@@ -1059,6 +1074,275 @@ class RoundtableTests(unittest.TestCase):
             commands = roundtable.detect_validation_commands(root)
         self.assertEqual(commands[0][0], "Python pytest")
         self.assertEqual(commands[0][1][-2:], ["pytest", "-q"])
+
+    @staticmethod
+    def _without_validation_marker():
+        """검증 자식 프로세스로 실행될 때도 테스트가 같은 경로를 타도록 표시를 지운다."""
+        context = patch.dict(os.environ)
+        context.start()
+        os.environ.pop(roundtable.VALIDATION_ACTIVE_ENV, None)
+        return context
+
+    def test_validation_is_skipped_inside_a_validation_child_process(self):
+        # 가드가 뚫리면 실제 pytest를 재귀 실행하는 대신 즉시 실패하도록 막아둔다.
+        with patch.dict(os.environ, {roundtable.VALIDATION_ACTIVE_ENV: "1"}), patch.object(
+            roundtable, "detect_validation_commands",
+            side_effect=AssertionError("검증 재귀 가드가 뚫렸습니다"),
+        ):
+            self.assertEqual(roundtable.run_project_validation(roundtable.ROOT), [])
+
+    def test_validation_timeout_terminates_the_process_tree(self):
+        killed = []
+
+        class FakeProcess:
+            returncode = 0
+
+            def __init__(self):
+                self.attempts = 0
+
+            def communicate(self, timeout=None):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise subprocess.TimeoutExpired("pytest", timeout)
+                return b"", b""
+
+            def poll(self):
+                return None
+
+        context = self._without_validation_marker()
+        roundtable.CONTROL["stopped"] = False
+        try:
+            with patch.object(
+                roundtable, "detect_validation_commands",
+                return_value=[("Python pytest", [sys.executable, "-m", "pytest", "-q"])],
+            ), patch.object(
+                roundtable.subprocess, "Popen", return_value=FakeProcess()
+            ), patch.object(
+                roundtable, "terminate_process_tree", side_effect=killed.append
+            ):
+                results = roundtable.run_project_validation(roundtable.ROOT)
+        finally:
+            context.stop()
+
+        self.assertEqual(len(killed), 1)
+        self.assertFalse(results[0]["ok"])
+        self.assertEqual(results[0]["returncode"], -1)
+        self.assertIn("제한 시간", results[0]["output"])
+
+    def test_validation_cancelled_by_user_is_not_recorded_as_failure(self):
+        class FakeProcess:
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                roundtable.CONTROL["stopped"] = True  # 사용자가 중단 버튼을 누른 상황
+                return b"", b""
+
+            def poll(self):
+                return 1
+
+        context = self._without_validation_marker()
+        roundtable.CONTROL["stopped"] = False
+        try:
+            with patch.object(
+                roundtable, "detect_validation_commands",
+                return_value=[("Python pytest", [sys.executable, "-m", "pytest", "-q"])],
+            ), patch.object(roundtable.subprocess, "Popen", return_value=FakeProcess()):
+                results = roundtable.run_project_validation(roundtable.ROOT)
+        finally:
+            context.stop()
+
+        self.assertEqual(results, [])
+
+    def test_validation_marks_child_env_and_registers_process_for_cancel(self):
+        seen = {}
+
+        class FakeProcess:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                seen["registered"] = dict(roundtable.ACTIVE_PROCESSES)
+                return "통과".encode("utf-8"), b""
+
+            def poll(self):
+                return 0
+
+        def fake_popen(command, cwd=None, env=None, **kwargs):
+            seen["command"] = command
+            seen["env"] = env
+            return FakeProcess()
+
+        context = self._without_validation_marker()
+        roundtable.CONTROL["stopped"] = False
+        try:
+            with patch.object(
+                roundtable, "detect_validation_commands",
+                return_value=[("Python pytest", [sys.executable, "-m", "pytest", "-q"])],
+            ), patch.object(roundtable.subprocess, "Popen", side_effect=fake_popen):
+                results = roundtable.run_project_validation(roundtable.ROOT)
+        finally:
+            context.stop()
+
+        self.assertEqual(seen["env"][roundtable.VALIDATION_ACTIVE_ENV], "1")
+        self.assertIn("검증 · Python pytest", seen["registered"])
+        self.assertNotIn("검증 · Python pytest", roundtable.ACTIVE_PROCESSES)
+        self.assertTrue(results[0]["ok"])
+
+    def test_validation_stops_when_session_is_stopped(self):
+        context = self._without_validation_marker()
+        roundtable.CONTROL["stopped"] = True
+        try:
+            with patch.object(
+                roundtable, "detect_validation_commands",
+                return_value=[("Python pytest", [sys.executable, "-m", "pytest", "-q"])],
+            ), patch.object(
+                roundtable.subprocess, "Popen", side_effect=AssertionError("실행되면 안 됨")
+            ):
+                self.assertEqual(roundtable.run_project_validation(roundtable.ROOT), [])
+        finally:
+            context.stop()
+
+    @patch.object(roundtable, "render_html_snapshot")
+    @patch.object(roundtable, "run_project_validation", return_value=[])
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_question_on_final_step_stays_answerable(
+        self, _save_state, _event, _validation, _render
+    ):
+        steps = roundtable.steps_for_mode("discussion", ["claude"])
+        roundtable.STATE.update(
+            topic="마지막 단계 질문",
+            mode="discussion",
+            enabled_agents=["claude"],
+            step_index=len(steps) - 1,
+            finished=False,
+        )
+        roundtable.CONTROL.update(
+            stopped=False,
+            paused=False,
+            approval_requested=False,
+            intervention_pending=False,
+            worker_session_id=roundtable.STATE["id"],
+        )
+        question = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "확인 필요",
+            "question": "어느 쪽으로 진행할까요?",
+            "options": [{"id": "A", "label": "A안", "risk": "없음"}],
+            "recommended_option": "A",
+            "blocking": True,
+        }
+
+        def fake_run_step(_agent, phase, _instruction, _cli_mode, **_kwargs):
+            roundtable.register_user_question("claude", phase, question)
+            return True
+
+        with patch.object(roundtable, "run_step", side_effect=fake_run_step):
+            roundtable.worker_loop(roundtable.STATE["id"])
+
+        self.assertFalse(roundtable.STATE["finished"])
+        self.assertEqual(
+            roundtable.STATE["workflow_status"],
+            roundtable.workflow.WAITING_FOR_USER_RESPONSE,
+        )
+        self.assertTrue(roundtable.waiting_for_user_response(roundtable.STATE))
+
+        with (
+            patch.object(roundtable, "add_message", return_value=True),
+            patch.object(roundtable, "start_worker_if_needed"),
+            patch.object(roundtable, "state_json_payload", return_value={}),
+        ):
+            answered = roundtable.answer_pending_user_question("A", "")
+        self.assertTrue(answered.get("success"))
+        self.assertIsNone(roundtable.STATE["pending_user_question"])
+
+    @patch.object(roundtable, "render_html_snapshot")
+    @patch.object(roundtable, "run_project_validation", return_value=[])
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_stopped_session_drops_a_question_it_cannot_answer(
+        self, _save_state, _event, _validation, _render
+    ):
+        # /stop 직후 마지막 턴이 질문을 등록하고 끝나면, 답할 수 없는 질문만 남는다.
+        roundtable.STATE.update(topic="중단 처리", mode="discussion", enabled_agents=["claude"])
+        roundtable.STATE["workflow_status"] = roundtable.workflow.WAITING_FOR_USER_RESPONSE
+        roundtable.STATE["pending_user_question"] = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "확인 필요",
+            "question": "계속할까요?",
+            "options": [{"id": "A", "label": "A안", "risk": "없음"}],
+            "recommended_option": "A",
+            "blocking": True,
+        }
+        roundtable.CONTROL.update(stopped=True, paused=False, worker_session_id=roundtable.STATE["id"])
+
+        roundtable.worker_loop(roundtable.STATE["id"])
+
+        self.assertIsNone(roundtable.STATE["pending_user_question"])
+        self.assertEqual(
+            roundtable.STATE["workflow_status"], roundtable.workflow.CANCELLED
+        )
+        self.assertFalse(roundtable.waiting_for_user_response(roundtable.STATE))
+
+    @patch.object(roundtable, "save_state")
+    def test_approval_gate_is_kept_but_does_not_override_pending_question(self, _save_state):
+        roundtable.STATE["workflow_status"] = roundtable.workflow.WAITING_FOR_USER_RESPONSE
+        roundtable.STATE["pending_user_question"] = {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "확인 필요",
+            "question": "진행할까요?",
+            "options": [],
+            "recommended_option": "",
+            "blocking": True,
+        }
+        roundtable.CONTROL["approval_requested"] = False
+
+        roundtable.mark_approval_requested("claude", roundtable.CONFIRM_PHASE)
+
+        # 쓰기 승인 게이트는 살아 있어야 한다 (없으면 승인 없이 코딩 턴이 실행된다).
+        self.assertTrue(roundtable.CONTROL["approval_requested"])
+        self.assertIn(
+            f"Claude Code · {roundtable.CONFIRM_PHASE}",
+            roundtable.CONTROL["approval_requested_by"],
+        )
+        # 다만 답변 대기 상태는 덮이면 안 된다.
+        self.assertEqual(
+            roundtable.STATE["workflow_status"],
+            roundtable.workflow.WAITING_FOR_USER_RESPONSE,
+        )
+        self.assertTrue(roundtable.waiting_for_user_response(roundtable.STATE))
+
+    @patch.object(roundtable, "start_worker_if_needed")
+    @patch.object(roundtable, "state_json_payload", return_value={})
+    @patch.object(roundtable, "add_message", return_value=True)
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_confirm_gate_survives_a_question_on_the_same_turn(
+        self, _save_state, _event, _add_message, _payload, _start
+    ):
+        roundtable.STATE.update(mode="coding", topic="승인 게이트")
+        roundtable.CONTROL.update(
+            approval_requested=False, awaiting_approval=False, approval_requested_by=[], stopped=False
+        )
+        roundtable.register_user_question("claude", roundtable.CONFIRM_PHASE, {
+            "action": "STOP_AND_ASK_USER",
+            "reason": "확인 필요",
+            "question": "이대로 구현할까요?",
+            "options": [{"id": "A", "label": "A안", "risk": "없음"}],
+            "recommended_option": "A",
+            "blocking": True,
+        })
+        roundtable.mark_approval_requested("claude", roundtable.CONFIRM_PHASE)
+
+        answered = roundtable.answer_pending_user_question("A", "")
+
+        self.assertTrue(answered.get("success"))
+        self.assertIsNone(roundtable.STATE["pending_user_question"])
+        # 질문에 답했다고 코딩이 바로 시작되면 안 된다. 승인 단계가 남아 있어야 한다.
+        self.assertTrue(roundtable.CONTROL["approval_requested"])
+        self.assertEqual(
+            roundtable.STATE["workflow_status"],
+            roundtable.workflow.WAITING_FOR_USER_APPROVAL,
+        )
 
     def test_turn_diff_contains_only_changed_text_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -2279,3 +2279,77 @@ select:focus {
     display: none;
   }
 }
+
+/* ──────────────────────────────────────────
+   대화 가독성 — 누가 말했는지를 폭과 정렬로 구분한다.
+   기존 left/center/right는 모델별로 임의 배정돼 있어(antigravity와 user가 둘 다 center)
+   화자 구분에 쓸 수 없었다. 서버가 내보내는 speaker-* 클래스를 기준으로 잡는다.
+   모델 셋은 같은 열에 나란히, 내 개입은 오른쪽, 시스템 알림은 가운데 좁게.
+   ────────────────────────────────────────── */
+
+.row.speaker-model .bubble {
+  max-width: 88%;
+  margin-right: auto;
+}
+
+.row.speaker-user .bubble {
+  max-width: 76%;
+  margin-left: auto;
+  /* 내 개입은 오른쪽 정렬이라 강조선도 오른쪽에 둔다. */
+  border-left: 1px solid var(--line);
+  border-right: 4px solid var(--accent);
+}
+
+.row.speaker-system .bubble {
+  max-width: 68%;
+  margin: 0 auto;
+  border-left-width: 1px;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.row.speaker-system .text {
+  font-size: 13.5px;
+}
+
+/* 최종 보고는 결론이라 폭을 좁히지 않고 그대로 둔다. */
+.row.report .bubble {
+  max-width: 100%;
+}
+
+/* 턴 통계는 화면에서 가장 읽기 힘든 글자였다. 한 단계 밝히고 키운다. */
+.stats {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* 실행 제어 / 모드 / 세션이 버튼 11개로 한 줄에 섞여 있었다. */
+.action-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.action-group + .action-group {
+  padding-left: 14px;
+  border-left: 1px solid var(--line-strong);
+}
+
+.composer-actions {
+  align-items: flex-start;
+  gap: 8px 14px;
+}
+
+@media (max-width: 1040px) {
+  .row.speaker-model .bubble,
+  .row.speaker-user .bubble,
+  .row.speaker-system .bubble {
+    max-width: 100%;
+  }
+
+  .action-group + .action-group {
+    padding-left: 0;
+    border-left: 0;
+  }
+}

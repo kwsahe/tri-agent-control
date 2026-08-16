@@ -1053,22 +1053,68 @@ def detect_validation_commands(root: Path) -> list[tuple[str, list[str]]]:
     return commands[:2]
 
 
+# 검증 명령이 다시 이 도구를 실행하는 프로젝트(이 저장소 자신을 포함)에서 검증이 무한히
+# 재귀하지 않도록, 자식 프로세스에는 표시를 남기고 표시가 있는 프로세스는 검증을 건너뛴다.
+VALIDATION_ACTIVE_ENV = "ROUNDTABLE_VALIDATION_ACTIVE"
+VALIDATION_TIMEOUT = int(os.environ.get("ROUNDTABLE_VALIDATION_TIMEOUT_SECONDS", "180"))
+
+
 def run_project_validation(root: Path) -> list[dict]:
+    if os.environ.get(VALIDATION_ACTIVE_ENV) == "1":
+        return []
+    child_env = {**os.environ, VALIDATION_ACTIVE_ENV: "1"}
     results = []
     for label, command in detect_validation_commands(root):
+        if CONTROL["stopped"]:
+            break
         started = time.time()
+        tool_name = f"검증 · {label}"
         try:
-            result = subprocess.run(command, cwd=root, capture_output=True, timeout=180)
-            output = decode_cli_output(result.stdout or result.stderr).strip()
+            process = subprocess.Popen(
+                command,
+                cwd=root,
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
             results.append({
-                "label": label,
-                "ok": result.returncode == 0,
-                "returncode": result.returncode,
-                "elapsed": round(time.time() - started, 1),
-                "output": output[-2000:],
+                "label": label, "ok": False, "returncode": -1,
+                "elapsed": round(time.time() - started, 1), "output": str(exc),
             })
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            results.append({"label": label, "ok": False, "returncode": -1, "elapsed": round(time.time() - started, 1), "output": str(exc)})
+            continue
+        # 대시보드의 중단 버튼(cancel_active_cli_processes)이 검증도 끊을 수 있게 등록한다.
+        with ACTIVE_PROCESS_LOCK:
+            ACTIVE_PROCESSES[tool_name] = process
+        timed_out = False
+        try:
+            stdout, stderr = process.communicate(timeout=VALIDATION_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # subprocess의 기본 타임아웃 처리는 직속 자식만 죽여서 손자 프로세스가 남는다.
+            timed_out = True
+            terminate_process_tree(process)
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = b"", b""
+        finally:
+            with ACTIVE_PROCESS_LOCK:
+                if ACTIVE_PROCESSES.get(tool_name) is process:
+                    ACTIVE_PROCESSES.pop(tool_name, None)
+        if CONTROL["stopped"]:
+            # 사용자가 중단해서 죽은 프로세스다. 테스트 실패로 기록하면 실패 카운터가
+            # 오염되고, 반복되면 코딩 사이클이 "동일 오류 반복"으로 스스로 종료된다.
+            break
+        output = decode_cli_output(stdout or stderr).strip()
+        if timed_out:
+            output = f"제한 시간 {VALIDATION_TIMEOUT}초를 초과해 중단했습니다.\n{output}".strip()
+        results.append({
+            "label": label,
+            "ok": not timed_out and process.returncode == 0,
+            "returncode": -1 if timed_out else process.returncode,
+            "elapsed": round(time.time() - started, 1),
+            "output": output[-2000:],
+        })
     return results
 
 
@@ -1705,6 +1751,7 @@ def load_session(session_id: str) -> dict | None:
 
 def append_log(agent: str, phase: str, text: str) -> None:
     label = AGENTS[agent]["label"]
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(f"\n### [{ts()}] {label} — {phase}\n\n{text}\n")
 
@@ -1895,6 +1942,9 @@ def append_session_transcript(session_id: str, agent: str, phase: str, text: str
     if meta:
         stats = f" _(⏱ {meta['elapsed']}초 · 추정 토큰 ~{meta['est_tokens']} · {meta['cli_mode']})_"
     path = session_transcript_path(session_id)
+    # 세션 폴더 생성이 save_state의 부수효과에만 의존하면, 아직 폴더가 없는 새 클론에서
+    # append 모드 열기가 FileNotFoundError로 터진다.
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(f"\n## [{ts()}] {label} — {phase}{stats}\n\n{text}\n")
 
@@ -2224,11 +2274,15 @@ def answer_pending_user_question(option_id: str = "", answer: str = "") -> dict:
             return {"error": "답변을 기록하는 동안 활성 세션이 변경되었습니다."}
         STATE["user_question_history"].append(history_item)
         STATE["pending_user_question"] = None
-        STATE["workflow_status"] = (
-            workflow.CODING
-            if STATE.get("mode") == "coding"
-            else workflow.DEBATING
-        )
+        if CONTROL["awaiting_approval"] or CONTROL["approval_requested"]:
+            # 같은 턴에 승인 게이트도 걸려 있었다면 답변 뒤 승인 단계로 넘어간다.
+            STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
+        else:
+            STATE["workflow_status"] = (
+                workflow.CODING
+                if STATE.get("mode") == "coding"
+                else workflow.DEBATING
+            )
         CONTROL["paused"] = False
         CONTROL["stopped"] = False
         save_state(STATE)
@@ -2561,7 +2615,10 @@ def mark_approval_requested(agent: str, phase: str) -> None:
         requesters = CONTROL.setdefault("approval_requested_by", [])
         if requester not in requesters:
             requesters.append(requester)
-        STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
+        # 승인 게이트 자체는 그대로 건다. 다만 답변 대기 중인 질문이 있으면 화면 상태까지
+        # 덮어쓰지는 않는다 — 질문에 먼저 답하고, 그다음 승인 단계로 넘어간다.
+        if not waiting_for_user_response(STATE):
+            STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
         save_state(STATE)
 
 
@@ -2634,6 +2691,13 @@ def render_text_html(raw: str) -> str:
 def bubble_html(m: dict) -> str:
     agent = AGENTS[m["agent"]]
     side = agent["side"]
+    # left/center/right는 모델마다 다르게 배정돼 있어서(antigravity와 user가 둘 다 center)
+    # 화자 종류를 구분하는 용도로 쓸 수 없다. 스타일용 화자 클래스를 따로 내보낸다.
+    speaker = (
+        "speaker-user" if m["agent"] == "user"
+        else "speaker-system" if m["agent"] == "system"
+        else "speaker-model"
+    )
     phase = m.get("phase", "")
     highlight_class = " system" if m["agent"] == "system" else (
         " report" if phase == "최종 보고" else (" confirm" if phase == CONFIRM_PHASE else "")
@@ -2706,7 +2770,7 @@ def bubble_html(m: dict) -> str:
             )
 
     return f"""
-    <div class="row {side}{highlight_class}">
+    <div class="row {side} {speaker}{highlight_class}">
       <div class="bubble" style="--accent:{agent['color']}">
         <div class="meta">
           {avatar_html}
@@ -3130,7 +3194,8 @@ def wait_for_user_approval(session_id: str) -> bool:
         CONTROL["approval_deferred"] = False
         CONTROL["approval_rejected"] = False
         CONTROL["approval_seen_messages"] = len(STATE["messages"])
-        STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
+        if not waiting_for_user_response(STATE):
+            STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
         save_state(STATE)
     separator("사용자 승인 대기 중 — 승인해야 다음 단계가 진행됩니다")
     while CONTROL["awaiting_approval"] and not CONTROL["stopped"]:
@@ -3590,6 +3655,13 @@ def worker_loop(session_id: str) -> None:
                     next_index >= len(steps) or steps[next_index][1] == "최종 보고"
                 ))
             )
+            with STATE_LOCK:
+                question_pending = bool(STATE.get("pending_user_question"))
+            if should_validate and question_pending:
+                # 검증 중에는 상태가 VALIDATING이 되어 질문에 답할 수 없게 된다.
+                # 에이전트가 진행을 멈추고 물어본 상황이므로 검증도 미룬다.
+                should_validate = False
+                add_runtime_event("사용자 질문 대기 중이라 자동 검증을 건너뜁니다.")
             if should_validate:
                 add_runtime_event("자동 검증 시작")
                 with STATE_LOCK:
@@ -3617,7 +3689,11 @@ def worker_loop(session_id: str) -> None:
                             STATE["coding_progress"] = progress
                         save_state(STATE)
                 if not validation_results:
-                    add_runtime_event("자동 검증 명령을 찾지 못했습니다.")
+                    add_runtime_event(
+                        "중단되어 자동 검증을 건너뛰었습니다."
+                        if CONTROL["stopped"]
+                        else "자동 검증 명령을 찾지 못했습니다."
+                    )
                 for result in validation_results:
                     level = "info" if result["ok"] else "error"
                     add_runtime_event(
@@ -3639,14 +3715,27 @@ def worker_loop(session_id: str) -> None:
                 mode = STATE.get("mode", "discussion")
                 enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
                 steps = steps_for_mode(mode, enabled_agents)
-                finished = (
-                    mode == "discussion"
-                    and STATE["step_index"] >= len(steps)
-                    and not CONTROL["stopped"]
-                ) or bool(STATE.get("finished", False))
+                # 사용자 답변 대기는 완료보다 우선한다. 마지막 단계에서 STOP_AND_ASK_USER가
+                # 나왔을 때 상태가 COMPLETED로 덮이면 질문은 화면에 뜨는데 답변은 영영 막힌다.
+                blocking_question = bool(STATE.get("pending_user_question"))
+                finished = not blocking_question and (
+                    (
+                        mode == "discussion"
+                        and STATE["step_index"] >= len(steps)
+                        and not CONTROL["stopped"]
+                    )
+                    or bool(STATE.get("finished", False))
+                )
                 STATE["finished"] = finished
                 if finished:
                     STATE["workflow_status"] = workflow.COMPLETED
+                elif blocking_question and CONTROL["stopped"]:
+                    # 중단된 세션에 답할 수 없는 질문만 남기지 않는다. /stop 직후에 마지막
+                    # 턴이 질문을 등록하고 끝나는 경우가 여기로 온다.
+                    STATE["pending_user_question"] = None
+                    STATE["workflow_status"] = workflow.CANCELLED
+                elif blocking_question:
+                    STATE["workflow_status"] = workflow.WAITING_FOR_USER_RESPONSE
                 STATE["active_agent"] = None
                 STATE["active_phase"] = None
                 STATE["active_started_at"] = None
@@ -4908,6 +4997,9 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 if STATE.get("mode") == "coding":
                     STATE["coding_stopped"] = True
                     STATE["coding_stop_reason"] = "사용자 중단"
+                # 중단은 대기 중인 질문도 함께 취소한다. 남겨두면 상태는 CANCELLED인데
+                # 화면에는 답할 수 없는 질문 카드만 계속 떠 있게 된다.
+                STATE["pending_user_question"] = None
                 STATE["workflow_status"] = workflow.CANCELLED
                 persist_intervention_queue_locked()
                 save_state(STATE)
@@ -4995,6 +5087,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_intent"] = ""
             CONTROL["intervention_queue"] = []
             with STATE_LOCK:
+                STATE["pending_user_question"] = None
                 STATE["workflow_status"] = workflow.CANCELLED
                 persist_intervention_queue_locked()
             self._send_json(state_json_payload())

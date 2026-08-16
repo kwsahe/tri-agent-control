@@ -221,6 +221,7 @@ python tests\live_smoke.py
 | `CODEX_TIMEOUT_SECONDS` | 900 | Codex 응답 제한 시간 |
 | `AGY_TIMEOUT_SECONDS` / `CLAUDE_TIMEOUT_SECONDS` | 600 | Antigravity와 Claude 응답 제한 시간 |
 | `ROUNDTABLE_PORT` | 8765 | 로컬 대시보드 시작 포트 |
+| `ROUNDTABLE_VALIDATION_TIMEOUT_SECONDS` | 180 | 자동 검증 명령 하나의 제한 시간 |
 | `ROUNDTABLE_TRANSCRIPT_WINDOW` | 2 | 직접 전달하는 최근 메시지 수 |
 | `ROUNDTABLE_MEMORY_BRIEF_LINES` | 6 | 압축 메모리 줄 수 |
 | `ROUNDTABLE_TRANSCRIPT_MAX_CHARS` | 1600 | 최근 대화 최대 문자 수 |

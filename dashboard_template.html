@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TriAgent Control</title>
-<link rel="stylesheet" href="/static/dashboard.css?v=20260715-responsive-test">
+<link rel="stylesheet" href="/static/dashboard.css?v=20260816-readable-thread">
 </head>
 <body>
 <div class="app-shell">
@@ -115,24 +115,30 @@
 
     <section class="composer" id="controlPanel">
       <div class="composer-actions">
-        <button id="pauseBtn" class="ghost" onclick="ctrl('pause')" __PAUSE_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>일시정지</button>
-        <button id="resumeBtn" class="ghost" onclick="ctrl('resume')" __RESUME_DISABLED__><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>재개</button>
-        <button id="stopBtn" class="danger" onclick="stopSession()" __STOP_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>중단</button>
-        <button id="retryBtn" class="ghost" onclick="retryFailedTurn()" style="display:none"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>실패 턴 재시도</button>
-        <button id="continueNextBtn" class="ghost" onclick="continueNextAgent()" style="display:none"><svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zm9-12v12h2V6h-2z"/></svg>변경 유지·다음 모델</button>
-        <button class="ghost" onclick="restartSession()"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>새 세션</button>
-        <button class="ghost" onclick="openPromptPreview()">프롬프트 미리보기</button>
-        <select id="composerModeSelect" aria-label="채팅 모드">
-          <option value="discussion">토론 모드</option>
-          <option value="coding">코딩 모드</option>
-        </select>
-        <button class="ghost" onclick="changeSessionMode('composer')">모드 전환</button>
-        <select id="composerDiscussionAccess" aria-label="토론 프로젝트 접근">
-          <option value="read">프로젝트 읽기</option>
-          <option value="write">프로젝트 읽기·쓰기</option>
-          <option value="none">읽지 않고 토론</option>
-        </select>
-        <button class="ghost" id="composerDiscussionAccessButton" onclick="changeDiscussionAccess('composer')">토론 접근 적용</button>
+        <div class="action-group" role="group" aria-label="실행 제어">
+          <button id="pauseBtn" class="ghost" onclick="ctrl('pause')" __PAUSE_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>일시정지</button>
+          <button id="resumeBtn" class="ghost" onclick="ctrl('resume')" __RESUME_DISABLED__><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>재개</button>
+          <button id="stopBtn" class="danger" onclick="stopSession()" __STOP_DISABLED__><svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>중단</button>
+          <button id="retryBtn" class="ghost" onclick="retryFailedTurn()" style="display:none"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>실패 턴 재시도</button>
+          <button id="continueNextBtn" class="ghost" onclick="continueNextAgent()" style="display:none"><svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zm9-12v12h2V6h-2z"/></svg>변경 유지·다음 모델</button>
+        </div>
+        <div class="action-group" role="group" aria-label="모드와 접근 권한">
+          <select id="composerModeSelect" aria-label="채팅 모드">
+            <option value="discussion">토론 모드</option>
+            <option value="coding">코딩 모드</option>
+          </select>
+          <button class="ghost" onclick="changeSessionMode('composer')">모드 전환</button>
+          <select id="composerDiscussionAccess" aria-label="토론 프로젝트 접근">
+            <option value="read">프로젝트 읽기</option>
+            <option value="write">프로젝트 읽기·쓰기</option>
+            <option value="none">읽지 않고 토론</option>
+          </select>
+          <button class="ghost" id="composerDiscussionAccessButton" onclick="changeDiscussionAccess('composer')">토론 접근 적용</button>
+        </div>
+        <div class="action-group" role="group" aria-label="세션">
+          <button class="ghost" onclick="restartSession()"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>새 세션</button>
+          <button class="ghost" onclick="openPromptPreview()">프롬프트 미리보기</button>
+        </div>
       </div>
       <div class="message-box">
         <select id="interventionIntent" aria-label="개입 유형" __NO_TOPIC__>
@@ -159,6 +165,11 @@
       <div class="live-line" id="liveLine">대기 중</div>
       <div class="live-detail" id="liveDetail">모델 호출이 시작되면 여기에 표시됩니다.</div>
     </div>
+
+    <details class="inspector-card supporting-card">
+      <summary class="card-title">검증</summary>
+      <div class="runtime-log" id="validationLog"><div class="runtime-empty">아직 검증 결과가 없습니다.</div></div>
+    </details>
 
     <div class="inspector-card">
       <div class="card-title">세션</div>
@@ -281,10 +292,6 @@
       <div class="runtime-log" id="agentCallLog"><div class="runtime-empty">아직 에이전트 호출이 없습니다.</div></div>
     </details>
 
-    <details class="inspector-card supporting-card">
-      <summary class="card-title">검증</summary>
-      <div class="runtime-log" id="validationLog"><div class="runtime-empty">아직 검증 결과가 없습니다.</div></div>
-    </details>
   </aside>
 </div>
 
