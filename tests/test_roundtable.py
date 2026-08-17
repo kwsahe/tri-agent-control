@@ -1094,6 +1094,59 @@ class RoundtableTests(unittest.TestCase):
         os.environ.pop(roundtable.VALIDATION_ACTIVE_ENV, None)
         return context
 
+    def test_topic_focus_paths_reads_file_names_from_topic_and_changes(self):
+        state = {
+            "topic": "app.py의 greet()를 고치고 tests/test_app.py도 갱신해라. 3.5초 안에.",
+            "coding_progress": {"changed_paths": ["static/dashboard.css"]},
+        }
+        paths = roundtable.topic_focus_paths(state)
+        self.assertIn("app.py", paths)
+        self.assertIn("tests/test_app.py", paths)
+        self.assertIn("static/dashboard.css", paths)
+
+    @patch.object(roundtable, "write_session_roles")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_coding_role_auto_selection_follows_the_topic_scope(
+        self, _save_state, _event, _roles_file
+    ):
+        # 실제로 막혔던 상황: 주제는 app.py인데 선호 순서상 qa(tests/**)가 먼저 걸렸다.
+        roundtable.STATE.update(
+            topic="app.py의 greet()가 name 인자를 받도록 고쳐라. tests/test_app.py는 그대로 둬라.",
+            mode="coding",
+            enabled_agents=["antigravity"],
+            agent_roles={"codex": "", "antigravity": "", "claude": ""},
+        )
+        selected = roundtable.choose_discussion_role("antigravity", "qa")
+        # qa는 tests/test_app.py 하나만, backend는 app.py까지 두 개를 덮는다.
+        self.assertEqual(selected, "backend")
+
+    @patch.object(roundtable, "write_session_roles")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_coding_role_auto_selection_skips_readonly_roles(
+        self, _save_state, _event, _roles_file
+    ):
+        roundtable.STATE.update(
+            topic="문서를 정리해라.", mode="coding", enabled_agents=["antigravity"],
+            agent_roles={"codex": "", "antigravity": "", "claude": ""},
+        )
+        selected = roundtable.choose_discussion_role("antigravity", "reviewer")
+        self.assertTrue(roundtable.ROLE_CATALOG[selected]["can_write"])
+
+    @patch.object(roundtable, "write_session_roles")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_discussion_role_auto_selection_keeps_the_requested_role(
+        self, _save_state, _event, _roles_file
+    ):
+        roundtable.STATE.update(
+            topic="app.py를 검토해라.", mode="discussion", enabled_agents=["antigravity"],
+            agent_roles={"codex": "", "antigravity": "", "claude": ""},
+        )
+        # 토론 모드에서는 범위 보정을 하지 않는다. 읽기 전용 역할도 그대로 존중한다.
+        self.assertEqual(roundtable.choose_discussion_role("antigravity", "reviewer"), "reviewer")
+
     @patch.object(roundtable, "state_json_payload", return_value={})
     @patch.object(roundtable, "announce_roles_if_complete")
     @patch.object(roundtable, "write_session_roles")

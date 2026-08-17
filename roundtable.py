@@ -661,6 +661,55 @@ def strip_role_selection(text: str) -> str:
     return ROLE_SELECTION_RE.sub("", text or "").strip()
 
 
+# 경로 문자를 ASCII로 한정한다. \w는 유니코드라 "app.py의" 같은 한글 조사까지 삼키고,
+# \b는 조사가 단어 문자라 경계로 인정되지 않아 매칭 자체가 실패한다.
+TOPIC_PATH_RE = re.compile(
+    r"[A-Za-z0-9_./\\-]*[A-Za-z0-9_]\.[A-Za-z][A-Za-z0-9]{0,7}(?![A-Za-z0-9])"
+)
+
+
+def topic_focus_paths(state: dict) -> list[str]:
+    """이번 작업이 건드릴 파일 경로를 주제 문장과 이미 바뀐 파일에서 뽑는다."""
+    paths = []
+    for token in TOPIC_PATH_RE.findall(str(state.get("topic", ""))):
+        cleaned = token.replace("\\", "/").lstrip("./")
+        if cleaned:
+            paths.append(cleaned)
+    paths.extend(normalize_coding_progress(state.get("coding_progress"))["changed_paths"])
+    return list(dict.fromkeys(paths))[:20]
+
+
+def role_scope_coverage(role_id: str, paths: list[str]) -> int:
+    """역할의 담당 범위가 주어진 경로 중 몇 개를 덮는지 센다."""
+    patterns = ROLE_CATALOG.get(role_id, {}).get("patterns", [])
+    if not patterns:
+        return 0
+    return sum(
+        any(fnmatch.fnmatch(path.lower(), pattern.lower()) for pattern in patterns)
+        for path in paths
+    )
+
+
+def pick_scoped_role(candidates: list[str], state: dict) -> str:
+    """코딩 모드에서는 담당 범위가 작업 대상과 맞는 역할을 우선 고른다.
+
+    선호 순서대로 첫 후보를 집으면 주제가 app.py인데 QA·테스트(tests/**)가 배정돼
+    코딩 턴이 통째로 막히는 일이 생긴다. 대상 파일을 가장 많이 덮는 역할을 고르고,
+    판단 근거가 없으면 기존 선호 순서를 그대로 쓴다.
+    """
+    if not candidates:
+        return ""
+    if state.get("mode") != "coding":
+        return candidates[0]
+    # 읽기 전용 역할은 코딩 지시를 전부 검토로 바꿔버리므로 자동 선택에서 뺀다.
+    writable = [role for role in candidates if ROLE_CATALOG[role].get("can_write")] or candidates
+    paths = topic_focus_paths(state)
+    if not paths:
+        return writable[0]
+    best = max(writable, key=lambda role: role_scope_coverage(role, paths))
+    return best if role_scope_coverage(best, paths) else writable[0]
+
+
 def choose_discussion_role(agent: str, requested_role: str = "") -> str:
     with STATE_LOCK:
         roles = normalize_agent_roles(STATE.get("agent_roles"))
@@ -668,7 +717,10 @@ def choose_discussion_role(agent: str, requested_role: str = "") -> str:
         candidates = [requested_role] if requested_role in ROLE_CATALOG else []
         candidates.extend(ROLE_PREFERENCES.get(agent, []))
         candidates.extend(ROLE_CATALOG)
-        selected = next((role for role in candidates if role and role not in used), "")
+        available = [
+            role for role in dict.fromkeys(candidates) if role and role not in used
+        ]
+        selected = pick_scoped_role(available, STATE)
         previous = roles.get(agent, "")
         if not selected or selected == previous:
             return selected
@@ -684,10 +736,16 @@ def choose_discussion_role(agent: str, requested_role: str = "") -> str:
         del STATE["role_history"][:-100]
         save_state(STATE)
         snapshot = dict(STATE)
+        focus_paths = topic_focus_paths(STATE) if STATE.get("mode") == "coding" else []
     write_session_roles(snapshot)
+    if requested_role == selected:
+        reason = ""
+    elif focus_paths and role_scope_coverage(selected, focus_paths):
+        reason = f" (작업 대상 {', '.join(focus_paths[:3])}에 맞춰 자동 보정)"
+    else:
+        reason = " (남은 선택지로 자동 보정)"
     add_runtime_event(
-        f"역할 토론 자동 선택: {AGENTS[agent]['label']}={role_label(selected)}"
-        + ("" if requested_role == selected else " (남은 선택지로 자동 보정)")
+        f"역할 토론 자동 선택: {AGENTS[agent]['label']}={role_label(selected)}{reason}"
     )
     return selected
 
