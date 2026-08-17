@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -66,6 +67,16 @@ class RoundtableTests(unittest.TestCase):
         args = run_cli.call_args.args[2]
         self.assertEqual(args[args.index("--tools") + 1], "Read,Glob,Grep")
         self.assertEqual(run_cli.call_args.kwargs["cwd"], roundtable.load_project_path())
+
+    def test_read_access_prompt_states_that_tools_are_already_granted(self):
+        roundtable.STATE["mode"] = "coding"  # 계획 단계 → project_access == "read"
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_claude("계획을 정리해라")
+        args = run_cli.call_args.args[2]
+        system_prompt = args[args.index("--system-prompt") + 1]
+        self.assertIn("already granted", system_prompt)
+        self.assertIn("never ask the user for file access permission", system_prompt.lower())
 
     def test_discussion_without_project_uses_no_tools_and_isolated_directory(self):
         roundtable.STATE["mode"] = "discussion"
@@ -1082,6 +1093,74 @@ class RoundtableTests(unittest.TestCase):
         context.start()
         os.environ.pop(roundtable.VALIDATION_ACTIVE_ENV, None)
         return context
+
+    @patch.object(roundtable, "state_json_payload", return_value={})
+    @patch.object(roundtable, "announce_roles_if_complete")
+    @patch.object(roundtable, "write_session_roles")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_coding_mode_releases_carried_over_readonly_roles(
+        self, _save_state, event, _roles_file, _announce, _payload
+    ):
+        roundtable.STATE.update(
+            topic="이월 역할",
+            mode="discussion",
+            enabled_agents=["codex", "claude"],
+            agent_roles={"codex": "backend", "antigravity": "", "claude": "reviewer"},
+        )
+        with patch.object(roundtable, "load_project_path", return_value=roundtable.ROOT):
+            roundtable.switch_mode("coding")
+
+        roles = roundtable.STATE["agent_roles"]
+        # 읽기 전용 역할만 풀리고, 쓰기 가능한 역할은 사용자가 고정한 것이므로 유지한다.
+        self.assertEqual(roles["claude"], "")
+        self.assertEqual(roles["codex"], "backend")
+        self.assertTrue(any("읽기 전용 역할을 해제" in str(c.args[0]) for c in event.call_args_list))
+        self.assertEqual(roundtable.STATE["role_history"][-1]["from"], "reviewer")
+
+    @patch.object(roundtable, "state_json_payload", return_value={})
+    @patch.object(roundtable, "announce_roles_if_complete")
+    @patch.object(roundtable, "write_session_roles")
+    @patch.object(roundtable, "add_runtime_event")
+    @patch.object(roundtable, "save_state")
+    def test_discussion_mode_keeps_readonly_roles(
+        self, _save_state, _event, _roles_file, _announce, _payload
+    ):
+        roundtable.STATE.update(
+            topic="유지",
+            mode="coding",
+            enabled_agents=["claude"],
+            agent_roles={"codex": "", "antigravity": "", "claude": "reviewer"},
+        )
+        with patch.object(roundtable, "load_project_path", return_value=roundtable.ROOT):
+            roundtable.switch_mode("discussion")
+        self.assertEqual(roundtable.STATE["agent_roles"]["claude"], "reviewer")
+
+    def test_stale_atomic_write_temp_files_are_cleaned_up(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sessions = root / "sessions"
+            sessions.mkdir()
+            stale = root / ".roundtable_state.json.111.222.tmp"
+            fresh = root / ".roundtable_state.json.333.444.tmp"
+            stale_session = sessions / ".20260101_000000_000000.json.111.222.tmp"
+            keep = root / "roundtable_state.json"
+            for path in (stale, fresh, stale_session, keep):
+                path.write_text("{}", encoding="utf-8")
+            old = time.time() - 7200
+            os.utime(stale, (old, old))
+            os.utime(stale_session, (old, old))
+
+            with patch.object(roundtable, "ROOT", root), patch.object(
+                roundtable, "STATE_PATH", keep
+            ), patch.object(roundtable, "SESSIONS_DIR", sessions):
+                removed = roundtable.cleanup_stale_state_temp_files()
+
+            self.assertEqual(removed, 2)
+            self.assertFalse(stale.exists())
+            self.assertFalse(stale_session.exists())
+            self.assertTrue(fresh.exists())   # 동시에 도는 인스턴스의 작업 파일은 건드리지 않는다
+            self.assertTrue(keep.exists())
 
     def test_validation_is_skipped_inside_a_validation_child_process(self):
         # 가드가 뚫리면 실제 pytest를 재귀 실행하는 대신 즉시 실패하도록 막아둔다.

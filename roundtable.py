@@ -1424,8 +1424,14 @@ def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> st
     if project_access != "write":
         tools = "Read,Glob,Grep" if project_access == "read" else ""
         args.extend(["--tools", tools])
+        # --permission-mode dontAsk는 "승인을 물어보지 않는다"는 뜻이지 도구를 막는다는
+        # 뜻이 아닌데, 모델이 이름만 보고 "차단됐다"고 단정한 뒤 사용자에게 권한을 되묻는
+        # 일이 잦았다. 읽기 도구가 이미 허용돼 있다는 사실을 명시한다.
         access_instruction = (
-            "Inspect only the relevant project files with Read, Glob, and Grep before answering. "
+            "Read, Glob, and Grep are already granted for the working directory and need no "
+            "further approval — call them directly to inspect the relevant project files before "
+            "answering. Never claim your tools are blocked and never ask the user for file "
+            "access permission. "
             if project_access == "read" else
             "Do not inspect files or call tools. Use only the conversation context in the prompt. "
         )
@@ -1700,6 +1706,33 @@ def atomic_write_json(path: Path, state: dict) -> None:
         os.replace(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+STALE_TEMP_AGE_SECONDS = 3600
+
+
+def cleanup_stale_state_temp_files(max_age_seconds: int = STALE_TEMP_AGE_SECONDS) -> int:
+    """이전 실행이 강제 종료되며 남긴 원자적 쓰기 임시 파일을 지운다.
+
+    atomic_write_json은 write_text와 os.replace 사이에서 프로세스가 죽으면
+    `.roundtable_state.json.<pid>.<tid>.tmp`를 남긴다. 다른 포트에서 동시에 도는
+    인스턴스의 작업 중 파일을 지우지 않도록, 충분히 오래된 것만 정리한다.
+    """
+    removed = 0
+    now = time.time()
+    targets = [(ROOT, f".{STATE_PATH.name}.*.tmp")]
+    if SESSIONS_DIR.is_dir():
+        targets.append((SESSIONS_DIR, ".*.json.*.tmp"))
+    for directory, pattern in targets:
+        for path in directory.glob(pattern):
+            try:
+                if now - path.stat().st_mtime < max_age_seconds:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+    return removed
 
 
 def save_state(state: dict) -> None:
@@ -2444,6 +2477,48 @@ def update_agent_roles(roles: dict) -> dict:
     payload = state_json_payload()
     payload["success"] = True
     return payload
+
+
+def release_readonly_roles_for_coding_locked() -> list[dict]:
+    """코딩 모드로 들어갈 때 이월된 읽기 전용 역할만 해제한다.
+
+    읽기 전용 역할(코드 리뷰어, 통합 조정자)이 이전 세션에서 남아 있으면 코딩 지시가
+    전부 검토로 전환되어, 코딩 세션인데 파일이 하나도 바뀌지 않는다. 쓰기 가능한 역할은
+    사용자가 의도해서 고정해 둔 것일 수 있으므로 건드리지 않는다.
+    STATE_LOCK을 이미 잡은 곳에서 호출한다.
+    """
+    roles = normalize_agent_roles(STATE.get("agent_roles"))
+    enabled = set(normalize_enabled_agents(STATE.get("enabled_agents")))
+    released = []
+    for agent in AGENT_ORDER:
+        role = ROLE_CATALOG.get(roles.get(agent, ""))
+        if agent in enabled and role and not role.get("can_write"):
+            released.append({
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "agent": agent,
+                "from": roles[agent],
+                "to": "",
+            })
+            roles[agent] = ""
+    if released:
+        STATE["agent_roles"] = roles
+        STATE.setdefault("role_history", []).extend(released)
+        del STATE["role_history"][:-100]
+        STATE["roles_announced_signature"] = ""
+    return released
+
+
+def announce_released_readonly_roles(released: list[dict]) -> None:
+    """해제 결과를 실행 기록에 남긴다. STATE_LOCK 밖에서 호출한다."""
+    if not released:
+        return
+    summary = ", ".join(
+        f"{AGENTS[item['agent']]['label']}({role_label(item['from'])})" for item in released
+    )
+    add_runtime_event(
+        f"코딩 모드라서 읽기 전용 역할을 해제했습니다: {summary}. "
+        "읽기 전용으로 두려면 Roles 카드에서 다시 지정해주세요."
+    )
 
 
 def update_discussion_project_access(access: str) -> dict:
@@ -4565,6 +4640,10 @@ def switch_mode(mode: str) -> dict:
             elif mode == "discussion" and STATE.get("step_index", 0) > common_step_count:
                 STATE["step_index"] = common_step_count
         STATE["mode"] = mode
+        released_roles = (
+            release_readonly_roles_for_coding_locked()
+            if mode == "coding" and previous_mode != "coding" else []
+        )
         if mode == "coding":
             STATE["workspace_access"] = "write"
             STATE["discussion_project_access"] = "write"
@@ -4592,7 +4671,11 @@ def switch_mode(mode: str) -> dict:
         save_state(STATE)
         topic_exists = bool(STATE.get("topic"))
         should_start = topic_exists and not STATE.get("finished", False)
+        role_snapshot = dict(STATE) if released_roles else None
     add_runtime_event(f"세션 모드 전환: {MODE_LABELS[mode]}")
+    if role_snapshot is not None:
+        write_session_roles(role_snapshot)
+    announce_released_readonly_roles(released_roles)
     if should_start:
         start_worker_if_needed(force=True)
     payload = state_json_payload()
@@ -4803,8 +4886,12 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     CONTROL["approval_requested"] = False
                     CONTROL["approval_requested_by"] = []
                     CONTROL["approval_rejected"] = False
+                    released_roles = (
+                        release_readonly_roles_for_coding_locked() if mode == "coding" else []
+                    )
                     save_state(STATE)
                     state_snapshot = dict(STATE)
+                announce_released_readonly_roles(released_roles)
                 start_log_session()
                 write_session_transcript_header(state_snapshot)
                 ensure_session_memory(state_snapshot)
@@ -5137,6 +5224,9 @@ def main() -> None:
     print(f"   공통 지침: {TEAM_PROMPT_PATH}")
     ensure_project_path_file()
     print(f"   코딩 대상 폴더: {load_project_path()}  (바꾸려면 {PROJECT_PATH_FILE.name} 수정)")
+    stale_temps = cleanup_stale_state_temp_files()
+    if stale_temps:
+        print(f"   이전 실행이 남긴 임시 파일 {stale_temps}개를 정리했습니다.")
     preflight()
 
     prepare_manual_resume_after_startup()
