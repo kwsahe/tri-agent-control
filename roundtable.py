@@ -1501,6 +1501,15 @@ def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> st
         ])
     else:
         args.extend(["--tools", "Bash,Edit,Read,Write,Glob,Grep"])
+        # acceptEdits는 편집만 자동 승인하고 Bash는 승인 대상이라, 모델이 pytest를 직접
+        # 돌리려다 막혀 사용자에게 되묻는다. 그러면 이 도구의 자동 검증까지 함께 밀린다.
+        # 기본 시스템 프롬프트를 덮지 않도록 append를 쓴다.
+        args.extend([
+            "--append-system-prompt",
+            "The orchestrator runs this project's test, lint, and build commands automatically "
+            "after your turn. Never run them yourself and never ask the user for permission to "
+            "run a command — just make the edits and report what changed, in Korean.",
+        ])
     args.extend(["--permission-mode", permission_mode, "--verbose", "--output-format", "stream-json", prompt])
     result = run_cli(
         "Claude Code",
@@ -2421,7 +2430,9 @@ def project_access_prompt(project_access: str) -> str:
     if project_access == "write":
         return (
             "프로젝트 접근 권한: 읽기·쓰기. 현재 작업이 구현이나 수정을 명시하면 관련 파일을 먼저 확인한 뒤 "
-            "실제 구현과 검증까지 완료한다. 현재 작업이 토론·분석·계획만 요구하면 파일을 수정하지 않는다. "
+            "실제 구현까지 완료한다. 현재 작업이 토론·분석·계획만 요구하면 파일을 수정하지 않는다. "
+            "테스트·린트·빌드 명령은 턴이 끝나면 이 도구가 자동으로 실행한다. 직접 실행하지 말고 "
+            "실행 승인도 요청하지 마라. 무엇을 어떻게 바꿨는지만 보고한다. "
             "승인된 작업 범위와 사용자 지시를 벗어나지 않는다."
         )
     if project_access == "read":

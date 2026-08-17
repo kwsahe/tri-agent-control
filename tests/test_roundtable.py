@@ -68,6 +68,25 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(args[args.index("--tools") + 1], "Read,Glob,Grep")
         self.assertEqual(run_cli.call_args.kwargs["cwd"], roundtable.load_project_path())
 
+    def test_coding_turn_tells_the_model_not_to_run_test_commands(self):
+        roundtable.STATE["mode"] = "coding"
+        roundtable.STATE["workspace_access"] = "write"
+        result = subprocess.CompletedProcess([], 0, "정상 응답", "")
+        with patch.object(roundtable, "run_cli", return_value=result) as run_cli:
+            roundtable.ask_claude("구현해라", "coding")
+        args = run_cli.call_args.args[2]
+        # 기본 시스템 프롬프트를 덮으면 코딩 능력이 깎이므로 append여야 한다.
+        self.assertNotIn("--system-prompt", args)
+        appended = args[args.index("--append-system-prompt") + 1]
+        self.assertIn("automatically", appended)
+        self.assertIn("never ask the user for permission", appended)
+
+    def test_write_access_prompt_defers_verification_to_the_tool(self):
+        prompt = roundtable.project_access_prompt("write")
+        self.assertIn("자동으로 실행한다", prompt)
+        self.assertIn("실행 승인도 요청하지 마라", prompt)
+        self.assertNotIn("검증까지 완료한다", prompt)
+
     def test_read_access_prompt_states_that_tools_are_already_granted(self):
         roundtable.STATE["mode"] = "coding"  # 계획 단계 → project_access == "read"
         result = subprocess.CompletedProcess([], 0, "정상 응답", "")
