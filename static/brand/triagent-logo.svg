@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">TriAgent Control</title>
+  <desc id="desc">세 개의 인공지능 에이전트가 하나의 제어 허브를 중심으로 협업하는 모습</desc>
+  <defs>
+    <linearGradient id="surface" x1="88" y1="72" x2="424" y2="448" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172033"/>
+      <stop offset="1" stop-color="#090D16"/>
+    </linearGradient>
+    <linearGradient id="hub" x1="184" y1="166" x2="332" y2="346" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#C9D5EA"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#03050A" flood-opacity=".5"/>
+    </filter>
+    <filter id="glow" x="-90%" y="-90%" width="280%" height="280%">
+      <feGaussianBlur stdDeviation="13"/>
+    </filter>
+  </defs>
+
+  <rect x="40" y="40" width="432" height="432" rx="132" fill="url(#surface)" stroke="#FFFFFF" stroke-opacity=".12" stroke-width="4" filter="url(#shadow)"/>
+
+  <g opacity=".36" fill="none" stroke="#AFC1DD" stroke-width="5" stroke-linecap="round">
+    <path d="M256 256 256 122"/>
+    <path d="M256 256 372 323"/>
+    <path d="M256 256 140 323"/>
+  </g>
+
+  <g opacity=".35" filter="url(#glow)">
+    <circle cx="256" cy="118" r="42" fill="#4F8CFF"/>
+    <circle cx="380" cy="328" r="42" fill="#A66CFF"/>
+    <circle cx="132" cy="328" r="42" fill="#FF8A3D"/>
+  </g>
+
+  <g>
+    <circle cx="256" cy="118" r="38" fill="#111827" stroke="#4F8CFF" stroke-width="10"/>
+    <circle cx="380" cy="328" r="38" fill="#111827" stroke="#A66CFF" stroke-width="10"/>
+    <circle cx="132" cy="328" r="38" fill="#111827" stroke="#FF8A3D" stroke-width="10"/>
+    <circle cx="256" cy="118" r="9" fill="#4F8CFF"/>
+    <circle cx="380" cy="328" r="9" fill="#A66CFF"/>
+    <circle cx="132" cy="328" r="9" fill="#FF8A3D"/>
+  </g>
+
+  <circle cx="256" cy="256" r="87" fill="#0A0F19" stroke="#FFFFFF" stroke-opacity=".15" stroke-width="5"/>
+  <circle cx="256" cy="256" r="67" fill="url(#hub)"/>
+  <path d="M208 219h96v24h-35v67h-26v-67h-35z" fill="#111827"/>
+  <circle cx="256" cy="256" r="105" fill="none" stroke="#FFFFFF" stroke-opacity=".09" stroke-width="3" stroke-dasharray="7 12"/>
+</svg>
