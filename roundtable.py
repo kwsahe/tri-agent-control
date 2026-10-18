@@ -2564,6 +2564,22 @@ def extract_approval_token(text: str) -> tuple[str, bool]:
     return text, False
 
 
+_REVIEW_VERDICT_RE = re.compile(r"^\s*REVIEW\s*:\s*(PASS|CHANGES)\s*$", re.IGNORECASE)
+
+
+def extract_review_verdict(text: str) -> tuple[str, str]:
+    """검토 답변 마지막 줄의 'REVIEW: PASS|CHANGES'를 떼어 낸다. 없으면 판정은 ''.
+
+    본문 중간에 인용된 토큰은 판정으로 보지 않는다 — 마지막 줄만 본다.
+    """
+    lines = (text or "").rstrip().splitlines()
+    if lines:
+        match = _REVIEW_VERDICT_RE.match(lines[-1])
+        if match:
+            return "\n".join(lines[:-1]).rstrip(), match.group(1).lower()
+    return text, ""
+
+
 def extract_agent_calls(text: str, source_agent: str, current_cli_mode: str) -> tuple[str, list[dict]]:
     calls = []
     kept_lines = []
@@ -3950,6 +3966,10 @@ def run_step(
     if not allow_agent_calls(state_snapshot.get("mode", "discussion"), phase):
         agent_calls = []
     visible_text, approval_requested = extract_approval_token(call_clean_text)
+    # 긴 답변은 아래에서 잘리므로 판정은 자르기 전에 읽는다.
+    review_verdict = ""
+    if phase.split(" · ", 1)[0] == REVIEW_PHASE:
+        visible_text, review_verdict = extract_review_verdict(visible_text)
     if pending_question:
         agent_calls = []
         approval_requested = False
@@ -4008,6 +4028,7 @@ def run_step(
         "raw_output_chars": len(raw_text),
         "output_truncated": output_truncated,
         "approval_requested": approval_requested,
+        "review_verdict": review_verdict,
         "ok": not failed,
         "run_status": outcome.status,
         "run_status_label": outcome.label,
@@ -4253,8 +4274,11 @@ def worker_loop(session_id: str) -> None:
 
             if coding_iteration and cycle_completed:
                 add_runtime_event(f"목표 기반 코딩 사이클 {cycle_number} 완료")
+            # 검토 전에 한 번 검증한다. 검토 단계가 없으면(Codex 꺼짐) 사이클 끝에 검증한다.
+            has_review_step = any(step[1] == REVIEW_PHASE for step in steps)
             should_validate = cli_mode == "coding" and (
-                (coding_iteration and not cycle_completed and steps[next_index][1] == "교차 검토")
+                (coding_iteration and not cycle_completed and steps[next_index][1] == REVIEW_PHASE)
+                or (coding_iteration and cycle_completed and not has_review_step)
                 or (not coding_iteration and (
                     next_index >= len(steps) or steps[next_index][1] == "최종 보고"
                 ))

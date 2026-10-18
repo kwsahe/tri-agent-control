@@ -584,9 +584,9 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         with patch.object(roundtable, "run_step", side_effect=fake_run_step):
             roundtable.worker_loop(roundtable.STATE["id"])
 
-        self.assertIn("개발 진행 · 목표 사이클 1", phases[0])
-        self.assertIn("토론 결과 통합 · 목표 사이클 1", phases[len(cycle) - 1])
-        self.assertIn("개발 진행 · 목표 사이클 2", phases[len(cycle)])
+        self.assertIn("구현 · 목표 사이클 1", phases[0])
+        self.assertIn(f"{roundtable.REVIEW_PHASE} · 목표 사이클 1", phases[len(cycle) - 1])
+        self.assertIn("구현 · 목표 사이클 2", phases[len(cycle)])
         self.assertEqual(roundtable.STATE["coding_cycle"], 2)
         self.assertEqual(roundtable.STATE["coding_cycle_step"], 1)
         self.assertFalse(roundtable.STATE["finished"])

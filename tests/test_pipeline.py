@@ -56,5 +56,55 @@ class PipelineStepsTests(unittest.TestCase):
         self.assertTrue(roundtable.allow_agent_calls("discussion", "개입 답변"))
 
 
+class ReviewVerdictTests(unittest.TestCase):
+    def test_last_line_verdict_is_extracted_and_hidden(self):
+        self.assertEqual(roundtable.extract_review_verdict("문제 없음\nREVIEW: PASS"), ("문제 없음", "pass"))
+        self.assertEqual(roundtable.extract_review_verdict("고칠 것\n review: changes \n"), ("고칠 것", "changes"))
+
+    def test_missing_or_quoted_verdict_is_not_a_pass(self):
+        for text in ("검토했습니다.", "REVIEW: PASS 라고 쓰면 통과입니다.\n추가 의견", "REVIEW: MAYBE", ""):
+            with self.subTest(text=text):
+                self.assertEqual(roundtable.extract_review_verdict(text)[1], "")
+
+
+@patch.object(roundtable, "render_html_snapshot")
+@patch.object(roundtable, "add_runtime_event")
+@patch.object(roundtable, "build_memory_context", return_value="")
+@patch.object(roundtable, "load_team_prompt", return_value="공통 지침")
+@patch.object(roundtable, "save_state")
+class ReviewTurnTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        self.original_control = dict(roundtable.CONTROL)
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="검토 테스트", mode="coding", plan_approved=True,
+                                coding_stage="iteration", agent_roles=roundtable.pipeline_agent_roles())
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+        roundtable.CONTROL.clear()
+        roundtable.CONTROL.update(self.original_control)
+        self._tmp.cleanup()
+
+    def run_review(self, reply: str) -> dict:
+        with patch.dict(roundtable.ASK_FUNCS, {"codex": lambda _p, _m: reply}), \
+             patch.object(roundtable, "read_configured_project_path", return_value=self._tmp.name), \
+             patch.object(roundtable, "add_message", return_value=True) as add_message:
+            roundtable.run_step("codex", f"{roundtable.REVIEW_PHASE} · 목표 사이클 1", "검토해라",
+                                "discussion", expected_session_id=SESSION_ID)
+        _agent, _phase, text, meta = add_message.call_args.args[:4]
+        return {"text": text, "meta": meta}
+
+    def test_review_turn_records_the_verdict_and_hides_the_token(self, *_):
+        result = self.run_review("치명적 결함 없음\nREVIEW: PASS")
+        self.assertEqual(result["meta"]["review_verdict"], "pass")
+        self.assertNotIn("REVIEW:", result["text"])
+
+    def test_verdict_survives_a_clipped_long_review(self, *_):
+        result = self.run_review("가" * (roundtable.OUTPUT_MAX_CHARS * 2) + "\nREVIEW: CHANGES")
+        self.assertEqual(result["meta"]["review_verdict"], "changes")
+
+
 if __name__ == "__main__":
     unittest.main()
