@@ -62,6 +62,7 @@ from urllib.parse import parse_qs, urlparse
 
 from triagent.domain import clicheck, gitops, runstatus, usage as usage_domain, validation, workflow
 from triagent.domain.workspace import (
+    WorkspaceResolution,
     WorkspaceStatus,
     parse_project_path_file,
     resolve_workspace,
@@ -96,6 +97,8 @@ PROFILE_PATHS = {
     "claude": ROOT / "CLAUDE_Profile.md",
 }
 NO_PROJECT_DIR = Path(tempfile.gettempdir()) / "triagent-control-chat-only"
+#: 코딩 파이프라인 세션의 worktree 위치 — 사용자 프로젝트 밖이라 그 폴더의 git status를 어지럽히지 않는다.
+WORKTREE_ROOT = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "TriAgentControl" / "worktrees"
 
 ACTIVE_PROCESS_LOCK = threading.Lock()
 ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
@@ -858,6 +861,25 @@ def turn_project_access(cli_mode: str, state: dict | None = None) -> str:
     return normalize_discussion_project_access(current.get("discussion_project_access"))
 
 
+def pipeline_workspace() -> Path | None:
+    """코딩 파이프라인 세션이 실제로 일하는 worktree 폴더. 아직 없으면(계획 단계·Git 없음) None.
+
+    worktree를 만든 세션인데 그 폴더가 사라졌으면 사용자 폴더로 조용히 바꾸지 않고 막는다 —
+    바꾸면 에이전트가 사용자 브랜치에 바로 쓰게 된다.
+    """
+    current = globals().get("STATE", {})
+    git_state = current.get("pipeline_git") or {}
+    if current.get("mode") != "coding" or not git_state.get("enabled") or not git_state.get("workspace"):
+        return None
+    workspace = Path(git_state["workspace"])
+    if not workspace.is_dir():
+        raise WorkspaceUnavailable(WorkspaceResolution(
+            ok=False, status=WorkspaceStatus.NOT_FOUND, path=None, configured=str(workspace),
+            message=f"이 세션의 worktree를 찾을 수 없습니다. ({workspace})",
+        ))
+    return workspace
+
+
 def cli_working_directory(cli_mode: str) -> Path:
     access = turn_project_access(cli_mode)
     if access != "none":
@@ -865,7 +887,7 @@ def cli_working_directory(cli_mode: str) -> Path:
         resolution = resolve_project_workspace(require_write=access == "write")
         if resolution.blocked or resolution.path is None:
             raise WorkspaceUnavailable(resolution)
-        return resolution.path
+        return pipeline_workspace() or resolution.path
     NO_PROJECT_DIR.mkdir(parents=True, exist_ok=True)
     return NO_PROJECT_DIR
 
@@ -1270,11 +1292,17 @@ def run_validation_for_current_workspace() -> list[dict]:
     if resolution.blocked or resolution.path is None:
         add_runtime_event(f"자동 검증 건너뜀 — {resolution.message}", "warn")
         return []
+    try:
+        # 파이프라인은 세션 worktree에서 일하므로 검증도 거기서 한다 (사용자 폴더에는 변경이 없다).
+        root = pipeline_workspace() or resolution.path
+    except WorkspaceUnavailable as exc:
+        add_runtime_event(f"자동 검증 건너뜀 — {exc.resolution.message}", "warn")
+        return []
     environment = current_tool_environment()
-    commands = detect_validation_commands(resolution.path, environment)
+    commands = detect_validation_commands(root, environment)
     if not commands:
         try:
-            same_as_self = resolution.path.resolve() == ROOT.resolve()
+            same_as_self = root.resolve() == ROOT.resolve()
         except OSError:
             same_as_self = False
         if same_as_self:
@@ -1283,7 +1311,7 @@ def run_validation_for_current_workspace() -> list[dict]:
                 "warn",
             )
         return []
-    return run_project_validation(resolution.path, environment)
+    return run_project_validation(root, environment)
 
 
 def parse_cli_stream_event(tool_name: str, line: str) -> tuple[dict | None, str | None]:
@@ -4219,29 +4247,53 @@ def run_step(
     return added and not failed
 
 
-def prepare_pipeline_git(session_id: str) -> None:
-    """사이클 1 진입 시 작업 브랜치를 준비한다. 안 되면 이유만 남기고 커밋 없이 진행한다."""
+def prepare_pipeline_git(session_id: str, start: str = "HEAD") -> None:
+    """사이클 1 진입 시 세션 전용 worktree를 만든다. 사용자 폴더의 브랜치와 파일은 건드리지 않는다.
+
+    ``start``는 새 브랜치의 출발점이다 (분기 세션은 원본 세션의 브랜치).
+    Git 저장소가 아니거나 worktree를 못 만들면 이유만 남기고 사용자 폴더에서 커밋 없이 진행한다.
+    """
     resolution = resolve_project_workspace(require_write=True)
     if resolution.blocked or resolution.path is None:
         return
-    result = gitops.prepare_work_branch(resolution.path, f"triagent/{session_id}")
+    project = resolution.path
+    branch = f"triagent/{session_id}"
+    repo = gitops.repo_root(project)
+    git_state = {"enabled": False, "branch": "", "workspace": "", "worktree": "", "repo": "", "note": "", "commits": []}
+    linked: list[str] = []
+    dirty = False
+    if repo is None:
+        git_state["note"] = "Git 저장소가 아니라 자동 커밋 없이 사용자 폴더에서 작업합니다."
+    else:
+        worktree = WORKTREE_ROOT / f"{project.name}-{session_id}"
+        result = gitops.create_worktree(repo, worktree, branch, start)
+        if result.ok:
+            try:
+                relative = Path(os.path.relpath(project.resolve(), repo.resolve()))
+            except ValueError:
+                relative = Path(".")
+            workspace = (worktree / relative).resolve()
+            linked = gitops.link_shared_dirs(project, workspace)
+            dirty = start == "HEAD" and not gitops.is_clean(project)
+            git_state.update(enabled=True, branch=branch, workspace=str(workspace),
+                             worktree=str(worktree), repo=str(repo))
+        else:
+            git_state["note"] = result.detail
     with STATE_LOCK:
         if STATE.get("id") != session_id:
             return
-        STATE["pipeline_git"] = {
-            "enabled": result.ok,
-            "branch": result.detail if result.ok else "",
-            "workspace": str(resolution.path),
-            "note": "" if result.ok else result.detail,
-            "commits": [],
-            # 여기 이후 메시지의 변경 파일만 다음 사이클 커밋에 담는다.
-            "committed_upto": len(STATE.get("messages", [])),
-        }
+        # 여기 이후 메시지의 변경 파일만 다음 사이클 커밋에 담는다.
+        git_state["committed_upto"] = len(STATE.get("messages", []))
+        STATE["pipeline_git"] = git_state
         save_state(STATE)
-    if result.ok:
-        add_runtime_event(f"사이클 커밋 브랜치: {result.detail}")
-    else:
-        add_runtime_event(f"자동 커밋 안 함 — {result.detail}", "warn")
+    if not git_state["enabled"]:
+        add_runtime_event(f"자동 커밋 안 함 — {git_state['note']}", "warn")
+        return
+    add_runtime_event(f"세션 작업 폴더(worktree): {git_state['workspace']} · 브랜치 {branch} — 사용자 폴더는 그대로입니다.")
+    if linked:
+        add_runtime_event(f"사용자 폴더의 {', '.join(linked)}를 worktree에 연결했습니다 (복사하지 않음).")
+    if dirty:
+        add_runtime_event("사용자 폴더의 커밋되지 않은 변경은 worktree에 들어가지 않습니다 (마지막 커밋 기준).", "warn")
 
 
 def commit_cycle(session_id: str, cycle_number: int, verdict: str, validation: str) -> None:
@@ -4254,17 +4306,14 @@ def commit_cycle(session_id: str, cycle_number: int, verdict: str, validation: s
         messages = list(STATE.get("messages", []))
     if not git_state.get("enabled"):
         return
-    resolution = resolve_project_workspace(require_write=True)
-    if resolution.blocked or resolution.path is None:
-        return
-    # 준비한 그 폴더의 그 작업 브랜치일 때만 커밋한다. 사용자가 main으로 돌아갔거나 작업 폴더를
-    # 바꿨거나 다른 세션의 브랜치에 있으면, 그 브랜치에 사용자 작업과 섞어 커밋하게 된다.
+    # 커밋은 세션 worktree에서만 한다. 그 폴더가 사라졌거나 다른 브랜치로 바뀌었으면 하지 않는다.
+    workspace = Path(git_state.get("workspace", ""))
     branch = git_state.get("branch", "")
-    on_branch = gitops.current_branch(resolution.path)
-    if str(resolution.path) != git_state.get("workspace") or on_branch != branch:
+    on_branch = gitops.current_branch(workspace) if workspace.is_dir() else ""
+    if not workspace.is_dir() or on_branch != branch:
         add_runtime_event(
-            f"사이클 {cycle_number} 커밋 안 함 — 작업 브랜치 {branch}가 아닙니다 "
-            f"(현재: {on_branch or '알 수 없음'}, 폴더: {resolution.path}).",
+            f"사이클 {cycle_number} 커밋 안 함 — 세션 worktree가 {branch} 브랜치가 아닙니다 "
+            f"(현재: {on_branch or '알 수 없음'}, 폴더: {workspace}).",
             "warn",
         )
         return
@@ -4281,7 +4330,7 @@ def commit_cycle(session_id: str, cycle_number: int, verdict: str, validation: s
         f"Review: {verdict or 'none'} · Validation: {validation}\n"
         f"Session: {session_id}"
     )
-    result = gitops.commit_paths(resolution.path, message_text, paths)
+    result = gitops.commit_paths(workspace, message_text, paths)
     if not result.ok:
         add_runtime_event(f"사이클 {cycle_number} 커밋 실패 — {result.detail}", "warn")
         return
@@ -4408,7 +4457,7 @@ def worker_loop(session_id: str) -> None:
                 with STATE_LOCK:
                     approval_missing = plan_approval_missing(STATE)
                 if approval_missing:
-                    # 거절 뒤 메시지 등으로 계획 다음에 왔지만 승인이 없다. 브랜치 전환·시간 측정
+                    # 거절 뒤 메시지 등으로 계획 다음에 왔지만 승인이 없다. worktree 생성·시간 측정
                     # 전에 승인을 다시 받는다 — 루프 맨 위에서 대기한다.
                     mark_approval_requested(PIPELINE_IMPLEMENTER, CONFIRM_PHASE)
                     continue
@@ -4709,8 +4758,8 @@ MODE_PLANS = {
         "auto_validation": True,
         "default_access": "write",
         "allow_write": True,
-        "note": "검토가 PASS이고 자동 검증이 통과하면 끝납니다. Git 저장소이고 커밋되지 않은 변경이 없으면 "
-                "사이클 커밋을 triagent/<세션ID> 브랜치에 남깁니다.",
+        "note": "검토가 PASS이고 자동 검증이 통과하면 끝납니다. Git 저장소면 세션 전용 작업 폴더(worktree)에서 "
+                "일하고 사이클 커밋을 triagent/<세션ID> 브랜치에 남깁니다. 사용자 폴더는 바뀌지 않습니다.",
     },
 }
 
@@ -4847,6 +4896,7 @@ def topic_section_html(
     active_id: str,
     agent_settings: dict | None = None,
     discussion_project_access: str = "read",
+    pipeline_git: dict | None = None,
 ) -> str:
     access_label = "읽기·쓰기" if workspace_access_mode() == "write" else "읽기 전용"
     workspace_resolution = resolve_project_workspace()
@@ -4865,6 +4915,12 @@ def topic_section_html(
             '유효한 폴더를 다시 선택하기 전까지 모델 실행이 차단됩니다.</p>'
         )
 
+    git_state = pipeline_git or {}
+    worktree_line = (
+        f'<p>세션 작업 폴더(worktree): {html.escape(git_state.get("workspace", ""))} '
+        f'· 브랜치 {html.escape(git_state.get("branch", ""))} — 사용자 폴더는 바뀌지 않습니다</p>'
+        if git_state.get("enabled") and git_state.get("worktree") else ""
+    )
     if topic:
         mode_label = MODE_LABELS.get(mode, mode)
         access_mode = normalize_discussion_project_access(discussion_project_access)
@@ -4883,7 +4939,8 @@ def topic_section_html(
             f'<p>모델: {html.escape(settings_label)}</p>'
             f'<p>프로젝트 접근: {"읽기·쓰기 (코딩 실행)" if mode == "coding" else html.escape(discussion_access_label)}</p>'
             f'<p>저장 폴더: {html.escape(str(session_memory_dir(active_id)))}</p>'
-            f'{project_path_line if mode == "coding" else ""}</div>'
+            f'{project_path_line if mode == "coding" else ""}'
+            f'{worktree_line if mode == "coding" else ""}</div>'
         )
 
     return f"""
@@ -4947,6 +5004,7 @@ def render_dashboard() -> str:
             STATE.get("discussion_project_access")
         )
         active_id = STATE.get("id", "")
+        pipeline_git = dict(STATE.get("pipeline_git") or {})
     # 최초 페인트에는 최근 메시지만 넣는다. 1,500개짜리 세션에서 전체를 HTML로
     # 굽던 게 첫 화면이 1MB를 넘던 원인이다. 나머지는 "이전 메시지 불러오기"로.
     total_messages = len(messages)
@@ -4967,7 +5025,7 @@ def render_dashboard() -> str:
     stopped = CONTROL["stopped"]
     topic_section = topic_section_html(
         topic, mode, enabled_agents, active_id, agent_settings,
-        discussion_project_access,
+        discussion_project_access, pipeline_git,
     )
 
     no_topic = "disabled" if not topic else ""
@@ -5153,7 +5211,8 @@ def state_json_payload(include_feed: bool = False) -> dict:
     )
     payload = {
         "topic_section_html": topic_section_html(
-            topic, mode, enabled_agents, active_id, agent_settings, discussion_project_access
+            topic, mode, enabled_agents, active_id, agent_settings, discussion_project_access,
+            state_snapshot.get("pipeline_git"),
         ),
         "status": status_text(),
         "finished": finished,
@@ -5377,7 +5436,7 @@ def session_detail_payload(session_id: str) -> dict | None:
         "feed_html": bubbles,
         "topic_section_html": topic_section_html(
             data.get("topic", ""), mode, enabled_agents, session_id, agent_settings,
-            discussion_project_access,
+            discussion_project_access, data.get("pipeline_git"),
         ),
         "topic": html.escape(data.get("topic", "")),
         "session_name": data.get("name") or data.get("topic") or "새 세션",
@@ -5496,6 +5555,14 @@ def delete_session(session_id: str) -> dict:
     with STATE_LOCK:
         if STATE.get("id") == session_id:
             return {"error": "현재 세션은 삭제할 수 없습니다. 새 세션을 만든 뒤 삭제해주세요."}
+    # 세션 worktree를 먼저 정리한다 (브랜치와 커밋은 남는다). 커밋 안 된 변경이 있으면 폴더를 남기고 알린다.
+    git_state = (load_session(session_id) or {}).get("pipeline_git") or {}
+    warning = ""
+    if git_state.get("worktree") and git_state.get("repo"):
+        result = gitops.remove_worktree(Path(git_state["repo"]), Path(git_state["worktree"]),
+                                        Path(git_state.get("workspace") or git_state["worktree"]))
+        if not result.ok:
+            warning = f"작업 폴더(worktree)는 남겨 두었습니다: {git_state['worktree']} — {result.detail}"
     removed = False
     # 삭제는 되돌릴 수 없으므로, 각 경로가 정말 허용 폴더 안인지 다시 확인한다.
     for path in (session_json_path(session_id), session_transcript_path(session_id)):
@@ -5506,7 +5573,9 @@ def delete_session(session_id: str) -> dict:
     if memory_path.is_dir():
         shutil.rmtree(memory_path)
         removed = True
-    return {"success": removed, "id": session_id} if removed else {"error": "세션을 찾을 수 없습니다."}
+    if not removed:
+        return {"error": "세션을 찾을 수 없습니다."}
+    return {"success": True, "id": session_id, **({"warning": warning} if warning else {})}
 
 
 def clone_session(session_id: str) -> dict:
@@ -5529,10 +5598,16 @@ def clone_session(session_id: str) -> dict:
     clone["active_prompt_chars"] = 0
     clone["active_work_log"] = []
     clone["active_usage"] = {}
+    # 원본 worktree를 함께 쓰면 두 세션이 같은 파일을 고친다. 분기 세션은 원본 브랜치에서 새 worktree를 만든다.
+    source_git = clone.get("pipeline_git") or {}
+    clone["pipeline_git"] = {}
     with STATE_LOCK:
         STATE.clear()
         STATE.update(clone)
         save_state(STATE)
+    if source_git.get("enabled") and source_git.get("branch"):
+        prepare_pipeline_git(clone["id"], start=source_git["branch"])
+        add_runtime_event("분기 세션은 원본 브랜치의 마지막 커밋에서 시작합니다 (커밋 안 된 변경은 넘어오지 않음).")
     source_memory = session_memory_dir(old_id)
     target_memory = session_memory_dir(clone["id"])
     if source_memory.exists():
@@ -5755,7 +5830,11 @@ def rollback_checkpoint_files(checkpoint: str, paths: list[str]) -> dict:
     workspace_resolution = resolve_project_workspace(require_write=True)
     if workspace_resolution.blocked or workspace_resolution.path is None:
         return {"error": workspace_block_message(workspace_resolution)}
-    workspace_root = workspace_resolution.path
+    try:
+        # 파이프라인 턴의 체크포인트는 세션 worktree 기준이다 — 되돌리기도 거기서 한다.
+        workspace_root = pipeline_workspace() or workspace_resolution.path
+    except WorkspaceUnavailable as exc:
+        return {"error": exc.resolution.message}
 
     clean_paths = []
     for path in paths:

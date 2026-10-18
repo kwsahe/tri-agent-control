@@ -117,7 +117,10 @@ def git(root: Path, *args: str) -> str:
 class GitOpsTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name).resolve()
+        base = Path(self._tmp.name).resolve()
+        self.root = base / "repo"
+        self.root.mkdir()
+        self.wt = base / "worktrees" / "repo-s1"
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -132,31 +135,51 @@ class GitOpsTests(unittest.TestCase):
         git(self.root, "commit", "-q", "-m", "init")
 
     def test_not_a_repo_is_refused_without_side_effects(self):
-        result = gitops.prepare_work_branch(self.root, "triagent/s1")
-        self.assertFalse(result.ok)
-        self.assertIn("Git 저장소가 아니", result.detail)
+        self.assertIsNone(gitops.repo_root(self.root))
+        self.assertFalse(gitops.create_worktree(self.root, self.wt, "triagent/s1").ok)
         self.assertFalse((self.root / ".git").exists())
 
-    def test_clean_repo_switches_to_the_work_branch(self):
-        self.init_repo()
-        result = gitops.prepare_work_branch(self.root, "triagent/s1")
-        self.assertEqual(result, gitops.GitResult(True, "triagent/s1"))
-        self.assertEqual(gitops.current_branch(self.root), "triagent/s1")
-        # 다시 불러도 그대로 성공한다 (재개 시).
-        self.assertTrue(gitops.prepare_work_branch(self.root, "triagent/s1").ok)
-
-    def test_dirty_repo_keeps_the_users_changes_and_branch(self):
+    def test_worktree_leaves_the_users_branch_and_uncommitted_work_alone(self):
         self.init_repo()
         (self.root / "app.py").write_text("x = 2  # 사용자 작업 중\n", encoding="utf-8")
-        result = gitops.prepare_work_branch(self.root, "triagent/s1")
-        self.assertFalse(result.ok)
-        self.assertIn("커밋되지 않은 변경", result.detail)
+        result = gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        self.assertEqual(result, gitops.GitResult(True, "triagent/s1"))
         self.assertEqual(gitops.current_branch(self.root), "main")
         self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "x = 2  # 사용자 작업 중\n")
+        self.assertEqual(gitops.current_branch(self.wt), "triagent/s1")
+        self.assertEqual((self.wt / "app.py").read_text(encoding="utf-8"), "x = 1\n")  # 마지막 커밋 기준
+        # 다시 불러도 그대로 성공한다 (재개 시).
+        self.assertTrue(gitops.create_worktree(self.root, self.wt, "triagent/s1").ok)
+
+    def test_existing_folder_that_is_not_the_session_worktree_is_refused(self):
+        self.init_repo()
+        self.wt.mkdir(parents=True)
+        result = gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        self.assertFalse(result.ok)
+        self.assertIn("이미 있지만", result.detail)
+
+    def test_removing_the_worktree_unlinks_shared_dirs_and_keeps_the_originals_and_branch(self):
+        self.init_repo()
+        (self.root / ".venv").mkdir()
+        (self.root / ".venv" / "marker.txt").write_text("원본\n", encoding="utf-8")
+        gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        self.assertEqual(gitops.link_shared_dirs(self.root, self.wt), [".venv"])
+        self.assertEqual((self.wt / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
+        self.assertEqual(gitops.remove_worktree(self.root, self.wt), gitops.GitResult(True, ""))
+        self.assertFalse(self.wt.exists())
+        self.assertEqual((self.root / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
+        self.assertEqual(git(self.root, "branch", "--list", "triagent/s1"), "triagent/s1")
+
+    def test_worktree_with_uncommitted_changes_is_not_removed(self):
+        self.init_repo()
+        gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        (self.wt / "unsaved.py").write_text("u = 1\n", encoding="utf-8")
+        self.assertFalse(gitops.remove_worktree(self.root, self.wt).ok)
+        self.assertTrue((self.wt / "unsaved.py").exists())
 
     def test_commit_paths_returns_sha_and_skips_when_nothing_changed(self):
         self.init_repo()
-        gitops.prepare_work_branch(self.root, "triagent/s1")
+        git(self.root, "checkout", "-q", "-b", "triagent/s1")
         (self.root / "new.py").write_text("y = 1\n", encoding="utf-8")
         result = gitops.commit_paths(self.root, "TriAgent cycle 1: test", ["new.py"])
         self.assertTrue(result.ok)
@@ -172,7 +195,7 @@ class GitOpsTests(unittest.TestCase):
         (self.root / "notes.py").write_text("n = 0\n", encoding="utf-8")
         git(self.root, "add", "-A")
         git(self.root, "commit", "-q", "-m", "notes")
-        gitops.prepare_work_branch(self.root, "triagent/s1")
+        git(self.root, "checkout", "-q", "-b", "triagent/s1")
         (self.root / "agent.py").write_text("a = 1\n", encoding="utf-8")       # 에이전트 변경
         (self.root / "app.py").write_text("x = 99  # 사용자 작업\n", encoding="utf-8")  # 사용자 변경
         (self.root / "notes.py").write_text("n = 1\n", encoding="utf-8")
@@ -201,9 +224,9 @@ class GitOpsTests(unittest.TestCase):
         self.assertIn("?? outside.txt", git(self.root, "status", "--porcelain"))
 
     def test_git_errors_while_preparing_are_reported_not_raised(self):
-        with patch.object(gitops, "is_repo", return_value=True), \
-             patch.object(gitops, "current_branch", side_effect=subprocess.TimeoutExpired("git", 60)):
-            result = gitops.prepare_work_branch(self.root, "triagent/s1")
+        with patch.object(gitops, "_git", side_effect=subprocess.TimeoutExpired("git", 60)):
+            result = gitops.create_worktree(self.root, self.wt, "triagent/s1")
+            self.assertIsNone(gitops.repo_root(self.root))
         self.assertFalse(result.ok)
         self.assertIn("git 실행 실패", result.detail)
 
@@ -324,6 +347,7 @@ class CycleCommitTests(unittest.TestCase):
 
     def test_commit_message_and_recorded_sha(self):
         commit, _event = self.call(self.git_state())
+        self.assertEqual(commit.call_args.args[0], Path(self._tmp.name).resolve())  # 세션 worktree에서 커밋
         message = commit.call_args.args[1]
         self.assertTrue(message.startswith("TriAgent cycle 2: 장바구니 기능 추가"))
         self.assertIn("Review: changes · Validation: pass", message)
@@ -343,7 +367,7 @@ class CycleCommitTests(unittest.TestCase):
         self.assertEqual(roundtable.STATE["pipeline_git"]["committed_upto"], 3)
 
     def test_wrong_branch_or_folder_never_commits(self):
-        """사용자가 main으로 돌아갔거나 작업 폴더를 바꿨으면 그 브랜치에 섞어 커밋하지 않는다."""
+        """worktree가 다른 브랜치로 바뀌었거나 사라졌으면 커밋하지 않는다."""
         for git_state, on_branch in (
             (self.git_state(), "main"),
             (self.git_state(workspace="C:\\other\\project"), "triagent/x"),
@@ -363,6 +387,114 @@ class CycleCommitTests(unittest.TestCase):
         )
         self.assertIn("Please tell me who you are", event.call_args.args[0])
         self.assertEqual(roundtable.STATE["pipeline_git"]["commits"], [])
+
+
+@unittest.skipUnless(shutil.which("git"), "git이 없으면 worktree를 검증할 수 없다")
+class PipelineWorktreeTests(unittest.TestCase):
+    """실제 git으로: 파이프라인은 세션 worktree에서만 일하고 사용자 폴더는 그대로 둔다."""
+
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        self.original_control = dict(roundtable.CONTROL)
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name).resolve()
+        self.repo = base / "proj"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.email", "test@example.com")
+        git(self.repo, "config", "user.name", "Test")
+        git(self.repo, "config", "core.autocrlf", "false")
+        (self.repo / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+        (self.repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "init")
+        self.main_sha = git(self.repo, "rev-parse", "main")
+        (self.repo / ".venv").mkdir()
+        (self.repo / ".venv" / "marker.txt").write_text("원본\n", encoding="utf-8")
+        (self.repo / "app.py").write_text("x = 2  # 사용자 작업 중\n", encoding="utf-8")
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="기능 추가", mode="coding", messages=[])
+        self.patches = [
+            patch.object(roundtable, "WORKTREE_ROOT", base / "worktrees"),
+            patch.object(roundtable, "read_configured_project_path", return_value=str(self.repo)),
+            patch.object(roundtable, "save_state"),
+        ]
+        for item in self.patches:
+            item.start()
+        self.events = patch.object(roundtable, "add_runtime_event").start()
+
+    def tearDown(self):
+        patch.stopall()
+        roundtable.STATE = self.original_state
+        roundtable.CONTROL.clear()
+        roundtable.CONTROL.update(self.original_control)
+        for worktree in (Path(self._tmp.name) / "worktrees").glob("*"):
+            gitops.remove_worktree(self.repo, worktree)   # 연결부터 끊어야 원본을 지우지 않는다
+        self._tmp.cleanup()
+
+    def prepare(self) -> Path:
+        roundtable.prepare_pipeline_git(SESSION_ID)
+        return Path(roundtable.STATE["pipeline_git"]["workspace"])
+
+    def test_cycle_runs_and_commits_in_the_worktree_without_touching_the_user_folder(self):
+        workspace = self.prepare()
+        self.assertEqual(workspace, Path(self._tmp.name).resolve() / "worktrees" / f"proj-{SESSION_ID}")
+        self.assertEqual(roundtable.cli_working_directory("coding"), workspace)
+        self.assertEqual(roundtable.cli_working_directory("discussion"), workspace)  # 검토도 worktree를 읽는다
+        self.assertTrue(any("커밋되지 않은 변경" in call.args[0] for call in self.events.call_args_list))
+        self.assertEqual((workspace / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
+
+        (workspace / "feature.py").write_text("f = 1\n", encoding="utf-8")
+        roundtable.STATE["messages"] = [{"agent": "claude", "meta": {"changed_paths": [{"path": "feature.py"}]}}]
+        roundtable.commit_cycle(SESSION_ID, 1, "pass", "pass")
+
+        self.assertEqual(len(roundtable.STATE["pipeline_git"]["commits"]), 1)
+        branch = f"triagent/{SESSION_ID}"
+        self.assertEqual(git(self.repo, "show", "--name-only", "--format=", branch), "feature.py")
+        self.assertEqual(git(self.repo, "rev-parse", "main"), self.main_sha)
+        self.assertEqual(gitops.current_branch(self.repo), "main")
+        self.assertEqual((self.repo / "app.py").read_text(encoding="utf-8"), "x = 2  # 사용자 작업 중\n")
+        self.assertFalse((self.repo / "feature.py").exists())
+
+    def test_planning_reads_the_user_folder_before_the_worktree_exists(self):
+        self.assertEqual(roundtable.cli_working_directory("discussion"), self.repo)
+
+    def test_a_missing_worktree_blocks_instead_of_writing_to_the_user_folder(self):
+        workspace = self.prepare()
+        roundtable.STATE["pipeline_git"]["workspace"] = str(workspace.parent / "gone")
+        with self.assertRaises(roundtable.WorkspaceUnavailable):
+            roundtable.cli_working_directory("coding")
+
+    def test_not_a_repo_works_in_the_user_folder_without_commits(self):
+        shutil.rmtree(self.repo / ".git", onerror=lambda func, path, _exc: (Path(path).chmod(0o700), func(path)))
+        roundtable.prepare_pipeline_git(SESSION_ID)
+        self.assertFalse(roundtable.STATE["pipeline_git"]["enabled"])
+        self.assertEqual(roundtable.cli_working_directory("coding"), self.repo)
+
+    def test_deleting_the_session_removes_its_worktree_but_keeps_the_branch_and_venv(self):
+        workspace = self.prepare()
+        roundtable.atomic_write_json(roundtable.session_json_path(SESSION_ID), roundtable.STATE)
+        roundtable.STATE = roundtable.new_state()   # 현재 세션은 지울 수 없다
+        result = roundtable.delete_session(SESSION_ID)
+        self.assertEqual(result, {"success": True, "id": SESSION_ID})
+        self.assertFalse(workspace.exists())
+        self.assertEqual((self.repo / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
+        self.assertEqual(git(self.repo, "branch", "--list", f"triagent/{SESSION_ID}"), f"triagent/{SESSION_ID}")
+
+    def test_a_cloned_session_gets_its_own_worktree_from_the_source_branch(self):
+        source_workspace = self.prepare()
+        (source_workspace / "feature.py").write_text("f = 1\n", encoding="utf-8")
+        git(source_workspace, "add", "feature.py")
+        git(source_workspace, "commit", "-q", "-m", "cycle 1")
+        source = json.loads(json.dumps(roundtable.STATE))
+        with patch.object(roundtable, "load_session", return_value=source), \
+             patch.object(roundtable, "cancel_active_cli_processes"), \
+             patch.object(roundtable, "session_memory_dir", side_effect=lambda sid: Path(self._tmp.name) / "mem" / sid):
+            result = roundtable.clone_session(SESSION_ID)
+        clone_git = roundtable.STATE["pipeline_git"]
+        self.assertEqual(clone_git["branch"], f"triagent/{result['id']}")
+        self.assertNotEqual(clone_git["workspace"], str(source_workspace))
+        self.assertTrue((Path(clone_git["workspace"]) / "feature.py").exists())
 
 
 class StartGuardTests(unittest.TestCase):
@@ -522,7 +654,9 @@ class ReviewFollowUpTests(unittest.TestCase):
         self.assertNotIn(real_repo, configured.parents)
         self.assertFalse(gitops.is_repo(roundtable.ROOT))          # 안전망이 막는다
         self.assertEqual(gitops.current_branch(roundtable.ROOT), "")
-        self.assertFalse(gitops.prepare_work_branch(roundtable.ROOT, "triagent/x").ok)
+        self.assertIsNone(gitops.repo_root(roundtable.ROOT))
+        self.assertIn(isolation._ROOT, roundtable.WORKTREE_ROOT.parents)   # 실제 %LOCALAPPDATA%가 아니다
+        self.assertFalse(gitops.create_worktree(roundtable.ROOT, roundtable.WORKTREE_ROOT / "x", "triagent/x").ok)
 
     def test_markdown_wrapped_verdicts_are_read(self):
         self.assertEqual(roundtable.extract_review_verdict("좋음\n**REVIEW: PASS**")[1], "pass")

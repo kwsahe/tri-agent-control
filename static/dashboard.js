@@ -1208,10 +1208,11 @@ async function activateViewedSession() {
 
 async function deleteManagedSession() {
   const id = $("sessionActionId").value;
-  if (!confirm("이 세션과 저장된 메모리를 삭제할까요?")) return;
+  if (!confirm("이 세션과 저장된 메모리, 세션 작업 폴더(worktree)를 삭제할까요? Git 브랜치와 커밋은 남습니다.")) return;
   const response = await fetch("/session/delete", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ id }).toString() });
   const data = await response.json();
   if (data.error) { alert(data.error); return; }
+  if (data.warning) alert(data.warning);
   closeSessionActions();
   // 보던 세션을 지웠으면 읽기 전용 화면을 닫고 현재 세션으로 돌아간다.
   if (id === viewingId) await backToLive();

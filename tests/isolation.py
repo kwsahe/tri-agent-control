@@ -37,6 +37,7 @@ ORIGINAL = {
     "LOG_PATH": roundtable.LOG_PATH,
     "HTML_PATH": roundtable.HTML_PATH,
     "PROJECT_PATH_FILE": roundtable.PROJECT_PATH_FILE,
+    "WORKTREE_ROOT": roundtable.WORKTREE_ROOT,
     "PROFILE_PATHS": dict(roundtable.PROFILE_PATHS),
 }
 
@@ -46,6 +47,7 @@ roundtable.STATE_PATH = _ROOT / "roundtable_state.json"
 roundtable.LOG_PATH = _ROOT / "roundtable_log.md"
 roundtable.HTML_PATH = _ROOT / "roundtable.html"
 roundtable.PROJECT_PATH_FILE = _ROOT / "PROJECT_PATH.txt"
+roundtable.WORKTREE_ROOT = _ROOT / "worktrees"   # 실제 %LOCALAPPDATA%에 세션 worktree를 만들지 않는다
 for _agent in roundtable.PROFILE_PATHS:
     roundtable.PROFILE_PATHS[_agent] = _ROOT / f"{_agent.upper()}_Profile.md"
 

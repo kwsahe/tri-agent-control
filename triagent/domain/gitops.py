@@ -1,22 +1,31 @@
-"""작업 폴더의 Git 커밋 — 파이프라인 사이클마다 체크포인트를 남긴다.
+"""세션 전용 Git worktree와 사이클 커밋.
 
 원칙:
 
-* 사용자의 기존 변경을 섞지 않는다. 브랜치를 만들 때 작업 트리가 깨끗하지 않으면
-  아무것도 바꾸지 않고 이유를 돌려준다.
-* main/master에 직접 커밋하지 않는다 — 호출부가 ``triagent/<세션ID>`` 브랜치를 넘긴다.
-* 실패는 예외가 아니라 ``GitResult(ok=False, detail=사유)``로 돌려준다. 커밋 실패가
+* 사용자 폴더의 브랜치와 파일은 건드리지 않는다. 파이프라인은 사용자 저장소의 HEAD에서
+  ``triagent/<세션ID>`` 브랜치를 만들어 별도 폴더(worktree)에 체크아웃하고 거기서 일한다.
+* Git이 추적하지 않는 가상환경·node_modules는 worktree에 없으므로 사용자 폴더의 것을
+  연결(Windows junction, 그 밖은 symlink)해서 함께 쓴다. 정리할 때는 연결만 끊는다.
+* 실패는 예외가 아니라 ``GitResult(ok=False, detail=사유)``로 돌려준다. git 문제가
   파이프라인 자체를 멈추면 안 된다.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["GitResult", "is_repo", "is_clean", "current_branch", "prepare_work_branch", "commit_paths"]
+__all__ = [
+    "GitResult", "SHARED_DIRS", "is_repo", "is_clean", "current_branch", "repo_root",
+    "create_worktree", "link_shared_dirs", "remove_worktree", "commit_paths",
+]
+
+#: worktree에 연결해 함께 쓰는 사용자 폴더의 무거운 의존성 폴더 (Git이 추적하지 않는다).
+SHARED_DIRS = (".venv", "venv", "node_modules")
 
 
 @dataclass(frozen=True)
@@ -55,23 +64,86 @@ def current_branch(root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def prepare_work_branch(root: Path, branch: str) -> GitResult:
-    """깨끗한 저장소에서 작업 브랜치로 옮긴다. 이미 그 브랜치면 그대로 둔다."""
-    if not is_repo(root):
-        return GitResult(False, "Git 저장소가 아니라 자동 커밋을 하지 않습니다.")
+def repo_root(path: Path) -> Path | None:
+    """``path``가 속한 저장소의 최상위 폴더. 저장소가 아니거나 git을 못 쓰면 None."""
     try:
-        if current_branch(root) == branch:
-            return GitResult(True, branch)
-        if not is_clean(root):
-            return GitResult(False, "커밋되지 않은 변경이 있어 자동 커밋을 하지 않습니다. 먼저 커밋하거나 정리해주세요.")
-        result = _git(root, "switch", "-c", branch)
+        result = _git(path, "rev-parse", "--show-toplevel")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    top = result.stdout.strip()
+    return Path(top) if result.returncode == 0 and top else None
+
+
+def create_worktree(repo: Path, worktree_dir: Path, branch: str, start: str = "HEAD") -> GitResult:
+    """``repo``의 ``start``(기본 HEAD)에서 ``branch``를 만들어 ``worktree_dir``에 체크아웃한다. 사용자 폴더는 그대로다."""
+    try:
+        if worktree_dir.exists():
+            if current_branch(worktree_dir) == branch:
+                return GitResult(True, branch)   # 세션 재개
+            return GitResult(False, f"worktree 폴더가 이미 있지만 {branch} 브랜치가 아닙니다: {worktree_dir}")
+        worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+        result = _git(repo, "worktree", "add", "-b", branch, str(worktree_dir), start)
         if result.returncode != 0:
-            result = _git(root, "switch", branch)   # 이미 있는 브랜치 (세션 재개)
+            result = _git(repo, "worktree", "add", str(worktree_dir), branch)   # 브랜치만 남아 있던 경우
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return GitResult(False, f"git 실행 실패로 자동 커밋을 하지 않습니다: {exc}")
+        return GitResult(False, f"git 실행 실패로 worktree를 만들지 못했습니다: {exc}")
     if result.returncode != 0:
-        return GitResult(False, f"작업 브랜치를 만들지 못했습니다: {result.stderr.strip()[:300]}")
+        return GitResult(False, f"worktree를 만들지 못했습니다: {result.stderr.strip()[:300]}")
     return GitResult(True, branch)
+
+
+def _is_link(path: Path) -> bool:
+    """symlink 또는 Windows junction인가 (os.path.isjunction은 3.12부터라 직접 본다)."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def link_shared_dirs(source: Path, target: Path) -> list[str]:
+    """사용자 폴더의 가상환경·node_modules를 worktree에 연결한다(복사하지 않는다). 연결한 이름 목록."""
+    linked = []
+    for name in SHARED_DIRS:
+        src, dst = Path(source) / name, Path(target) / name
+        if not src.is_dir() or dst.exists() or _is_link(dst):
+            continue
+        try:
+            if os.name == "nt":
+                import _winapi   # CPython이 제공하는 junction 생성 (관리자 권한 불필요)
+                _winapi.CreateJunction(str(src.resolve()), str(dst))
+            else:
+                dst.symlink_to(src.resolve(), target_is_directory=True)
+        except (OSError, ImportError, AttributeError):
+            continue
+        linked.append(name)
+    return linked
+
+
+def remove_worktree(repo: Path, worktree_dir: Path, workspace: Path | None = None) -> GitResult:
+    """연결부터 끊고 worktree를 지운다. 커밋 안 된 변경이 있으면 지우지 않는다 (브랜치는 남긴다)."""
+    base = Path(workspace or worktree_dir)
+    for name in SHARED_DIRS:
+        link = base / name
+        if _is_link(link):
+            try:
+                # 연결만 끊는다 — 재귀 삭제하면 연결된 원본(사용자 .venv 등)까지 지워진다.
+                os.rmdir(link) if os.name == "nt" else link.unlink()
+            except OSError as exc:
+                return GitResult(False, f"연결 폴더를 끊지 못해 worktree를 그대로 둡니다: {link} ({exc})")
+    try:
+        if not Path(worktree_dir).exists():
+            _git(repo, "worktree", "prune")
+            return GitResult(True, "")
+        result = _git(repo, "worktree", "remove", str(worktree_dir))
+        if result.returncode != 0:
+            return GitResult(False, f"worktree를 지우지 않았습니다 (커밋 안 된 변경이 있을 수 있음): {result.stderr.strip()[:300]}")
+        _git(repo, "worktree", "prune")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return GitResult(False, f"git 실행 실패로 worktree를 지우지 못했습니다: {exc}")
+    return GitResult(True, "")
 
 
 def commit_paths(root: Path, message: str, paths: list[str]) -> GitResult:
