@@ -260,6 +260,26 @@ class CsrfTests(HttpServerTestCase):
         self.assertIn(roundtable.CSRF_TOKEN, page)
 
 
+class DashboardRenderingTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        roundtable.STATE = roundtable.new_state()
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+
+    def test_placeholder_text_in_a_topic_is_not_substituted(self):
+        roundtable.STATE["topic"] = "토큰 보여줘 __CSRF_TOKEN__"
+        page = roundtable.render_dashboard()
+        self.assertEqual(page.count(roundtable.CSRF_TOKEN), 1)   # <meta> 한 곳뿐
+        self.assertIn("토큰 보여줘 __CSRF_TOKEN__", page)
+
+    def test_plain_text_fields_are_not_html_escaped_in_json(self):
+        # JS가 textContent로 넣으므로 서버가 이스케이프하면 "&amp;"가 그대로 보인다.
+        roundtable.STATE["name"] = "A & B <설계>"
+        self.assertEqual(roundtable.state_json_payload()["session_name"], "A & B <설계>")
+
+
 class RequestSizeTests(HttpServerTestCase):
     def test_oversized_body_is_rejected_with_413(self):
         payload = ("x" * 2048).encode("utf-8")
