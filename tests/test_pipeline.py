@@ -166,5 +166,94 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(gitops.commit_all(self.root, "again"), gitops.GitResult(True, ""))
 
 
+class CycleFinishTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, mode="coding", coding_stage="iteration",
+                                plan_approved=True, enabled_agents=ALL, messages=[])
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+
+    def review(self, cycle: int, verdict: str) -> None:
+        roundtable.STATE["messages"].append({
+            "agent": "codex", "phase": f"{roundtable.REVIEW_PHASE} · 목표 사이클 {cycle}",
+            "text": "검토", "meta": {"review_verdict": verdict},
+        })
+
+    def finish(self, validation_ok: bool = True) -> bool:
+        roundtable.STATE["validation_results"] = [{"label": "unittest", "ok": validation_ok, "elapsed": 1}]
+        with patch.object(roundtable, "save_state"), patch.object(roundtable, "add_runtime_event"), \
+             patch.object(roundtable, "commit_cycle") as commit:
+            done = roundtable.finish_pipeline_cycle(SESSION_ID, 1)
+        commit.assert_called_once()
+        return done
+
+    def test_pass_and_green_validation_finishes_the_session(self):
+        self.review(1, "pass")
+        self.assertTrue(self.finish())
+        self.assertTrue(roundtable.STATE["finished"])
+        self.assertEqual(roundtable.STATE["coding_stop_reason"], "검토·검증 통과")
+
+    def test_changes_or_missing_verdict_or_red_validation_continues(self):
+        for verdict, validation_ok in (("changes", True), ("", True), ("pass", False)):
+            with self.subTest(verdict=verdict, validation_ok=validation_ok):
+                roundtable.STATE.update(messages=[], finished=False)
+                if verdict:
+                    self.review(1, verdict)
+                self.assertFalse(self.finish(validation_ok))
+                self.assertFalse(roundtable.STATE["finished"])
+
+    def test_an_older_cycles_pass_does_not_count(self):
+        self.review(0, "pass")
+        self.assertFalse(self.finish())
+
+    def test_without_a_reviewer_green_validation_is_enough(self):
+        roundtable.STATE["enabled_agents"] = ["claude", "antigravity"]
+        self.assertTrue(self.finish())
+
+
+class CycleCommitTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="장바구니  기능\n추가", mode="coding")
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+        self._tmp.cleanup()
+
+    def call(self, git_state: dict, commit_result=None):
+        roundtable.STATE["pipeline_git"] = git_state
+        with patch.object(roundtable, "save_state"), \
+             patch.object(roundtable, "add_runtime_event") as event, \
+             patch.object(roundtable, "read_configured_project_path", return_value=self._tmp.name), \
+             patch.object(roundtable.gitops, "commit_all",
+                          return_value=commit_result or roundtable.gitops.GitResult(True, "abc1234")) as commit:
+            roundtable.commit_cycle(SESSION_ID, 2, "changes", True)
+        return commit, event
+
+    def test_commit_message_and_recorded_sha(self):
+        commit, _event = self.call({"enabled": True, "branch": "triagent/x", "note": "", "commits": []})
+        message = commit.call_args.args[1]
+        self.assertTrue(message.startswith("TriAgent cycle 2: 장바구니 기능 추가"))
+        self.assertIn("Review: changes", message)
+        self.assertEqual(roundtable.STATE["pipeline_git"]["commits"], [{"cycle": 2, "sha": "abc1234"}])
+
+    def test_disabled_git_never_commits(self):
+        commit, _event = self.call({"enabled": False, "branch": "", "note": "Git 저장소가 아니라", "commits": []})
+        commit.assert_not_called()
+
+    def test_commit_failure_is_reported_not_raised(self):
+        _commit, event = self.call(
+            {"enabled": True, "branch": "triagent/x", "note": "", "commits": []},
+            roundtable.gitops.GitResult(False, "Please tell me who you are"),
+        )
+        self.assertIn("Please tell me who you are", event.call_args.args[0])
+        self.assertEqual(roundtable.STATE["pipeline_git"]["commits"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

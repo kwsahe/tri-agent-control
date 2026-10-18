@@ -60,7 +60,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from triagent.domain import clicheck, runstatus, usage as usage_domain, validation, workflow
+from triagent.domain import clicheck, gitops, runstatus, usage as usage_domain, validation, workflow
 from triagent.domain.workspace import (
     WorkspaceStatus,
     parse_project_path_file,
@@ -4146,6 +4146,89 @@ def run_step(
     return added and not failed
 
 
+def prepare_pipeline_git(session_id: str) -> None:
+    """사이클 1 진입 시 작업 브랜치를 준비한다. 안 되면 이유만 남기고 커밋 없이 진행한다."""
+    resolution = resolve_project_workspace(require_write=True)
+    if resolution.blocked or resolution.path is None:
+        return
+    result = gitops.prepare_work_branch(resolution.path, f"triagent/{session_id}")
+    with STATE_LOCK:
+        if STATE.get("id") != session_id:
+            return
+        STATE["pipeline_git"] = {
+            "enabled": result.ok,
+            "branch": result.detail if result.ok else "",
+            "note": "" if result.ok else result.detail,
+            "commits": [],
+        }
+        save_state(STATE)
+    if result.ok:
+        add_runtime_event(f"사이클 커밋 브랜치: {result.detail}")
+    else:
+        add_runtime_event(f"자동 커밋 안 함 — {result.detail}", "warn")
+
+
+def commit_cycle(session_id: str, cycle_number: int, verdict: str, validation_ok: bool) -> None:
+    with STATE_LOCK:
+        if STATE.get("id") != session_id:
+            return
+        git_state = dict(STATE.get("pipeline_git") or {})
+        topic = re.sub(r"\s+", " ", STATE.get("topic", "")).strip()[:60]
+    if not git_state.get("enabled"):
+        return
+    resolution = resolve_project_workspace(require_write=True)
+    if resolution.blocked or resolution.path is None:
+        return
+    message = (
+        f"TriAgent cycle {cycle_number}: {topic}\n\n"
+        f"Review: {verdict or 'none'} · Validation: {'pass' if validation_ok else 'fail'}\n"
+        f"Session: {session_id}"
+    )
+    result = gitops.commit_all(resolution.path, message)
+    if not result.ok:
+        add_runtime_event(f"사이클 {cycle_number} 커밋 실패 — {result.detail}", "warn")
+        return
+    if not result.detail:
+        add_runtime_event(f"사이클 {cycle_number}: 변경이 없어 커밋하지 않았습니다.")
+        return
+    with STATE_LOCK:
+        if STATE.get("id") == session_id:
+            commits = list((STATE.get("pipeline_git") or {}).get("commits", []))
+            commits.append({"cycle": cycle_number, "sha": result.detail})
+            STATE["pipeline_git"] = {**git_state, "commits": commits}
+            save_state(STATE)
+    add_runtime_event(f"사이클 {cycle_number} 커밋: {result.detail} ({git_state.get('branch', '')})")
+
+
+def finish_pipeline_cycle(session_id: str, cycle_number: int) -> bool:
+    """사이클 끝: 커밋하고, 검토 통과 + 검증 통과면 세션을 완료한다. 완료했으면 True."""
+    marker = f"{REVIEW_PHASE} · 목표 사이클 {cycle_number}"
+    with STATE_LOCK:
+        if STATE.get("id") != session_id:
+            return False
+        verdict = next(
+            ((message.get("meta") or {}).get("review_verdict", "")
+             for message in reversed(STATE.get("messages", []))
+             if message.get("phase") == marker),
+            "",
+        )
+        validation_ok = all(result.get("ok") for result in STATE.get("validation_results") or [])
+        has_reviewer = any(step[1] == REVIEW_PHASE for step in goal_coding_steps(STATE.get("enabled_agents")))
+    commit_cycle(session_id, cycle_number, verdict, validation_ok)
+    if not validation_ok or (has_reviewer and verdict != "pass"):
+        return False
+    with STATE_LOCK:
+        if STATE.get("id") != session_id:
+            return False
+        STATE["finished"] = True
+        STATE["coding_stopped"] = True
+        STATE["coding_stop_reason"] = "검토·검증 통과"
+        STATE["workflow_status"] = workflow.COMPLETED
+        save_state(STATE)
+    add_runtime_event(f"사이클 {cycle_number}: 검토·검증 통과 — 작업 완료")
+    return True
+
+
 def worker_loop(session_id: str) -> None:
     restart_pending = False
     try:
@@ -4206,6 +4289,7 @@ def worker_loop(session_id: str) -> None:
                     STATE["finished"] = False
                     save_state(STATE)
                 add_runtime_event("계획·승인 단계 완료 · 목표 기반 코딩 사이클 1 시작")
+                prepare_pipeline_git(session_id)
                 continue
             if coding_iteration and step_index >= len(steps):
                 with STATE_LOCK:
@@ -4318,6 +4402,10 @@ def worker_loop(session_id: str) -> None:
                         f'({result["elapsed"]}초)',
                         level=level,
                     )
+
+            # 사이클 끝 검증(검토가 없을 때)이 끝난 뒤에 커밋·완료 판정을 한다.
+            if coding_iteration and cycle_completed and finish_pipeline_cycle(session_id, cycle_number):
+                break
 
             if phase == CONFIRM_PHASE and not CONTROL["approval_requested"]:
                 mark_approval_requested(agent, phase)

@@ -598,11 +598,11 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
     def test_coding_planning_transitions_to_goal_iteration(
         self, _save_state, _event, _render
     ):
-        planning_steps = roundtable.steps_for_mode("coding", ["codex"])
+        planning_steps = roundtable.steps_for_mode("coding", ["claude", "codex"])
         roundtable.STATE.update(
             topic="목표 코딩",
             mode="coding",
-            enabled_agents=["codex"],
+            enabled_agents=["claude", "codex"],
             coding_stage="planning",
             plan_approved=True,   # 계획 단계를 끝까지 지났다 = 사용자가 승인했다
             step_index=len(planning_steps),
@@ -622,7 +622,8 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
             roundtable.CONTROL["stopped"] = True
             return True
 
-        with patch.object(roundtable, "run_step", side_effect=fake_run_step):
+        with patch.object(roundtable, "run_step", side_effect=fake_run_step), \
+             patch.object(roundtable, "prepare_pipeline_git"):
             roundtable.worker_loop(roundtable.STATE["id"])
 
         self.assertEqual(roundtable.STATE["coding_stage"], "iteration")
