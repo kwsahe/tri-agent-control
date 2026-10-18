@@ -4650,9 +4650,10 @@ def render_dashboard() -> str:
         "__FEED_LAST_INDEX__": str(total_messages - 1),
         "__MESSAGE_TOTAL__": str(total_messages),
     }
-    for token, value in replacements.items():
-        page = page.replace(token, value)
-    return page
+    # 한 번에 치환한다. 순서대로 replace하면 앞에서 넣은 주제·메시지 안의
+    # "__CSRF_TOKEN__" 같은 글자가 뒤 단계에서 진짜 값으로 바뀐다.
+    pattern = re.compile("|".join(map(re.escape, replacements)))
+    return pattern.sub(lambda match: replacements[match.group(0)], page)
 
 
 #: 최초 진입 시 내려보낼 최근 메시지 개수. 나머지는 "이전 메시지 불러오기"로 가져온다.
@@ -4820,7 +4821,7 @@ def state_json_payload(include_feed: bool = False) -> dict:
         "workflow_status": workflow_status,
         "pending_user_question": pending_user_question,
         "topic": html.escape(topic) if topic else "",
-        "session_name": html.escape(session_name),
+        "session_name": session_name,
         "tags": list(STATE.get("tags", [])),
         "favorite": bool(STATE.get("favorite", False)),
         "archived": bool(STATE.get("archived", False)),
@@ -4844,9 +4845,9 @@ def state_json_payload(include_feed: bool = False) -> dict:
         "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
         "conn_html": connection_status_html(),
         "active_id": active_id,
-        "memory_dir": html.escape(str(session_memory_dir(active_id))) if active_id else "",
-        "profile_path": html.escape(str(session_profile_path(active_id))) if active_id else "",
-        "roles_path": html.escape(str(session_roles_path(active_id))) if active_id else "",
+        "memory_dir": str(session_memory_dir(active_id)) if active_id else "",
+        "profile_path": str(session_profile_path(active_id)) if active_id else "",
+        "roles_path": str(session_roles_path(active_id)) if active_id else "",
         "workspace_path": str(project_path_or_none() or ""),
         "workspace_access": workspace_access,
         "workspace_access_label": "읽기·쓰기" if workspace_access == "write" else "읽기 전용",
@@ -5031,7 +5032,7 @@ def session_detail_payload(session_id: str) -> dict | None:
             discussion_project_access,
         ),
         "topic": html.escape(data.get("topic", "")),
-        "session_name": html.escape(data.get("name") or data.get("topic") or "새 세션"),
+        "session_name": data.get("name") or data.get("topic") or "새 세션",
         "tags": data.get("tags", []),
         "favorite": bool(data.get("favorite", False)),
         "archived": bool(data.get("archived", False)),
@@ -5052,9 +5053,9 @@ def session_detail_payload(session_id: str) -> dict | None:
         },
         "enabled_agents_label": html.escape(agent_names(enabled_agents)),
         "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
-        "memory_dir": html.escape(str(session_memory_dir(session_id))),
-        "profile_path": html.escape(str(session_profile_path(session_id))),
-        "roles_path": html.escape(str(session_roles_path(session_id))),
+        "memory_dir": str(session_memory_dir(session_id)),
+        "profile_path": str(session_profile_path(session_id)),
+        "roles_path": str(session_roles_path(session_id)),
         "workspace_path": data.get("workspace_path") or str(project_path_or_none() or ""),
         "workspace_access": data.get("workspace_access", "write"),
         "workspace_access_label": "읽기·쓰기" if data.get("workspace_access", "write") == "write" else "읽기 전용",
