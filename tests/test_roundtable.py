@@ -5,11 +5,70 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import json
+
+import isolation  # noqa: F401  (실제 데이터 폴더 격리 — 반드시 roundtable보다 먼저)
 import roundtable
+from triagent.domain import runstatus, usage as usage_domain, validation, workspace
+from triagent.security import paths as secure_paths
+from triagent.security import webguard
 
 
-class RoundtableTests(unittest.TestCase):
+class IsolatedWorkspaceMixin:
+    """모든 테스트를 격리된 임시 폴더에서 돌린다.
+
+    실제 PROJECT_PATH.txt / sessions/ / roundtable_memory/ / roundtable_state.json /
+    roundtable_log.md 는 전부 사용자 데이터라 테스트가 절대 건드리면 안 된다.
+    작업공간 해석뿐 아니라 **저장 경로 전체**를 임시 폴더로 갈아끼운다.
+
+    (이 격리가 없을 때 테스트 한 번에 세션 파일 수백 개가 실제 sessions/ 폴더에
+     쌓였다 — append_session_transcript 등이 save_state를 거치지 않기 때문이다.)
+    """
+
+    def start_workspace_isolation(self):
+        self._workspace_tmp = tempfile.TemporaryDirectory()
+        self.workspace_path = Path(self._workspace_tmp.name).resolve()
+
+        self._data_tmp = tempfile.TemporaryDirectory()
+        data_root = Path(self._data_tmp.name).resolve()
+        sessions_dir = data_root / "sessions"
+        memory_dir = data_root / "roundtable_memory"
+        sessions_dir.mkdir()
+        memory_dir.mkdir()
+
+        self._patches = [
+            patch.object(
+                roundtable, "read_configured_project_path",
+                return_value=str(self.workspace_path),
+            ),
+            patch.object(roundtable, "SESSIONS_DIR", sessions_dir),
+            patch.object(roundtable, "MEMORY_DIR", memory_dir),
+            patch.object(roundtable, "STATE_PATH", data_root / "roundtable_state.json"),
+            patch.object(roundtable, "LOG_PATH", data_root / "roundtable_log.md"),
+            patch.object(roundtable, "HTML_PATH", data_root / "roundtable.html"),
+            patch.object(roundtable, "PROJECT_PATH_FILE", data_root / "PROJECT_PATH.txt"),
+            patch.dict(roundtable.PROFILE_PATHS, {
+                agent: data_root / f"{agent.upper()}_Profile.md"
+                for agent in roundtable.AGENT_ORDER
+            }),
+        ]
+        for item in self._patches:
+            item.start()
+
+        # 경고 dedupe 상태도 테스트마다 초기화한다.
+        roundtable._WORKSPACE_WARNING_STATE["signature"] = ""
+        roundtable._WORKSPACE_WARNING_STATE["seen"] = set()
+
+    def stop_workspace_isolation(self):
+        for item in reversed(self._patches):
+            item.stop()
+        self._data_tmp.cleanup()
+        self._workspace_tmp.cleanup()
+
+
+class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
     def setUp(self):
+        self.start_workspace_isolation()
         self.original_state = roundtable.STATE
         self.original_control = dict(roundtable.CONTROL)
         roundtable.STATE = roundtable.new_state()
@@ -18,6 +77,7 @@ class RoundtableTests(unittest.TestCase):
         roundtable.STATE = self.original_state
         roundtable.CONTROL.clear()
         roundtable.CONTROL.update(self.original_control)
+        self.stop_workspace_isolation()
 
     def test_codex_prompt_is_sent_through_stdin(self):
         result = subprocess.CompletedProcess([], 0, "정상 응답", "")
@@ -100,7 +160,10 @@ class RoundtableTests(unittest.TestCase):
                 ask_func("구현", "coding")
                 args = run_cli.call_args.args[2]
                 if agent == "codex":
-                    self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+                    # 승인/샌드박스 옵션은 Codex 버전마다 달라서 고정 문자열로
+                    # 확인하지 않는다. 기능 감지 결과가 그대로 전달되는지 본다.
+                    for token in roundtable.codex_write_args():
+                        self.assertIn(token, args)
                     self.assertNotIn("--ignore-user-config", args)
                     self.assertEqual(
                         Path(args[args.index("--cd") + 1]),
@@ -123,7 +186,8 @@ class RoundtableTests(unittest.TestCase):
                 ask_func("쓰기 권한 확인", "discussion")
                 args = run_cli.call_args.args[2]
                 if agent == "codex":
-                    self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+                    for token in roundtable.codex_write_args():
+                        self.assertIn(token, args)
                     self.assertNotIn("--ignore-user-config", args)
                 elif agent == "claude":
                     self.assertIn("Bash,Edit,Read,Write,Glob,Grep", args)
@@ -486,7 +550,7 @@ class RoundtableTests(unittest.TestCase):
         self.assertNotIn("maybe_autostart_worker", source)
 
     @patch.object(roundtable, "render_html_snapshot")
-    @patch.object(roundtable, "run_project_validation", return_value=[])
+    @patch.object(roundtable, "run_validation_for_current_workspace", return_value=[])
     @patch.object(roundtable, "add_runtime_event")
     @patch.object(roundtable, "save_state")
     def test_goal_coding_worker_wraps_into_next_cycle(
@@ -496,6 +560,7 @@ class RoundtableTests(unittest.TestCase):
             topic="반복 개발",
             mode="coding",
             coding_stage="iteration",
+            plan_approved=True,
             coding_cycle=1,
             coding_cycle_step=0,
             coding_started_at=roundtable.time.time(),
@@ -541,6 +606,7 @@ class RoundtableTests(unittest.TestCase):
             mode="coding",
             enabled_agents=["codex"],
             coding_stage="planning",
+            plan_approved=True,   # 계획 단계를 끝까지 지났다 = 사용자가 승인했다
             step_index=len(planning_steps),
             finished=False,
         )
@@ -1050,15 +1116,53 @@ class RoundtableTests(unittest.TestCase):
         self.assertEqual(add_message.call_args.args[1], "실행 차단 · 예산 한도")
         self.assertIn("자동으로 재개", add_message.call_args.args[2])
 
-    def test_validation_command_detection_for_python_tests(self):
+    def _python_tests_dir(self, root: Path) -> None:
+        tests_dir = root / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_sample.py").write_text("", encoding="utf-8")
+
+    def test_validation_uses_pytest_when_pytest_is_installed(self):
+        """환경을 주입하므로 이 기계에 pytest가 있든 없든 결과가 같다."""
+        environment = validation.ToolEnvironment(
+            python_executable="python", has_pytest=True
+        )
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            tests = root / "tests"
-            tests.mkdir()
-            (tests / "test_sample.py").write_text("", encoding="utf-8")
-            commands = roundtable.detect_validation_commands(root)
+            self._python_tests_dir(root)
+            commands = validation.detect_validation_commands(root, environment)
         self.assertEqual(commands[0][0], "Python pytest")
         self.assertEqual(commands[0][1][-2:], ["pytest", "-q"])
+
+    def test_validation_falls_back_to_unittest_without_pytest(self):
+        environment = validation.ToolEnvironment(
+            python_executable="python", has_pytest=False
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._python_tests_dir(root)
+            commands = validation.detect_validation_commands(root, environment)
+        self.assertEqual(commands[0][0], "Python unittest")
+        self.assertEqual(
+            commands[0][1][-4:], ["unittest", "discover", "-s", "tests"]
+        )
+
+    def test_validation_skips_triagent_itself_to_avoid_recursion(self):
+        """자기 자신을 검증 대상으로 잡으면 unittest가 무한 재귀한다."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._python_tests_dir(root)
+            environment = validation.ToolEnvironment(
+                python_executable="python",
+                has_pytest=False,
+                excluded_roots=(str(root),),
+            )
+            self.assertEqual(
+                validation.detect_validation_commands(root, environment), []
+            )
+
+    def test_real_detection_excludes_triagent_root(self):
+        """실제 배선에서도 TriAgent 폴더는 검증 명령을 만들지 않는다."""
+        self.assertEqual(roundtable.detect_validation_commands(roundtable.ROOT), [])
 
     def test_turn_diff_contains_only_changed_text_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1091,12 +1195,20 @@ class RoundtableTests(unittest.TestCase):
             source.write_text("after\n", encoding="utf-8")
             diff = roundtable.build_turn_diff(target, before, [{"path": "sample.txt", "change": "수정"}])
             checkpoint = memory / "turn.patch"
-            checkpoint.write_text(diff, encoding="utf-8")
+            checkpoint.write_text(diff, encoding="utf-8", newline="")
+            # 소유권 정보(세션 + 작업공간)가 있어야 적용된다.
+            (memory / "turn.json").write_text(
+                json.dumps({
+                    "session_id": roundtable.STATE["id"],
+                    "workspace_path": str(target.resolve()),
+                }),
+                encoding="utf-8",
+            )
             with patch.object(roundtable, "MEMORY_DIR", memory), patch.object(
-                roundtable, "load_project_path", return_value=target
+                roundtable, "read_configured_project_path", return_value=str(target)
             ), patch.object(roundtable, "add_runtime_event"):
                 result = roundtable.rollback_checkpoint_files(str(checkpoint), ["sample.txt"])
-            self.assertTrue(result["success"])
+            self.assertTrue(result.get("success"), result)
             self.assertEqual(source.read_text(encoding="utf-8"), "before\n")
 
     @patch.object(roundtable, "save_state")
@@ -1152,14 +1264,14 @@ class RoundtableTests(unittest.TestCase):
             topic="계속할 작업",
             mode="coding",
             finished=False,
-            workspace_path=str(roundtable.ROOT),
+            workspace_path=str(self.workspace_path),
             workspace_access="write",
             messages=[],
         )
         with patch.object(roundtable, "load_session", return_value=source):
             result = roundtable.activate_session("saved")
 
-        self.assertTrue(result["success"])
+        self.assertTrue(result.get("success"), result)
         self.assertEqual(roundtable.STATE["id"], "saved")
         self.assertTrue(roundtable.CONTROL["paused"])
         self.assertFalse(roundtable.CONTROL["worker_running"])

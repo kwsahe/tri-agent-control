@@ -1,8 +1,142 @@
+// ──────────────────────────────────────────────────────────────
+// CSRF / 네트워크 계층
+// ──────────────────────────────────────────────────────────────
+// 상태를 바꾸는 요청에는 서버가 발급한 토큰이 있어야 한다. 호출 지점이 30곳이 넘어
+// 하나씩 고치면 새로 추가되는 호출을 빠뜨리기 쉬우므로, fetch를 한 번 감싸서
+// 같은 오리진의 비-GET 요청에 자동으로 토큰을 붙인다.
+// 서버를 다시 켜면 토큰이 바뀐다. 상태 응답마다 오는 csrf_token으로 갱신하고,
+// 그래도 403이 나면 새 토큰을 받아 한 번만 다시 보낸다.
+let csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
+
+const nativeFetch = window.fetch.bind(window);
+
+async function refreshCsrfToken() {
+  try {
+    const data = await (await nativeFetch("/state.json")).json();
+    if (data.csrf_token && data.csrf_token !== csrfToken) {
+      csrfToken = data.csrf_token;
+      return true;
+    }
+  } catch (_e) { /* 서버가 아직 안 떴으면 원래 403을 그대로 돌려준다 */ }
+  return false;
+}
+
+window.fetch = async function guardedFetch(input, init) {
+  const options = { ...(init || {}) };
+  const method = (options.method || (typeof input === "object" ? input.method : "GET") || "GET").toUpperCase();
+  const url = typeof input === "string" ? input : (input && input.url) || "";
+  const sameOrigin = url.startsWith("/") || url.startsWith(window.location.origin);
+  if (method === "GET" || method === "HEAD" || !sameOrigin || !csrfToken) return nativeFetch(input, options);
+  const headers = new Headers(options.headers || (typeof input === "object" ? input.headers : undefined));
+  const callerToken = headers.has("X-CSRF-Token");
+  if (!callerToken) headers.set("X-CSRF-Token", csrfToken);
+  options.headers = headers;
+  options.credentials = options.credentials || "same-origin";
+  const response = await nativeFetch(input, options);
+  if (response.status !== 403 || callerToken || !(await refreshCsrfToken())) return response;
+  headers.set("X-CSRF-Token", csrfToken);
+  return nativeFetch(input, options);
+};
+
+/** 응답을 JSON으로 읽되, 서버 오류·네트워크 오류를 사용자에게 보여줄 수 있는
+ *  형태로 정규화한다. 조용히 실패하지 않는 것이 목적이다. */
+async function requestJson(url, options) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (err) {
+    throw new Error(`서버에 연결하지 못했습니다: ${err.message}`);
+  }
+  let payload = null;
+  const text = await response.text();
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch (_e) {
+      payload = null;
+    }
+  }
+  if (!response.ok) {
+    const detail = (payload && payload.error) || `HTTP ${response.status}`;
+    const error = new Error(detail);
+    error.status = response.status;
+    throw error;
+  }
+  return payload || {};
+}
+
+function postForm(url, fields) {
+  const body = fields instanceof URLSearchParams ? fields : new URLSearchParams(fields || {});
+  return requestJson(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+}
+
+/** 인라인 오류 표시. alert()과 달리 흐름을 끊지 않고 aria-live로 읽힌다. */
+function showInlineError(elementId, message, focusId) {
+  const box = document.getElementById(elementId);
+  if (box) {
+    box.textContent = message;
+    box.hidden = false;
+  }
+  if (focusId) document.getElementById(focusId)?.focus();
+}
+
+function clearInlineError(elementId) {
+  const box = document.getElementById(elementId);
+  if (box) {
+    box.textContent = "";
+    box.hidden = true;
+  }
+}
+
+/** 전송 중 버튼 중복 클릭 차단 + 진행 표시. */
+async function withBusy(button, label, action) {
+  if (!button) return action();
+  if (button.dataset.busy === "1") return undefined;
+  button.dataset.busy = "1";
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  if (label) button.textContent = label;
+  try {
+    return await action();
+  } finally {
+    button.dataset.busy = "0";
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+    button.innerHTML = original;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// 메시지 증분 로딩 상태
+// ──────────────────────────────────────────────────────────────
+function metaNumber(name, fallback) {
+  const value = Number(document.querySelector(`meta[name="${name}"]`)?.content);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+const feedCursor = {
+  first: metaNumber("feed-first-index", 0),
+  last: metaNumber("feed-last-index", -1),
+  total: metaNumber("message-total", 0),
+  loading: false,
+};
+
+let followLatestMessages = true;
+
 let viewingId = null;
 let lastVersion = null;
 let sessionsById = {};
 let allSessions = [];
 let sessionsActiveId = null;
+let guideCardIndex = 0;
+let guideRotationTimer = null;
+let guideRotationPaused = false;
+const GUIDE_ROTATION_MS = 6500;
 
 const AGENTS = {
   codex: { label: "Codex", color: "#4f8cff", avatar: "/static/agents/codex.png" },
@@ -19,10 +153,78 @@ function $(id) {
   return document.getElementById(id);
 }
 
+function renderGuideCard(nextIndex) {
+  const carousel = $("guideCarousel");
+  if (!carousel) return;
+  const cards = Array.from(carousel.querySelectorAll("[data-guide-card]"));
+  const dots = Array.from(carousel.querySelectorAll(".guide-dot"));
+  if (!cards.length) return;
+  guideCardIndex = (nextIndex + cards.length) % cards.length;
+  cards.forEach((card, index) => {
+    const active = index === guideCardIndex;
+    card.classList.toggle("is-active", active);
+    card.setAttribute("aria-hidden", String(!active));
+  });
+  dots.forEach((dot, index) => {
+    const active = index === guideCardIndex;
+    dot.classList.toggle("is-active", active);
+    dot.setAttribute("aria-selected", String(active));
+    dot.tabIndex = active ? 0 : -1;
+  });
+  const count = $("guideCarouselCount");
+  if (count) count.textContent = `${guideCardIndex + 1} / ${cards.length}`;
+}
+
+function stopGuideRotation() {
+  if (guideRotationTimer) window.clearInterval(guideRotationTimer);
+  guideRotationTimer = null;
+}
+
+function startGuideRotation() {
+  stopGuideRotation();
+  if (guideRotationPaused || document.hidden || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  guideRotationTimer = window.setInterval(() => renderGuideCard(guideCardIndex + 1), GUIDE_ROTATION_MS);
+}
+
+function guideStep(direction) {
+  renderGuideCard(guideCardIndex + direction);
+  startGuideRotation();
+}
+
+function selectGuideCard(index) {
+  renderGuideCard(index);
+  startGuideRotation();
+}
+
+function toggleGuideRotation() {
+  guideRotationPaused = !guideRotationPaused;
+  const button = $("guideToggle");
+  if (button) {
+    button.textContent = guideRotationPaused ? "재생" : "일시정지";
+    button.setAttribute("aria-label", guideRotationPaused ? "카드 자동 회전 재생" : "카드 자동 회전 일시정지");
+    button.setAttribute("aria-pressed", String(guideRotationPaused));
+  }
+  startGuideRotation();
+}
+
+function initGuideCarousel() {
+  const carousel = $("guideCarousel");
+  if (!carousel) return;
+  renderGuideCard(0);
+  carousel.addEventListener("mouseenter", stopGuideRotation);
+  carousel.addEventListener("mouseleave", startGuideRotation);
+  carousel.addEventListener("focusin", stopGuideRotation);
+  carousel.addEventListener("focusout", (event) => {
+    if (!carousel.contains(event.relatedTarget)) startGuideRotation();
+  });
+  document.addEventListener("visibilitychange", startGuideRotation);
+  startGuideRotation();
+}
+
+/** 본문과 속성값 모두에 안전하게 넣을 수 있도록 따옴표까지 바꾼다. */
 function escapeHtml(str) {
-  const d = document.createElement("div");
-  d.textContent = str || "";
-  return d.innerHTML;
+  const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  return String(str ?? "").replace(/[&<>"']/g, (ch) => entities[ch]);
 }
 
 function formatTokens(value) {
@@ -39,6 +241,27 @@ function compactSessionTitle(value) {
   return normalized.length > 56 ? `${normalized.slice(0, 56)}…` : normalized;
 }
 
+/** 컨텍스트 점유율 표시 문자열.
+ *  누적 토큰을 컨텍스트 한도로 나누던 옛 계산이 461.1% 같은 값을 만들었다.
+ *  이제 서버가 측정/추정/알수없음을 구분해 주므로 그대로 드러낸다. */
+function contextDisplay(context) {
+  const known = context && context.known;
+  if (!known) {
+    return { text: "알 수 없음", bar: 0, title: "CLI가 호출 단위 컨텍스트를 제공하지 않습니다.", overflow: false };
+  }
+  const percent = Number(context.percent || 0);
+  const estimated = context.source !== "measured";
+  const prefix = estimated ? "추정 " : "실측 ";
+  return {
+    text: `${prefix}${percent.toFixed(1)}%`,
+    bar: Number(context.bar_percent ?? Math.min(100, percent)),
+    overflow: Boolean(context.overflow),
+    title: estimated
+      ? "프롬프트 길이 기반 추정치입니다."
+      : "CLI가 보고한 호출 단위 사용량입니다.",
+  };
+}
+
 function estimateCost(tokens) {
   return `$${((Number(tokens || 0) * 0.002) / 1000).toFixed(4)}`;
 }
@@ -51,7 +274,7 @@ function renderTopic(data) {
       <p>활성: ${data.enabled_agents_label || "-"} · 비활성: ${data.disabled_agents_label || "없음"}</p>
       <p>프로젝트 접근: ${data.mode === "coding" ? "읽기·쓰기 (코딩 실행)" : (data.discussion_project_access_label || "프로젝트 읽기")}</p>
       ${data.mode === "coding" ? `<p>현재 진행: ${data.coding_stage === "iteration" ? `목표 사이클 ${data.coding_cycle || 1} / ${data.coding_limits?.max_cycles || 3}` : "계획·승인"}</p>` : ""}
-      <p>저장 폴더: ${data.memory_dir || "-"}</p>
+      <p>저장 폴더: ${escapeHtml(data.memory_dir || "-")}</p>
     </div>`;
 }
 
@@ -62,7 +285,9 @@ function renderSessionList(sessions, activeId) {
   applySessionFilters();
 }
 
-function applySessionFilters() {
+let lastSessionListSignature = null;
+
+function applySessionFilters(force = false) {
   const list = $("sessionList");
   const query = ($("sessionSearch")?.value || "").trim().toLowerCase();
   const favoriteOnly = $("favoriteOnly")?.checked || false;
@@ -71,22 +296,32 @@ function applySessionFilters() {
     const haystack = `${session.name || ""} ${session.topic || ""} ${(session.tags || []).join(" ")}`.toLowerCase();
     return (!query || haystack.includes(query)) && (!favoriteOnly || session.favorite) && (showArchived ? session.archived : !session.archived);
   });
+  // 4초마다 전체 DOM을 갈아엎지 않는다 — 내용이 같으면 건드리지 않는다.
+  const signature = JSON.stringify(sessions.map((s) => [
+    s.id, s.name, s.status_label, s.mode_label, s.message_count, s.favorite, s.tags,
+  ])) + `|${viewingId}|${sessionsActiveId}`;
+  if (!force && signature === lastSessionListSignature) return;
+  lastSessionListSignature = signature;
+
   if (!sessions.length) {
     list.innerHTML = '<div class="empty-state">아직 세션이 없습니다.</div>';
     return;
   }
   list.innerHTML = sessions.map((s) => {
     const cls = `session-item${s.id === (viewingId || sessionsActiveId) ? " active" : ""}`;
-    const status = !s.topic ? "준비" : (s.finished ? "완료" : (s.id === sessionsActiveId ? "진행 중" : "보류"));
+    // 서버가 상단 배너와 같은 규칙으로 계산해 보낸 값. 색만이 아니라 기호+문구로
+    // 표시해 색각 이상에서도 구분할 수 있게 한다.
+    const status = s.status_label || (!s.topic ? "준비" : (s.finished ? "완료" : "보류"));
+    const glyph = s.status_glyph || "·";
     const tags = (s.tags || []).map((tag) => `<span>#${escapeHtml(tag)}</span>`).join("");
     const isCurrent = s.id === (viewingId || sessionsActiveId);
     return `<div class="session-row">
-      <button class="${cls}" onclick="viewSession('${s.id}')" aria-current="${isCurrent ? "page" : "false"}" aria-label="${escapeHtml(s.name || s.topic)} · ${status}">
+      <button class="${cls}" data-session-id="${escapeHtml(s.id)}" onclick="viewSession(this.dataset.sessionId)" aria-current="${isCurrent ? "page" : "false"}" aria-label="${escapeHtml(s.name || s.topic)} · ${escapeHtml(status)}">
         <span class="s-topic">${s.favorite ? "★ " : ""}${escapeHtml(s.name || s.topic)}</span>
-        <span class="s-meta">${status} · ${escapeHtml(s.mode_label)} · ${s.message_count}개</span>
+        <span class="s-meta"><span class="s-glyph" aria-hidden="true">${escapeHtml(glyph)}</span>${escapeHtml(status)} · ${escapeHtml(s.mode_label)} · ${s.message_count}개</span>
         <span class="s-tags">${tags}</span>
       </button>
-      <button class="session-rename icon-button" onclick="openSessionActions('${s.id}')" title="세션 메뉴" aria-label="세션 메뉴">•••</button>
+      <button class="session-rename icon-button" data-session-id="${escapeHtml(s.id)}" onclick="openSessionActions(this.dataset.sessionId)" title="세션 메뉴" aria-label="세션 메뉴">•••</button>
     </div>`;
   }).join("");
 }
@@ -121,16 +356,18 @@ function renderAgentUsage(data) {
   $("agentUsage").innerHTML = rows.map(({ info, row, context, actual, tokens, percent }) => {
     const percentText = percent > 0 && percent < 0.1 ? "<0.1%" : `${percent.toFixed(1)}%`;
     const tokenText = actual > 0 ? formatTokens(tokens) : `~${formatTokens(tokens)}`;
-    const contextPercent = Number(context.percent || 0);
-    const contextTokenText = `${context.estimated ? "~" : ""}${formatTokens(context.used_tokens || 0)} / ${formatTokens(context.limit_tokens || 0)}`;
+    const contextView = contextDisplay(context);
+    const contextTokenText = context.known
+      ? `${context.source !== "measured" ? "~" : ""}${formatTokens(context.used_tokens || 0)} / ${formatTokens(context.limit_tokens || 0)}`
+      : "-";
     return `<div class="agent-usage-row" style="--agent-color:${info.color}">
       <div class="agent-usage-head"><span>${info.label}<small>${row.turns || 0}턴</small></span><strong>점유 ${percentText} · ${tokenText}</strong></div>
       <div class="agent-usage-track" role="progressbar" aria-label="${info.label} 토큰 점유율" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(1)}">
         <span style="width:${Math.min(100, percent).toFixed(2)}%"></span>
       </div>
-      <div class="agent-context-meta"><span>현재 컨텍스트</span><strong>${contextPercent.toFixed(1)}% · ${contextTokenText}</strong></div>
-      <div class="agent-context-track" role="progressbar" aria-label="${info.label} 현재 컨텍스트 사용률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${contextPercent.toFixed(1)}">
-        <span style="width:${Math.min(100, contextPercent).toFixed(2)}%"></span>
+      <div class="agent-context-meta" title="${escapeHtml(contextView.title)}"><span>현재 컨텍스트</span><strong>${escapeHtml(contextView.text)} · ${contextTokenText}${contextView.overflow ? " ⚠ 한도 초과" : ""}</strong></div>
+      <div class="agent-context-track${contextView.overflow ? " is-overflow" : ""}" role="progressbar" aria-label="${info.label} 현재 컨텍스트 사용률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${contextView.bar.toFixed(1)}" aria-valuetext="${escapeHtml(contextView.text)}">
+        <span style="width:${contextView.bar.toFixed(2)}%"></span>
       </div>
     </div>`;
   }).join("");
@@ -144,12 +381,16 @@ function renderTokenDetails(data) {
       + Number(row.cache_read_input_tokens || 0)
       + Number(row.cached_input_tokens || 0);
     const percentText = percent > 0 && percent < 0.1 ? "<0.1%" : `${percent.toFixed(1)}%`;
-    const contextPercent = Number(context.percent || 0);
-    const contextTokens = `${context.estimated ? "~" : ""}${formatTokens(context.used_tokens || 0)} / ${formatTokens(context.limit_tokens || 0)}`;
+    const contextView = contextDisplay(context);
+    const contextTokens = context.known
+      ? `${context.source !== "measured" ? "~" : ""}${formatTokens(context.used_tokens || 0)} / ${formatTokens(context.limit_tokens || 0)}`
+      : "-";
+    const cumulative = formatTokens(context.session_cumulative_tokens || 0);
     return `<article class="token-model-card" style="--agent-color:${info.color}">
       <header><img src="${info.avatar}" alt=""><div><strong>${info.label}</strong><span>${context.estimated ? "컨텍스트 추정값" : "최신 실제 컨텍스트"}</span></div></header>
-      <div class="token-model-total"><strong>${contextPercent.toFixed(1)}%</strong><span>${contextTokens}토큰</span></div>
-      <div class="token-model-track" role="progressbar" aria-label="${info.label} 컨텍스트 사용률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${contextPercent.toFixed(1)}"><span style="width:${Math.min(100, contextPercent).toFixed(2)}%"></span></div>
+      <div class="token-model-total" title="${escapeHtml(contextView.title)}"><strong>${escapeHtml(contextView.text)}</strong><span>${contextTokens}토큰</span></div>
+      <div class="token-model-track${contextView.overflow ? " is-overflow" : ""}" role="progressbar" aria-label="${info.label} 컨텍스트 사용률" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${contextView.bar.toFixed(1)}" aria-valuetext="${escapeHtml(contextView.text)}"><span style="width:${contextView.bar.toFixed(2)}%"></span></div>
+      <div class="token-model-cumulative">세션 누적 ${cumulative}토큰 <span class="token-hint">(컨텍스트 한도와 무관)</span></div>
       <dl>
         <div><dt>세션 점유율</dt><dd>${percentText}</dd></div>
         <div><dt>세션 집계</dt><dd>${actual > 0 ? formatTokens(tokens) : `~${formatTokens(tokens)}`}</dd></div>
@@ -380,11 +621,10 @@ function updateInspector(data) {
   $("sideCodingLimit").textContent = `${data.coding_limits?.max_cycles || 3}회 · ${data.coding_limits?.max_minutes || 45}분 · ${formatTokens(data.coding_limits?.max_tokens || 200000)} 토큰`;
   $("sideCodingStopRow").style.display = data.coding_stop_reason ? "flex" : "none";
   $("sideCodingStop").textContent = data.coding_stop_reason || "-";
-  if ($("sessionModeSelect") && data.mode && $("sessionModeSelect").value !== data.mode) {
-    $("sessionModeSelect").value = data.mode;
-  }
-  if ($("composerModeSelect") && data.mode && $("composerModeSelect").value !== data.mode) {
-    $("composerModeSelect").value = data.mode;
+  // 서버 모드가 바뀔 때만 맞춘다. 매 폴링마다 맞추면 "전환"을 누르기 전에 고른 값이 되돌아간다.
+  if (data.mode && lastState.selectMode !== data.mode) {
+    ["sessionModeSelect", "composerModeSelect"].forEach((id) => { if ($(id)) $(id).value = data.mode; });
+    lastState.selectMode = data.mode;
   }
   ["discussionAccessSelect", "composerDiscussionAccess"].forEach((id) => {
     const select = $(id);
@@ -433,10 +673,13 @@ function updateInspector(data) {
   }
   if (Number(data.total_actual_tokens || 0) > 0) {
     $("statTokens").textContent = `${formatTokens(data.total_actual_tokens)} 실측`;
-    $("statCost").textContent = `$${Number(data.total_actual_cost_usd || 0).toFixed(4)}`;
   }
-  $("budgetWarning").textContent = data.budget_exceeded || "";
-  $("budgetWarning").style.display = data.budget_exceeded ? "block" : "none";
+  renderCostSummary(data);
+  // 예산 경고와 저장 실패는 둘 다 사용자가 손을 써야 풀리는 문제다.
+  const blockingNotice = data.save_error || data.budget_exceeded || "";
+  $("budgetWarning").textContent = blockingNotice;
+  $("budgetWarning").style.display = blockingNotice ? "block" : "none";
+  renderComposerError();
   $("retryBtn").style.display = data.can_retry ? "inline-flex" : "none";
   $("continueNextBtn").style.display = data.can_continue_next ? "inline-flex" : "none";
   const usageKey = JSON.stringify([data.agent_usage || {}, data.context_usage || {}]);
@@ -484,6 +727,29 @@ function updateInspector(data) {
   }
 }
 
+/** 비용 표시. CLI가 보고한 값과 우리가 토큰으로 추정한 값은 근거가 달라서
+ *  하나의 확정 숫자로 합치지 않는다. 단위(USD)와 계산 근거를 함께 보여준다. */
+function renderCostSummary(data) {
+  const box = $("statCost");
+  if (!box) return;
+  const cost = data.cost_breakdown || {};
+  const reported = Number(cost.reported_usd || 0);
+  const estimated = Number(cost.estimated_usd || 0);
+  const currency = cost.currency || "USD";
+  let text;
+  if (reported > 0 && estimated > 0) {
+    text = `$${reported.toFixed(4)} + 추정 $${estimated.toFixed(4)}`;
+  } else if (reported > 0) {
+    text = `$${reported.toFixed(4)}`;
+  } else if (estimated > 0) {
+    text = `추정 $${estimated.toFixed(4)}`;
+  } else {
+    text = "$0.0000";
+  }
+  box.textContent = text;
+  box.title = `${currency} · ${cost.basis || "집계된 턴 없음"}`;
+}
+
 function updateThinking(data) {
   const workLog = data.active_work_log || [];
   const lastWork = workLog.length ? `${workLog[workLog.length - 1].time}_${workLog[workLog.length - 1].text}` : "";
@@ -529,25 +795,117 @@ function updateThinking(data) {
   }
 }
 
-function updateFeedHtml(feedHtml) {
+/** 사용자가 하단을 보고 있는지. 여기서만 판단하고 모든 스크롤 결정이 이 값을 쓴다. */
+function isNearBottom(scroller, threshold = 120) {
+  if (!scroller) return true;
+  return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < threshold;
+}
+
+function handleFeedScroll() {
+  const scroller = $("conversationScroll");
+  followLatestMessages = isNearBottom(scroller);
+  const jump = $("jumpLatest");
+  if (jump) jump.hidden = followLatestMessages;
+}
+
+function jumpToLatest() {
+  const scroller = $("conversationScroll");
+  if (!scroller) return;
+  scroller.scrollTop = scroller.scrollHeight;
+  followLatestMessages = true;
+  const jump = $("jumpLatest");
+  if (jump) jump.hidden = true;
+}
+
+/** 새 메시지만 이어붙인다. 전체 innerHTML 교체를 하지 않는다. */
+function appendMessagesHtml(html) {
   const feed = $("feed");
   const scroller = $("conversationScroll");
-  const previousRows = feed.querySelectorAll(".row").length;
-  const previousTop = scroller.scrollTop;
-  const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-  const followLatest = previousRows === 0 || distanceFromBottom < 120;
-
-  feed.innerHTML = feedHtml;
-  const rows = feed.querySelectorAll(".row");
-  if (previousRows > 0 && rows.length > previousRows) {
-    for (let index = previousRows; index < rows.length; index += 1) {
-      rows[index].classList.add("is-new");
-    }
+  if (!feed || !html) return;
+  const wasNearBottom = isNearBottom(scroller);
+  const holder = document.createElement("div");
+  holder.innerHTML = html;
+  const added = Array.from(holder.children);
+  if (added.length) feed.querySelector(":scope > .empty-state")?.remove();
+  // 진행 중 표시는 항상 맨 아래에 남도록 그 앞에 끼워 넣는다 (없으면 맨 끝).
+  const thinking = $("thinkingIndicator");
+  added.forEach((node) => feed.insertBefore(node, thinking));
+  if (wasNearBottom && followLatestMessages) {
+    requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
+  } else if (added.length) {
+    const jump = $("jumpLatest");
+    if (jump) jump.hidden = false;
   }
+}
 
-  requestAnimationFrame(() => {
-    scroller.scrollTop = followLatest ? scroller.scrollHeight : previousTop;
-  });
+/** 서버에서 새 메시지만 받아온다 (전체 재전송 없음). */
+async function fetchNewMessages() {
+  if (feedCursor.loading) return;
+  feedCursor.loading = true;
+  try {
+    const data = await requestJson(`/messages.json?after=${feedCursor.last}&limit=80`);
+    if (data.count > 0) {
+      appendMessagesHtml(data.messages_html);
+      feedCursor.last = data.to_index;
+    }
+    feedCursor.total = data.total ?? feedCursor.total;
+  } catch (_e) {
+    // 폴링 실패는 상태 표시에서 이미 알린다.
+  } finally {
+    feedCursor.loading = false;
+  }
+}
+
+/** "이전 메시지 불러오기" — 최초에는 최근 것만 받으므로 과거는 여기서 채운다. */
+async function loadOlderMessages() {
+  if (feedCursor.loading || feedCursor.first <= 0) return;
+  feedCursor.loading = true;
+  const wrap = $("loadOlderWrap");
+  const scroller = $("conversationScroll");
+  const previousHeight = scroller ? scroller.scrollHeight : 0;
+  try {
+    const data = await requestJson(`/messages-older.json?before=${feedCursor.first}&limit=60`);
+    if (data.count > 0) {
+      const holder = document.createElement("div");
+      holder.innerHTML = data.messages_html;
+      const feed = $("feed");
+      const anchor = wrap && wrap.parentNode === feed ? wrap.nextSibling : feed.firstChild;
+      Array.from(holder.children).forEach((node) => feed.insertBefore(node, anchor));
+      feedCursor.first = data.from_index;
+      // 읽던 위치를 유지한다.
+      if (scroller) scroller.scrollTop += scroller.scrollHeight - previousHeight;
+    }
+    if (wrap) {
+      if (feedCursor.first > 0) {
+        wrap.querySelector("button").textContent = `이전 메시지 ${feedCursor.first.toLocaleString()}개 불러오기`;
+      } else {
+        wrap.remove();
+      }
+    }
+  } catch (err) {
+    if (wrap) wrap.querySelector("button").textContent = `불러오지 못했습니다 (${err.message}) · 다시 시도`;
+  } finally {
+    feedCursor.loading = false;
+  }
+}
+
+/** 지난 세션을 보다가 돌아오면 피드에 남의 대화가 들어 있다. 첫 화면과 같은
+ *  구성(모드 안내 + 이전 메시지 버튼 + 최근 메시지)으로 다시 채우고 커서도 맞춘다. */
+let liveFeedStale = false;
+
+async function reloadLiveFeed(state) {
+  const page = await requestJson("/messages.json?after=-1&limit=60");
+  if (viewingId) return;
+  feedCursor.first = page.from_index;
+  feedCursor.last = page.to_index;
+  feedCursor.total = page.total;
+  const older = page.from_index > 0
+    ? `<div class="load-older" id="loadOlderWrap"><button type="button" class="ghost" onclick="loadOlderMessages()">이전 메시지 ${page.from_index.toLocaleString()}개 불러오기</button></div>`
+    : "";
+  $("feed").innerHTML = (state.mode_notice_html || "") + older
+    + (page.messages_html || '<div class="empty-state">아직 대화가 없습니다.</div>');
+  liveFeedStale = false;
+  requestAnimationFrame(jumpToLatest);
 }
 
 function updateConnectionSummary() {
@@ -624,27 +982,56 @@ async function submitQuestionAnswer() {
   }
 }
 
+function renderConnection(connHtml) {
+  $("conn").innerHTML = `<div class="conn-list">${connHtml || ""}</div><button class="ghost compact" onclick="recheck()"><svg viewBox="0 0 24 24" style="margin-right:4px"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>다시 확인</button>`;
+  updateConnectionSummary();
+  lastState.conn_html = connHtml;
+}
+
+function startFieldKey(el) {
+  return el.type === "radio" || el.type === "checkbox" ? `${el.name}=${el.value}` : el.id || el.name;
+}
+
+/** 시작 폼은 작업 폴더·권한이 바뀔 때 서버 HTML로 다시 그려진다. 그때 입력하던
+ *  주제와 고른 모드·모델·세부 설정 펼침 상태를 잃지 않게 옮겨 담는다. */
+function replaceTopicSection(html) {
+  const section = $("topicSection");
+  const fields = "input, textarea, select";
+  const saved = new Map(Array.from(section.querySelectorAll(fields), (el) => [
+    startFieldKey(el), el.type === "radio" || el.type === "checkbox" ? el.checked : el.value,
+  ]));
+  const optionsOpen = $("startOptions") ? !$("startOptions").hidden : false;
+  const focused = section.contains(document.activeElement) ? startFieldKey(document.activeElement) : null;
+  section.innerHTML = html;
+  section.querySelectorAll(fields).forEach((el) => {
+    const key = startFieldKey(el);
+    if (!saved.has(key)) return;
+    const value = saved.get(key);
+    if (el.type === "radio" || el.type === "checkbox") el.checked = value;
+    else if (el.tagName !== "SELECT" || Array.from(el.options).some((option) => option.value === value)) el.value = value;
+    if (key === focused) el.focus();
+  });
+  if (optionsOpen && $("startOptions")?.hidden) toggleStartOptions();
+  syncDirectAgentButtons();
+}
+
 function applyState(data) {
-  if (lastState.feed_html !== data.feed_html) {
-    updateFeedHtml(data.feed_html);
-    lastState.feed_html = data.feed_html;
-  }
+  if (data.csrf_token) csrfToken = data.csrf_token;
   if (lastState.status !== data.status) {
     $("status").textContent = `상태 · ${data.status || "준비"}`;
     $("status").dataset.status = data.status || "준비";
+    if (!networkErrorMessage && $("mobileStatus")) $("mobileStatus").textContent = data.status || "준비";
     lastState.status = data.status;
   }
-  if (lastState.conn_html !== data.conn_html) {
-    $("conn").innerHTML = `<div class="conn-list">${data.conn_html}</div><button class="ghost compact" onclick="recheck()"><svg viewBox="0 0 24 24" style="margin-right:4px"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>다시 확인</button>`;
-    updateConnectionSummary();
-    lastState.conn_html = data.conn_html;
-  }
-  
+  if (lastState.conn_html !== data.conn_html) renderConnection(data.conn_html);
+
   const currentTopicHtml = data.topic_section_html || renderTopic(data);
   if (lastState.topic_html !== currentTopicHtml) {
-    $("topicSection").innerHTML = currentTopicHtml;
+    replaceTopicSection(currentTopicHtml);
     syncAgentModelCards();
     lastState.topic_html = currentTopicHtml;
+    // 주제 영역을 통째로 갈아끼우면 실행 계획 상자도 비워지므로 다시 채운다.
+    if ($("executionPlan")) refreshExecutionPlan();
   }
 
   const hasTopic = !!data.topic;
@@ -790,12 +1177,17 @@ async function activateSession(id) {
   const session = sessionsById[id] || {};
   const label = session.name || session.topic || "선택한 세션";
   if (!confirm(`"${label}" 세션을 활성화할까요?\nCLI는 자동 실행되지 않습니다.`)) return;
-  const response = await fetch("/session/activate", {
+  const request = (extra = {}) => fetch("/session/activate", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ id }).toString(),
-  });
-  const data = await response.json();
+    body: new URLSearchParams({ id, ...extra }).toString(),
+  }).then((response) => response.json());
+  let data = await request();
+  // 세션 폴더가 현재 폴더와 다르면 서버가 확인을 요구한다. 사용자가 동의할 때만 다시 보낸다.
+  if (data.needs_workspace_confirm) {
+    if (!confirm(data.error)) return;
+    data = await request({ confirm_workspace: "true" });
+  }
   if (data.error) {
     alert(data.error);
     return;
@@ -819,7 +1211,11 @@ async function deleteManagedSession() {
   if (!confirm("이 세션과 저장된 메모리를 삭제할까요?")) return;
   const response = await fetch("/session/delete", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ id }).toString() });
   const data = await response.json();
-  if (data.error) alert(data.error); else { closeSessionActions(); viewingId = null; await loadSessions(); await poll(true); }
+  if (data.error) { alert(data.error); return; }
+  closeSessionActions();
+  // 보던 세션을 지웠으면 읽기 전용 화면을 닫고 현재 세션으로 돌아간다.
+  if (id === viewingId) await backToLive();
+  else await loadSessions();
 }
 
 async function openPromptPreview() {
@@ -852,50 +1248,106 @@ async function viewSession(id) {
   if (!r.ok) return;
   const data = await r.json();
   if (data.is_active) {
-    viewingId = null;
-    $("viewingBanner").style.display = "none";
-    $("controlPanel").style.display = "flex";
-    await poll(true);
-  } else {
-    viewingId = id;
-    $("feed").innerHTML = data.feed_html;
-    $("topicSection").innerHTML = data.topic_section_html || renderTopic(data);
-    $("viewingBanner").style.display = "flex";
-    $("controlPanel").style.display = "none";
-    $("approveBanner").style.display = "none";
-    $("thinkingIndicator")?.remove();
-    $("conversationScroll").scrollTop = 0;
-    lastState.feed_html = null;
-    lastState.topic_html = null;
-    updateInspector(data);
+    if (viewingId) await backToLive();
+    else await loadSessions();
+    return;
   }
+  viewingId = id;
+  $("feed").innerHTML = data.feed_html;
+  $("topicSection").innerHTML = data.topic_section_html || renderTopic(data);
+  $("viewingBanner").style.display = "flex";
+  $("controlPanel").style.display = "none";
+  $("approveBanner").style.display = "none";
+  $("thinkingIndicator")?.remove();
+  $("conversationScroll").scrollTop = 0;
+  updateInspector(data);
   await loadSessions();
 }
 
-function backToLive() {
+async function backToLive() {
   viewingId = null;
-  lastState.feed_html = null;
+  // 지난 세션을 보는 동안 덮어쓰거나 숨긴 영역을 다음 상태 반영 때 다시 그리게 한다.
+  liveFeedStale = true;
   lastState.topic_html = null;
+  lastState.showApprove = null;
   $("viewingBanner").style.display = "none";
   $("controlPanel").style.display = "flex";
-  poll(true);
-  loadSessions();
+  await poll(true);
+  await loadSessions();
+}
+
+const POLL_BASE_MS = 1800;
+const POLL_MAX_BACKOFF_MS = 30000;
+let pollFailures = 0;
+let pollTimer = null;
+
+let networkErrorMessage = "";
+
+/** 하단 오류 줄: 연결 오류가 먼저, 없으면 저장 실패. 둘 다 풀리면 지운다. */
+function renderComposerError() {
+  const message = networkErrorMessage || lastState.latestPayload?.save_error || "";
+  if (lastState.composerError === message) return;
+  lastState.composerError = message;
+  if (message) showInlineError("composerError", message);
+  else clearInlineError("composerError");
+}
+
+function setNetworkStatus(message) {
+  networkErrorMessage = message;
+  const box = $("mobileStatus");
+  if (box) box.textContent = message || lastState.status || "준비";
+  renderComposerError();
 }
 
 async function poll(force = false) {
   if (viewingId) return;
   try {
-    if (!force) {
-      const vr = await fetch("/version.json");
-      const vdata = await vr.json();
-      if (vdata.version === lastVersion) return;
+    let changed = force || liveFeedStale;
+    if (!changed) {
+      const vdata = await requestJson("/version.json");
+      changed = vdata.version !== lastVersion;
       lastVersion = vdata.version;
     }
-    const r = await fetch("/state.json");
-    const data = await r.json();
-    applyState(data);
-  } catch (_e) {}
+    if (changed) {
+      // feed_html은 받지 않는다 — 새 메시지는 /messages.json으로 증분 조회한다.
+      const data = await requestJson("/state.json");
+      if (liveFeedStale) await reloadLiveFeed(data);
+      if (viewingId) return;
+      applyState(data);
+      if (Number(data.message_count || 0) > feedCursor.last + 1) await fetchNewMessages();
+    }
+    if (pollFailures) setNetworkStatus("");
+    pollFailures = 0;
+  } catch (err) {
+    pollFailures += 1;
+    if (pollFailures >= 3) {
+      setNetworkStatus(`상태를 갱신하지 못했습니다: ${err.message} (자동 재시도 중)`);
+    }
+  }
 }
+
+/** 고정 간격 폭주 대신 제한된 backoff. 백그라운드 탭에서는 훨씬 느리게. */
+function nextPollDelay() {
+  if (document.hidden) return 15000;
+  if (!pollFailures) return POLL_BASE_MS;
+  return Math.min(POLL_MAX_BACKOFF_MS, POLL_BASE_MS * 2 ** Math.min(pollFailures, 5));
+}
+
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    if (!document.hidden) await poll(false);
+    schedulePoll();
+  }, nextPollDelay());
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    // 탭으로 돌아오면 즉시 한 번 맞춘다.
+    poll(true);
+  }
+  schedulePoll();
+});
 
 async function approveWork() {
   const btn = document.querySelector('.approve-banner button[onclick="approveWork()"]');
@@ -920,7 +1372,7 @@ async function approveWork() {
 }
 
 async function deferApproval() {
-  await fetch("/defer", { method: "POST" });
+  await postControl("/defer", "보류 요청이 실패했습니다");
   await poll(true);
 }
 
@@ -948,20 +1400,31 @@ function syncDirectAgentButtons() {
 
 async function submitTopic(startAgent = "") {
   const topic = $("topicInput").value.trim();
-  if (!topic) return;
+  if (!topic) {
+    // 예전에는 조용히 return 해서 왜 시작되지 않는지 알 수 없었다.
+    showInlineError("topicError", "먼저 주제나 질문을 입력해주세요.", "topicInput");
+    return;
+  }
+  clearInlineError("topicError");
   const modeEl = document.querySelector('input[name="mode"]:checked');
   const mode = modeEl ? modeEl.value : "discussion";
   const discussionAccessEl = document.querySelector('input[name="discussion_project_access"]:checked');
   const discussionProjectAccess = discussionAccessEl ? discussionAccessEl.value : "read";
   const agents = Array.from(document.querySelectorAll('input[name="agent"]:checked')).map((el) => el.value);
   if (!agents.length) {
-    alert("최소 한 명의 에이전트를 선택해주세요.");
+    showInlineError("topicError", "최소 한 명의 모델을 선택해주세요.", "topicInput");
     return;
   }
-  if (!agents.includes(startAgent)) {
-    alert("직접 호출할 Agent를 활성화한 뒤 다시 시도해주세요.");
+  // 기본 "시작하기"는 startAgent 없이 호출된다 — 서버가 첫 활성 모델부터 시작한다.
+  if (startAgent && !agents.includes(startAgent)) {
+    showInlineError(
+      "topicError",
+      "직접 호출하려는 모델이 비활성 상태입니다. 먼저 그 모델을 켜주세요.",
+      "topicInput",
+    );
     return;
   }
+  clearInlineError("topicError");
   const params = new URLSearchParams({ topic, mode, discussion_project_access: discussionProjectAccess });
   params.set("start_agent", startAgent);
   agents.forEach((agent) => params.append("agent", agent));
@@ -971,22 +1434,149 @@ async function submitTopic(startAgent = "") {
     if (model) params.set(`model_${agent}`, model.value);
     if (effort) params.set(`effort_${agent}`, effort.value);
   });
-  await fetch("/topic", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params.toString(),
-  });
-  location.reload();
+  const button = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
+  try {
+    await withBusy(button, "시작 중...", async () => {
+      const response = await fetch("/topic", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: params.toString(),
+      });
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try {
+          const payload = await response.json();
+          if (payload.error) detail = payload.error;
+        } catch (_e) { /* 본문이 JSON이 아니면 상태 코드만 보여준다 */ }
+        throw new Error(detail);
+      }
+      location.reload();
+    });
+  } catch (err) {
+    showInlineError("topicError", `시작하지 못했습니다: ${err.message}`, "topicInput");
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// 실행 전 계획 표시
+// ──────────────────────────────────────────────────────────────
+/** 시작 버튼을 누르기 전에 "무엇이 몇 번 실행되는지"를 보여준다. */
+async function refreshExecutionPlan() {
+  const box = $("executionPlan");
+  if (!box) return;
+  const mode = document.querySelector('input[name="mode"]:checked')?.value || "discussion";
+  const access = document.querySelector('input[name="discussion_project_access"]:checked')?.value || "read";
+  const agents = Array.from(document.querySelectorAll('input[name="agent"]:checked')).map((el) => el.value);
+  const params = new URLSearchParams({ mode, access });
+  agents.forEach((agent) => params.append("agent", agent));
+  try {
+    const plan = await requestJson(`/plan.json?${params.toString()}`);
+    const calls = plan.min_calls === plan.max_calls
+      ? `${plan.min_calls}회`
+      : `${plan.min_calls}~${plan.max_calls}회`;
+    const rows = [
+      ["실행 모드", plan.mode_label],
+      ["호출될 모델", `${plan.agent_count}명 (${plan.agent_labels.join(", ")})`],
+      ["예상 모델 호출", calls],
+      ["프로젝트 권한", plan.project_access_label],
+      ["작업 폴더", plan.workspace_ok ? plan.workspace_path : `차단됨 — ${plan.workspace_message}`],
+      ["자동 검증", plan.auto_validation ? "실행함" : "실행하지 않음"],
+    ];
+    const warning = plan.long_running_warning
+      ? '<p class="execution-plan-warning">단계가 많아 실행 시간이 길어질 수 있습니다.</p>'
+      : "";
+    const blocked = plan.workspace_ok
+      ? ""
+      : '<p class="execution-plan-warning">작업 폴더가 유효하지 않아 실행이 차단됩니다.</p>';
+    box.innerHTML =
+      `<div class="execution-plan-title">실행 계획</div>` +
+      rows.map(([label, value]) =>
+        `<div class="execution-plan-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`
+      ).join("") +
+      (plan.note ? `<p class="execution-plan-note">${escapeHtml(plan.note)}</p>` : "") +
+      warning + blocked;
+  } catch (err) {
+    box.textContent = `실행 계획을 불러오지 못했습니다: ${err.message}`;
+  }
+}
+
+/** 세부 설정 접기/펼치기. 접힌 상태의 컨트롤은 hidden이라 탭 순서에도 안 남는다. */
+function toggleStartOptions() {
+  const box = document.getElementById("startOptions");
+  const button = document.getElementById("startOptionsToggle");
+  if (!box || !button) return;
+  const willOpen = box.hidden;
+  box.hidden = !willOpen;
+  button.setAttribute("aria-expanded", String(willOpen));
+  button.textContent = willOpen ? "세부 설정 닫기" : "세부 설정";
+  if (willOpen) refreshExecutionPlan();
+}
+
+// ──────────────────────────────────────────────────────────────
+// 모바일 패널 (세션 목록 / 상태 인스펙터)
+// ──────────────────────────────────────────────────────────────
+// display:none으로 정보를 없애지 않고, 접이식 패널로 접근할 수 있게 한다.
+let openMobilePanel = null;
+
+function toggleMobilePanel(which) {
+  if (openMobilePanel === which) { closeMobilePanels(); return; }
+  openMobilePanel = which;
+  const sidebar = $("sidebarPanel");
+  const inspector = $("inspectorPanel");
+  const scrim = $("mobileScrim");
+  sidebar?.classList.toggle("is-open", which === "sessions");
+  inspector?.classList.toggle("is-open", which === "inspector");
+  document.body.classList.add("mobile-panel-open");
+  if (scrim) scrim.hidden = false;
+  $("mobileSessionsButton")?.setAttribute("aria-expanded", String(which === "sessions"));
+  $("mobileInspectorButton")?.setAttribute("aria-expanded", String(which === "inspector"));
+  const panel = which === "sessions" ? sidebar : inspector;
+  panel?.querySelector(".mobile-panel-close")?.focus();
+}
+
+function closeMobilePanels() {
+  openMobilePanel = null;
+  $("sidebarPanel")?.classList.remove("is-open");
+  $("inspectorPanel")?.classList.remove("is-open");
+  document.body.classList.remove("mobile-panel-open");
+  const scrim = $("mobileScrim");
+  if (scrim) scrim.hidden = true;
+  $("mobileSessionsButton")?.setAttribute("aria-expanded", "false");
+  $("mobileInspectorButton")?.setAttribute("aria-expanded", "false");
+}
+
+// 키보드만으로도 패널을 닫을 수 있어야 한다.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && openMobilePanel) {
+    closeMobilePanels();
+    $("mobileInspectorButton")?.focus();
+  }
+});
+
+/** 제어 요청을 보내고, 실패하면 조용히 넘어가지 않고 알린다. 성공하면 응답을 돌려준다. */
+async function postControl(url, failMessage) {
+  try {
+    const data = await postForm(url);
+    if (data.error) throw new Error(data.error);
+    return data;
+  } catch (err) {
+    alert(`${failMessage}: ${err.message}`);
+    return null;
+  }
 }
 
 async function recheck() {
+  const previous = lastState.conn_html;
   $("conn").innerHTML = '<span class="conn-item">확인 중...</span>';
-  await fetch("/preflight", { method: "POST" });
+  // 결과가 이전과 같아도 연결 막대를 다시 그려야 "확인 중..."에 멈추지 않는다.
+  const data = await postControl("/preflight", "연결 확인에 실패했습니다");
+  renderConnection(data ? data.conn_html : previous);
   await poll(true);
 }
 
 async function ctrl(action) {
-  await fetch(`/${action}`, { method: "POST" });
+  const labels = { pause: "일시정지", resume: "재개" };
+  await postControl(`/${action}`, `${labels[action] || action} 요청이 실패했습니다`);
   await poll(true);
 }
 
@@ -1064,7 +1654,7 @@ async function saveProfileEditor() {
 
 async function stopSession() {
   if (!confirm("중단할까요? 현재 실행 중인 CLI도 즉시 종료됩니다.")) return;
-  await fetch("/stop", { method: "POST" });
+  await postControl("/stop", "중단 요청이 실패했습니다");
   await poll(true);
 }
 
@@ -1149,21 +1739,6 @@ async function saveAgentRoles(source = "card") {
   } finally {
     button.disabled = false;
   }
-}
-
-async function saveBudget() {
-  const params = new URLSearchParams({
-    token_limit: $("budgetTokenLimit").value || "0",
-    cost_limit_usd: $("budgetCostLimit").value || "0",
-  });
-  const response = await fetch("/budget", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params.toString(),
-  });
-  const data = await response.json();
-  if (data.error) alert(data.error);
-  else applyState(data);
 }
 
 async function rollbackSelectedFiles(button) {
@@ -1262,7 +1837,11 @@ async function sendApprovalMessage() {
   }
 }
 
-setInterval(() => poll(false), 1800);
-setInterval(loadSessions, 4000);
+// 최초 진입 시 실행 계획을 바로 보여준다 (무엇이 몇 번 실행되는지).
+if (document.getElementById("executionPlan")) refreshExecutionPlan();
+schedulePoll();
+// 세션 목록은 변경이 있을 때만 다시 그린다 (renderSessionList 내부에서 서명 비교).
+setInterval(() => { if (!document.hidden) loadSessions(); }, 6000);
+initGuideCarousel();
 poll(true);
 loadSessions();

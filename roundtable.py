@@ -48,6 +48,7 @@ import queue
 import re
 import shlex
 import shutil
+import traceback
 import subprocess
 import sys
 import tempfile
@@ -55,11 +56,25 @@ import threading
 import time
 import webbrowser
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from triagent.domain import workflow
+from triagent.domain import clicheck, runstatus, usage as usage_domain, validation, workflow
+from triagent.domain.workspace import (
+    WorkspaceStatus,
+    parse_project_path_file,
+    resolve_workspace,
+    workspace_matches,
+)
+from triagent.security import webguard
+from triagent.security.paths import (
+    UnsafePathError,
+    UnsafeSessionIdError,
+    is_valid_session_id,
+    safe_child,
+    validate_session_id,
+)
 
 for stream in (sys.stdout, sys.stderr):
     try:
@@ -125,6 +140,47 @@ def cancel_active_cli_processes() -> list[str]:
             if process.poll() is not None:
                 ACTIVE_PROCESSES.pop(tool_name, None)
     return cancelled
+
+
+def run_process_tree(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    input_bytes: bytes | None = None,
+    timeout: float | None = None,
+    active_name: str | None = None,
+) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True)과 같지만 시간 초과 시 프로세스 트리 전체를 끝낸다.
+
+    subprocess.run은 직계 자식만 죽인 뒤 communicate()로 파이프가 닫히길 끝없이 기다린다.
+    npm.cmd(cmd.exe) → node처럼 손자가 파이프를 물고 있으면 워커가 영원히 멈춘다.
+    ``active_name``을 주면 실행 중에 /stop이 이 프로세스 트리를 끝낼 수 있다.
+    """
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdin=subprocess.PIPE if input_bytes is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if active_name:
+        with ACTIVE_PROCESS_LOCK:
+            ACTIVE_PROCESSES[active_name] = process
+    try:
+        stdout, stderr = process.communicate(input_bytes, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        terminate_process_tree(process)
+        try:
+            exc.output, exc.stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass  # 트리 밖으로 빠져나간 손자가 아직 파이프를 쥐고 있다 — 출력 없이 포기한다.
+        raise exc
+    finally:
+        if active_name:
+            with ACTIVE_PROCESS_LOCK:
+                if ACTIVE_PROCESSES.get(active_name) is process:
+                    ACTIVE_PROCESSES.pop(active_name, None)
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 SESSION_PROFILE_TEMPLATE = """# Session Role Profile
 
@@ -237,23 +293,82 @@ def ensure_project_path_file() -> None:
         PROJECT_PATH_FILE.write_text(DEFAULT_PROJECT_PATH_CONTENT, encoding="utf-8")
 
 
-def load_project_path() -> Path:
-    """PROJECT_PATH.txt에 적힌 경로를 매번 새로 읽는다 (실행 중 바꿔도 다음 턴부터 반영)."""
+class WorkspaceUnavailable(RuntimeError):
+    """작업 폴더가 유효하지 않아 실행을 진행할 수 없다."""
+
+    def __init__(self, resolution) -> None:
+        super().__init__(resolution.message)
+        self.resolution = resolution
+        self.status = resolution.status
+        self.configured = resolution.configured
+
+
+# 작업공간 경고를 상태 조회마다 반복 출력하지 않기 위한 기억. 상태가 바뀔 때만 찍는다.
+_WORKSPACE_WARNING_STATE: dict[str, object] = {"signature": "", "seen": set()}
+
+
+def read_configured_project_path() -> str:
+    """PROJECT_PATH.txt에 적힌 경로 원문을 돌려준다 (검증하지 않음)."""
     ensure_project_path_file()
     try:
-        lines = PROJECT_PATH_FILE.read_text(encoding="utf-8").splitlines()
+        return parse_project_path_file(PROJECT_PATH_FILE.read_text(encoding="utf-8"))
     except OSError:
-        return ROOT
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        candidate = Path(line).expanduser()
-        if candidate.is_dir():
-            return candidate.resolve()
-        print(f"  ⚠️  PROJECT_PATH.txt의 경로를 찾을 수 없습니다: {line} — 기본 폴더({ROOT})를 사용합니다.")
-        return ROOT
-    return ROOT
+        return ""
+
+
+def resolve_project_workspace(require_write: bool = False):
+    """현재 설정된 작업공간을 해석한다. 실패하면 대체하지 않고 차단 상태를 돌려준다.
+
+    예전에는 경로가 없으면 조용히 ROOT(=TriAgent 코드 폴더)로 바꿔서, 세션에는 옛
+    프로젝트가 적혀 있는데 실제 실행은 이 도구 폴더에서 일어날 수 있었다.
+    이제는 fail closed — 유효한 폴더를 다시 고를 때까지 읽기도 쓰기도 막는다.
+    """
+    resolution = resolve_workspace(read_configured_project_path(), require_write=require_write)
+
+    # 경고는 상태가 바뀔 때 한 번만 남긴다 (폴링 때문에 무한 반복되던 문제).
+    # require_write는 호출부마다 달라서 서명에 넣으면 두 값이 번갈아 찍힌다.
+    # 상태(status)와 설정 경로가 바뀔 때만 한 번 남긴다.
+    signature = f"{resolution.status}:{resolution.configured}"
+    seen = _WORKSPACE_WARNING_STATE["seen"]
+    if resolution.blocked:
+        if signature not in seen:
+            seen.add(signature)
+            _WORKSPACE_WARNING_STATE["signature"] = signature
+            print(f"  ⚠️  작업 폴더를 사용할 수 없습니다 — {resolution.message}")
+            print("      대시보드에서 '작업 폴더 선택'으로 유효한 폴더를 지정할 때까지 모델 실행이 차단됩니다.")
+    elif _WORKSPACE_WARNING_STATE["signature"]:
+        # 정상으로 돌아왔으면 다음 차단 때 다시 알릴 수 있도록 기억을 비운다.
+        _WORKSPACE_WARNING_STATE["signature"] = ""
+        seen.clear()
+    return resolution
+
+
+def load_project_path() -> Path:
+    """유효한 작업 폴더를 돌려준다. 없으면 :class:`WorkspaceUnavailable`.
+
+    호출부가 예외를 잡지 않고 그냥 쓰던 자리를 위해, 읽기 전용 맥락에서는
+    :func:`project_path_or_none`을 쓰는 편이 안전하다.
+    """
+    resolution = resolve_project_workspace()
+    if resolution.blocked or resolution.path is None:
+        raise WorkspaceUnavailable(resolution)
+    return resolution.path
+
+
+def project_path_or_none() -> Path | None:
+    resolution = resolve_project_workspace()
+    return resolution.path if resolution.ok else None
+
+
+def workspace_block_message(resolution) -> str:
+    """차단 사유 + 원래 저장된 경로 + 다음 행동을 한 문단으로 정리한다."""
+    configured = resolution.configured or "(설정 없음)"
+    return (
+        f"{resolution.message}\n"
+        f"저장된 경로: {configured}\n"
+        "대시보드의 '작업 폴더 선택'에서 유효한 폴더를 지정하기 전까지 "
+        "읽기와 쓰기 모두 실행하지 않습니다."
+    )
 
 
 def save_project_path(path: Path) -> None:
@@ -290,6 +405,9 @@ AGY_CMD = os.environ.get("AGY_CMD", "agy")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "900"))
 AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "600"))
+#: CLI가 끝난 뒤 남은 출력을 기다리는 시간. 그 뒤에도 파이프가 열려 있으면 CLI가 띄운
+#: 자식(개발 서버 등)이 물려받은 것이므로 더 기다리지 않는다.
+CLI_PIPE_DRAIN_SECONDS = 2.0
 PORT = int(os.environ.get("ROUNDTABLE_PORT", "8765"))
 # 프롬프트에 매번 재전송할 최근 대화 개수 — 전체 기록은 roundtable_memory/<id>/full.md에
 # 남기고, 프롬프트에는 요약 + 최근 메시지만 넣어 토큰 낭비를 줄인다.
@@ -740,6 +858,10 @@ def discussion_project_access_label(value: str | None) -> str:
 
 def turn_project_access(cli_mode: str, state: dict | None = None) -> str:
     current = state if isinstance(state, dict) else globals().get("STATE", {})
+    if current.get("mode") == "quick":
+        # 빠른 질문은 기본 읽기 전용이고, 쓰기는 어떤 경로로도 허용하지 않는다.
+        access = normalize_discussion_project_access(current.get("discussion_project_access"))
+        return "read" if access == "read" else "none"
     if cli_mode == "coding":
         return "write"
     if current.get("mode") == "coding":
@@ -748,8 +870,13 @@ def turn_project_access(cli_mode: str, state: dict | None = None) -> str:
 
 
 def cli_working_directory(cli_mode: str) -> Path:
-    if turn_project_access(cli_mode) != "none":
-        return load_project_path()
+    access = turn_project_access(cli_mode)
+    if access != "none":
+        # read/write 어느 쪽이든 유효한 폴더가 없으면 실행 자체를 막는다.
+        resolution = resolve_project_workspace(require_write=access == "write")
+        if resolution.blocked or resolution.path is None:
+            raise WorkspaceUnavailable(resolution)
+        return resolution.path
     NO_PROJECT_DIR.mkdir(parents=True, exist_ok=True)
     return NO_PROJECT_DIR
 
@@ -821,6 +948,8 @@ def make_confirm_step(enabled_agents: list[str]) -> tuple[str, str, str, str]:
 
 def steps_for_mode(mode: str, enabled_agents: list[str] | None = None) -> list[tuple[str, str, str, str]]:
     enabled = normalize_enabled_agents(enabled_agents)
+    if mode == "quick":
+        return quick_steps(enabled)
     discussion_steps = order_steps_by_agents([
         (agent, phase, instruction + (role_choice_instruction() if phase in {"역할 선언", "역할 확정"} else ""), cli_mode)
         for agent, phase, instruction, cli_mode in DISCUSSION_STEPS
@@ -853,7 +982,14 @@ def separator(title: str) -> None:
 
 def command_parts(command: str) -> list[str]:
     try:
-        return shlex.split(command)
+        if os.name != "nt":
+            return shlex.split(command)
+        # POSIX 규칙은 백슬래시를 이스케이프로 먹는다 (C:\tools\codex.cmd → C:toolscodex.cmd).
+        # Windows 규칙으로 나누고 감싼 따옴표만 벗긴다.
+        return [
+            part[1:-1] if len(part) > 1 and part[0] == part[-1] and part[0] in "\"'" else part
+            for part in shlex.split(command, posix=False)
+        ]
     except ValueError:
         return [command]
 
@@ -991,7 +1127,8 @@ def capture_project_texts(root: Path, max_total_bytes: int = 5_000_000) -> dict[
                 size = path.stat().st_size
                 if size > 512_000 or total + size > max_total_bytes:
                     continue
-                text = path.read_text(encoding="utf-8")
+                # read_text는 \r\n을 \n으로 바꾼다. 롤백 패치가 원래 줄 끝과 맞도록 그대로 읽는다.
+                text = path.read_bytes().decode("utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
             contents[path.relative_to(root).as_posix()] = text
@@ -999,67 +1136,147 @@ def capture_project_texts(root: Path, max_total_bytes: int = 5_000_000) -> dict[
     return contents
 
 
-def build_turn_diff(root: Path, before: dict[str, str], changed_paths: list[dict]) -> str:
+def _split_lines_keep_ends(text: str) -> list[str]:
+    """\\n에서만 나누고 줄 끝(\\r\\n 포함)은 그대로 둔다 — git apply가 줄을 보는 방식과 같다."""
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def build_turn_diff(
+    root: Path, before: dict[str, str], changed_paths: list[dict], max_chars: int = 100_000
+) -> str:
+    """`git apply --reverse`로 정확히 되돌릴 수 있는 패치를 만든다.
+
+    * 줄 끝을 바꾸지 않는다 — LF·CRLF 파일 모두 바이트 그대로 복원된다.
+    * 변경 전 내용을 저장하지 못한 파일(크기·예산 초과)은 패치에서 뺀다. 예전에는 빈
+      내용과 비교해서, 되돌리면 파일이 통째로 비워졌다.
+    * 한도는 파일 단위로 적용한다. 헝크 중간에서 자르면 패치 전체가 깨진다.
+    """
     chunks = []
+    total = 0
     for item in changed_paths[:50]:
         relative = item["path"].rstrip("/")
         if not relative or item["path"].endswith("/"):
             continue
+        created = item.get("change") == "생성"
+        if not created and relative not in before:
+            continue
         path = root / relative
-        old_text = before.get(relative, "")
         try:
-            new_text = path.read_text(encoding="utf-8") if path.exists() else ""
+            deleted = not path.exists()
+            new_text = "" if deleted else path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        diff = difflib.unified_diff(
-            old_text.splitlines(), new_text.splitlines(),
-            fromfile=f"a/{relative}", tofile=f"b/{relative}", lineterm="",
-        )
-        chunk = "\n".join(diff)
-        if chunk:
-            chunks.append(chunk)
-    combined = "\n\n".join(chunks)
-    return (combined + "\n")[:100_000] if combined else ""
+        lines = []
+        for line in difflib.unified_diff(
+            _split_lines_keep_ends("" if created else before[relative]),
+            _split_lines_keep_ends(new_text),
+            fromfile="/dev/null" if created else f"a/{relative}",
+            tofile="/dev/null" if deleted else f"b/{relative}",
+        ):
+            if not line.endswith("\n"):
+                line += "\n\\ No newline at end of file\n"
+            lines.append(line)
+        chunk = "".join(lines)
+        if not chunk or total + len(chunk) > max_chars:
+            continue
+        chunks.append(chunk)
+        total += len(chunk)
+    return "".join(chunks)
 
 
-def save_turn_checkpoint(session_id: str, step_index: int, agent: str, turn_diff: str) -> str:
+def checkpoint_patch_paths(patch_text: str) -> set[str]:
+    """패치에 실제로 들어 있는 파일 경로 — 여기 없는 파일은 되돌릴 수 없다."""
+    return {
+        match.group(1)
+        for match in re.finditer(r"^(?:---|\+\+\+) [ab]/(.+?)\r?$", patch_text, re.MULTILINE)
+    }
+
+
+def checkpoint_dir(session_id: str) -> Path:
+    return safe_child(session_memory_dir(session_id), "checkpoints")
+
+
+def checkpoint_meta_path(patch_path: Path) -> Path:
+    return patch_path.with_suffix(".json")
+
+
+def save_turn_checkpoint(
+    session_id: str,
+    step_index: int,
+    agent: str,
+    turn_diff: str,
+    workspace: Path | None = None,
+) -> str:
+    """턴 diff를 체크포인트로 저장한다.
+
+    소유권 정보(세션 ID + 작업공간)를 옆에 같이 남긴다. 이게 없으면 "MEMORY_DIR
+    아래에 있다"는 이유만으로 다른 세션·다른 프로젝트의 패치가 적용될 수 있다.
+    """
     if not turn_diff:
         return ""
-    directory = session_memory_dir(session_id) / "checkpoints"
+    directory = checkpoint_dir(session_id)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{step_index:03d}_{agent}.patch"
-    path.write_text(turn_diff, encoding="utf-8")
+    # step_index는 목표 사이클·개입·재시도 동안 그대로라 이름이 겹친다. 시각을 붙여 덮어쓰지 않는다.
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = safe_child(directory, f"{step_index:03d}_{agent}_{stamp}.patch")
+    # newline=""로 써야 Windows에서 \n이 \r\n으로 바뀌지 않는다 (원래 줄 끝 보존).
+    path.write_text(turn_diff, encoding="utf-8", newline="")
+    atomic_write_json(checkpoint_meta_path(path), {
+        "session_id": validate_session_id(session_id),
+        "workspace_path": str(workspace) if workspace else "",
+        "agent": agent,
+        "step_index": step_index,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    })
     return str(path)
 
 
-def detect_validation_commands(root: Path) -> list[tuple[str, list[str]]]:
-    commands: list[tuple[str, list[str]]] = []
-    package_json = root / "package.json"
-    if package_json.exists():
-        try:
-            scripts = json.loads(package_json.read_text(encoding="utf-8")).get("scripts", {})
-        except (OSError, json.JSONDecodeError):
-            scripts = {}
-        npm = shutil.which("npm.cmd") or shutil.which("npm") or "npm"
-        if scripts.get("test") and "no test specified" not in scripts["test"]:
-            commands.append(("npm test", [npm, "test", "--", "--runInBand"]))
-        if scripts.get("build"):
-            commands.append(("npm run build", [npm, "run", "build"]))
-    if (root / "tests").is_dir() and any((root / "tests").glob("test*.py")):
-        if importlib.util.find_spec("pytest") is not None:
-            commands.append(("Python pytest", [sys.executable, "-m", "pytest", "-q"]))
-        else:
-            commands.append(("Python unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests"]))
-    return commands[:2]
+def current_tool_environment() -> validation.ToolEnvironment:
+    """검증 명령 탐지에 필요한 바깥 환경을 지금 값으로 채운다.
+
+    ``excluded_roots``에 TriAgent 자신의 폴더를 넣는 게 핵심이다. 이게 없으면
+    TriAgent를 대상으로 코딩 모드를 돌릴 때 자동 검증이
+    ``python -m unittest discover -s tests``를 자식 프로세스로 띄우고, 그 테스트가
+    다시 워커를 돌려 자기 자신을 무한히 재귀 실행한다.
+    """
+    npm = shutil.which("npm.cmd") or shutil.which("npm")
+    return validation.ToolEnvironment(
+        python_executable=sys.executable,
+        npm_executable=npm or "npm",
+        has_pytest=importlib.util.find_spec("pytest") is not None,
+        has_npm=npm is not None,
+        excluded_roots=(str(ROOT),),
+    )
 
 
-def run_project_validation(root: Path) -> list[dict]:
+def detect_validation_commands(
+    root: Path, environment: validation.ToolEnvironment | None = None
+) -> list[tuple[str, list[str]]]:
+    """순수 탐지 로직은 triagent.domain.validation에 있다 (환경 주입 가능)."""
+    return validation.detect_validation_commands(
+        root, environment or current_tool_environment()
+    )
+
+
+def run_project_validation(
+    root: Path, environment: validation.ToolEnvironment | None = None
+) -> list[dict]:
     results = []
-    for label, command in detect_validation_commands(root):
+    for label, command in detect_validation_commands(root, environment):
         started = time.time()
         try:
-            result = subprocess.run(command, cwd=root, capture_output=True, timeout=180)
-            output = decode_cli_output(result.stdout or result.stderr).strip()
+            result = run_process_tree(command, cwd=root, timeout=180, active_name="자동 검증")
+            if CONTROL["stopped"]:
+                break  # /stop이 검증을 끊었다 — 끊긴 결과를 실패로 기록하지 않는다.
+            # unittest는 결과를 stderr에, pytest는 stdout에 쓴다. 둘 다 남긴다.
+            output = "\n".join(
+                part for part in (decode_cli_output(result.stdout).strip(),
+                                  decode_cli_output(result.stderr).strip()) if part
+            )
             results.append({
                 "label": label,
                 "ok": result.returncode == 0,
@@ -1070,6 +1287,32 @@ def run_project_validation(root: Path) -> list[dict]:
         except (OSError, subprocess.TimeoutExpired) as exc:
             results.append({"label": label, "ok": False, "returncode": -1, "elapsed": round(time.time() - started, 1), "output": str(exc)})
     return results
+
+
+def run_validation_for_current_workspace() -> list[dict]:
+    """현재 작업공간에서 자동 검증을 실행한다.
+
+    작업 폴더가 막혀 있거나 TriAgent 자신을 가리키면 실행하지 않는다 — 후자는
+    unittest가 자기 자신을 자식 프로세스로 다시 띄우는 무한 재귀가 된다.
+    """
+    resolution = resolve_project_workspace()
+    if resolution.blocked or resolution.path is None:
+        add_runtime_event(f"자동 검증 건너뜀 — {resolution.message}", "warn")
+        return []
+    environment = current_tool_environment()
+    commands = detect_validation_commands(resolution.path, environment)
+    if not commands:
+        try:
+            same_as_self = resolution.path.resolve() == ROOT.resolve()
+        except OSError:
+            same_as_self = False
+        if same_as_self:
+            add_runtime_event(
+                "자동 검증 건너뜀 — 작업 폴더가 TriAgent 자신이라 테스트 재귀 실행을 막았습니다.",
+                "warn",
+            )
+        return []
+    return run_project_validation(resolution.path, environment)
 
 
 def parse_cli_stream_event(tool_name: str, line: str) -> tuple[dict | None, str | None]:
@@ -1168,9 +1411,6 @@ def run_cli(
             )
             with ACTIVE_PROCESS_LOCK:
                 ACTIVE_PROCESSES[tool_name] = process
-            if input_text is not None and process.stdin is not None:
-                process.stdin.write(input_text.encode("utf-8"))
-                process.stdin.close()
 
             output_queue: queue.Queue = queue.Queue()
 
@@ -1179,10 +1419,22 @@ def run_cli(
                     output_queue.put((name, raw_line))
                 output_queue.put((name, None))
 
+            def write_stdin() -> None:
+                # 읽기 스레드와 함께 돌려야 큰 프롬프트를 쓰는 동안 출력 파이프가 차서 서로
+                # 기다리지 않는다. CLI가 먼저 끝나 파이프가 닫히면(BrokenPipeError) 진짜 원인은
+                # stderr와 종료 코드에 남으므로 여기서는 삼킨다.
+                try:
+                    process.stdin.write(input_text.encode("utf-8"))
+                    process.stdin.close()
+                except OSError:
+                    pass
+
             threads = [
                 threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
                 threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
             ]
+            if input_text is not None and process.stdin is not None:
+                threads.append(threading.Thread(target=write_stdin, daemon=True))
             for thread in threads:
                 thread.start()
 
@@ -1191,10 +1443,23 @@ def run_cli(
             final_messages: list[str] = []
             closed_streams = 0
             deadline = time.monotonic() + timeout if timeout else None
+            exited_at = None
             while closed_streams < 2:
-                if deadline and time.monotonic() >= deadline:
+                now = time.monotonic()
+                if deadline and now >= deadline:
                     terminate_process_tree(process)
-                    raise subprocess.TimeoutExpired(cmd, timeout)
+                    raise subprocess.TimeoutExpired(
+                        cmd, timeout,
+                        output="\n".join(final_messages or stdout_lines),
+                        stderr="\n".join(stderr_lines),
+                    )
+                if exited_at is None:
+                    if process.poll() is not None:
+                        exited_at = now
+                elif now - exited_at >= CLI_PIPE_DRAIN_SECONDS and output_queue.empty():
+                    # CLI는 끝났는데 CLI가 띄운 자식(개발 서버 등)이 출력 파이프를 물려받아
+                    # 붙잡고 있다. 기다리면 시간 초과까지 멈추고 끝난 답변을 버리게 된다.
+                    break
                 try:
                     stream_name, raw_line = output_queue.get(timeout=0.2)
                 except queue.Empty:
@@ -1218,11 +1483,10 @@ def run_cli(
             stdout = "\n".join(final_messages) if final_messages else "\n".join(stdout_lines)
             return subprocess.CompletedProcess(cmd, returncode, stdout, "\n".join(stderr_lines))
 
-        result = subprocess.run(
+        result = run_process_tree(
             cmd,
             cwd=cwd or ROOT,
-            capture_output=True,
-            input=input_text.encode("utf-8") if input_text is not None else None,
+            input_bytes=input_text.encode("utf-8") if input_text is not None else None,
             timeout=timeout,
         )
         return subprocess.CompletedProcess(
@@ -1235,12 +1499,18 @@ def run_cli(
         print_cli_hint(tool_name, command, f"명령을 찾을 수 없음 ({exc})")
     except PermissionError as exc:
         print_cli_hint(tool_name, command, f"권한 거부 ({exc})")
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         with ACTIVE_PROCESS_LOCK:
             active = ACTIVE_PROCESSES.get(tool_name)
             if active is not None and active.poll() is not None:
                 ACTIVE_PROCESSES.pop(tool_name, None)
         print_cli_hint(tool_name, command, "실행 시간 초과")
+        # "실행하지 못함"과 구분하고, 시간 초과 전까지 받은 부분 출력을 보존한다.
+        result = subprocess.CompletedProcess(
+            cmd, -1, decode_cli_output(exc.output), decode_cli_output(exc.stderr)
+        )
+        result.timed_out = timeout
+        return result
     return None
 
 
@@ -1270,26 +1540,199 @@ CONNECTION_TARGETS = [
 ]
 
 
-def run_connection_checks() -> bool:
+#: 격리된 사전 점검 전용 폴더. 절대 프로젝트 폴더에서 읽기/쓰기 검사를 하지 않는다.
+PREFLIGHT_DIR = Path(tempfile.gettempdir()) / "triagent-preflight"
+
+CLI_PROBE_TIMEOUT = int(os.environ.get("ROUNDTABLE_PROBE_TIMEOUT", "120"))
+
+
+def _probe_runner(command: str):
+    """clicheck에 주입할 프로세스 실행기. 실제 CLI가 없는 테스트에서는 교체된다."""
+
+    def run(args: list[str]) -> clicheck.CommandResult:
+        try:
+            result = run_process_tree(resolve_command(command) + args, timeout=30)
+        except FileNotFoundError:
+            return clicheck.CommandResult(returncode=127, not_found=True)
+        except PermissionError as exc:
+            return clicheck.CommandResult(returncode=126, stderr=str(exc))
+        except subprocess.TimeoutExpired:
+            return clicheck.CommandResult(returncode=124, timed_out=True)
+        return clicheck.CommandResult(
+            returncode=result.returncode,
+            stdout=decode_cli_output(result.stdout),
+            stderr=decode_cli_output(result.stderr),
+        )
+
+    return run
+
+
+def _make_probe_workspace(name: str) -> Path:
+    """점검용 임시 폴더를 깨끗하게 만든다 (프로젝트 폴더와 완전히 분리)."""
+    directory = PREFLIGHT_DIR / name
+    if directory.exists():
+        shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _codex_help_text() -> str:
+    try:
+        result = run_process_tree(resolve_command(CODEX_CMD) + ["exec", "--help"], timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return decode_cli_output(result.stdout) + decode_cli_output(result.stderr)
+
+
+def codex_write_args() -> list[str]:
+    """이 Codex 버전에서 쓰기 실행에 쓸 인자.
+
+    옵션 이름을 추측하지 않고 `codex exec --help` 출력에서 실제로 존재하는 것만
+    고른다. 0.148.0에서는 --approve-for-me가 --sandbox와 배타적이라, 둘을 같이
+    넘기면 인자 오류로 즉시 죽는다.
+    """
+    cached = (CONNECTION_STATUS.get("codex") or {}).get("features", {}).get("write_args")
+    if cached:
+        return list(cached)
+    return clicheck.detect_codex_write_flags(_codex_help_text())
+
+
+def _cli_read_probe(key: str, command: str) -> tuple[bool, str]:
+    """격리된 폴더의 파일을 CLI가 실제로 읽는지 확인한다."""
+    directory = _make_probe_workspace(f"{key}-read")
+    marker = "TRIAGENT_READ_PROBE_7F3A"
+    (directory / "probe.txt").write_text(marker + "\n", encoding="utf-8")
+    prompt = (
+        "Read the file probe.txt in the current working directory and reply with "
+        "its exact contents and nothing else."
+    )
+    try:
+        response = _run_probe_cli(key, command, prompt, directory, write=False)
+    except Exception as exc:  # noqa: BLE001 - 어떤 실패든 점검 실패로 보고한다
+        return False, f"읽기 검사 실행 실패: {type(exc).__name__}"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    if response is None:
+        return False, "읽기 검사에서 CLI가 응답하지 않았습니다."
+    if marker in response:
+        return True, "격리된 폴더의 파일을 읽었습니다."
+    return False, f"파일 내용을 읽지 못했습니다. 응답 일부: {clicheck.redact(response, 200)}"
+
+
+def _cli_write_probe(key: str, command: str) -> tuple[bool, str]:
+    """격리된 폴더에 CLI가 실제로 파일을 쓰는지 확인하고 내용까지 검증한다."""
+    directory = _make_probe_workspace(f"{key}-write")
+    marker = "TRIAGENT_WRITE_PROBE_9C21"
+    prompt = (
+        "Create a file named probe_out.txt in the current working directory whose "
+        f"entire content is exactly {marker}. Then reply DONE."
+    )
+    target = directory / "probe_out.txt"
+    try:
+        response = _run_probe_cli(key, command, prompt, directory, write=True)
+        if not target.is_file():
+            return False, (
+                "파일이 생성되지 않았습니다. 응답 일부: "
+                f"{clicheck.redact(response or '', 240)}"
+            )
+        written = target.read_text(encoding="utf-8", errors="replace").strip()
+        if marker not in written:
+            return False, f"파일은 만들어졌지만 내용이 다릅니다: {written[:120]!r}"
+        return True, "격리된 폴더에 파일을 쓰고 내용까지 확인했습니다."
+    except Exception as exc:  # noqa: BLE001
+        return False, f"쓰기 검사 실행 실패: {type(exc).__name__}"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _run_probe_cli(key: str, command: str, prompt: str, directory: Path, write: bool) -> str | None:
+    """점검용 최소 인자로 CLI를 한 번 호출한다. 인증정보는 인자에 넣지 않는다."""
+    if key == "codex":
+        args = ["exec", "--ephemeral", "--skip-git-repo-check"]
+        args += codex_write_args() if write else ["--sandbox", "read-only"]
+        args += ["--cd", str(directory), "-"]
+        result = run_cli("Codex", command, args, timeout=CLI_PROBE_TIMEOUT,
+                         cwd=directory, input_text=prompt)
+    elif key == "claude":
+        args = ["--print", "--safe-mode", "--no-session-persistence"]
+        args += (["--tools", "Bash,Edit,Read,Write,Glob,Grep", "--permission-mode", "acceptEdits"]
+                 if write else ["--tools", "Read,Glob,Grep", "--permission-mode", "dontAsk"])
+        args.append(prompt)
+        result = run_cli("Claude Code", command, args, timeout=CLI_PROBE_TIMEOUT, cwd=directory)
+    else:
+        args = ["--add-dir", str(directory)]
+        args += (["--mode", "accept-edits", "--dangerously-skip-permissions"]
+                 if write else ["--mode", "plan", "--sandbox", "--dangerously-skip-permissions"])
+        args += ["--print", prompt]
+        result = run_cli("Antigravity", command, args, timeout=CLI_PROBE_TIMEOUT, cwd=directory)
+    if result is None:
+        return None
+    return (result.stdout or "") + "\n" + (result.stderr or "")
+
+
+def run_connection_checks(check_write: bool | None = None, deep: bool = False) -> bool:
+    """CLI별 사전 점검을 단계별로 수행한다.
+
+    ``deep``이 False면 명령 존재 + 버전까지만 본다 (시작이 느려지지 않도록).
+    ``deep``이 True면 격리된 임시 폴더에서 실제 읽기 검사를, 사용자가 쓰기 권한을
+    선택했을 때만 쓰기 검사까지 한다. 검사는 절대 프로젝트 폴더에서 하지 않는다.
+    """
     separator("연결 확인")
-    all_ok = True
+    if check_write is None:
+        check_write = workspace_access_mode() == "write"
+
+    codex_help = _codex_help_text() if deep else ""
+    reports = []
     for key, label, command in CONNECTION_TARGETS:
-        ok, detail = check_cli(label, command)
-        CONNECTION_STATUS[key] = {"label": label, "ok": ok, "detail": detail}
-        all_ok = all_ok and ok
-    return all_ok
+        report = clicheck.run_staged_check(
+            key=key,
+            label=label,
+            command=command,
+            runner=_probe_runner(command),
+            read_probe=(lambda k=key, c=command: _cli_read_probe(k, c)) if deep else None,
+            write_probe=(lambda k=key, c=command: _cli_write_probe(k, c)) if deep else None,
+            check_write=check_write and deep,
+        )
+        if key == "codex" and deep:
+            report.features["write_args"] = clicheck.detect_codex_write_flags(codex_help)
+        CONNECTION_STATUS[key] = report.as_dict()
+        reports.append(report)
+
+        if report.ok:
+            extra = []
+            if report.can_read:
+                extra.append("읽기 OK")
+            if report.can_write:
+                extra.append("쓰기 OK")
+            suffix = f" · {' · '.join(extra)}" if extra else ""
+            print(f"  ✅ {label}: {command_label(command)} ({report.version}){suffix}")
+        else:
+            failure = report.first_failure
+            print(f"  ❌ {label}: [{failure.name}] {clicheck.redact(failure.detail, 200)}")
+            if report.suggested_action():
+                print(f"      → {report.suggested_action()}")
+    return all(report.ok for report in reports)
 
 
 def preflight() -> None:
-    if not run_connection_checks():
-        print("\n\U0001f6d1 필요한 CLI를 실행할 수 없어 시작하지 않습니다.")
+    if run_connection_checks():
+        return
+    usable = [key for key, status in CONNECTION_STATUS.items() if status.get("ok")]
+    if not usable:
+        print("\n\U0001f6d1 사용할 수 있는 CLI가 하나도 없어 시작하지 않습니다.")
+        print("   위의 실패 단계와 조치 안내를 확인해주세요.")
         sys.exit(1)
+    print("\n\u26a0\ufe0f  일부 CLI 점검이 실패했습니다. 대시보드에서 실패 단계를 확인하세요.")
 
 
 def _finalize_cli_result(tool_name: str, result) -> str:
     """subprocess 결과를 응답 문자열로 정리한다. 실패/빈 응답을 구분해서 원인을 남긴다."""
     if result is None:
         return f"({tool_name} 응답 없음 — 실행 실패: 프로세스를 실행하지 못함)"
+    if getattr(result, "timed_out", None):
+        partial = (result.stdout or "").strip()
+        notice = f"({tool_name} 응답 없음 — 실행 시간 초과: {result.timed_out}초)"
+        return f"{notice}\n\n시간 초과 전 부분 출력:\n{partial}" if partial else notice
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         return f"({tool_name} 응답 없음 — 종료 코드 {result.returncode}: {detail[:300]})"
@@ -1328,7 +1771,6 @@ def allow_agent_calls(session_mode: str, phase: str) -> bool:
 
 def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str:
     project_access = turn_project_access(mode)
-    sandbox = "workspace-write" if project_access == "write" else "read-only"
     working_directory = cli_working_directory(mode)
     setting = selected_agent_setting("codex")
     args = ["exec", "--ephemeral"]
@@ -1342,8 +1784,10 @@ def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str
         args.extend(["--model", setting["model"]])
     if setting["effort"]:
         args.extend(["--config", f'model_reasoning_effort="{setting["effort"]}"'])
+    # 승인·샌드박스 옵션은 버전마다 다르다. 추측하지 말고 `codex exec --help`에서
+    # 실제로 지원하는 조합만 쓴다 (0.148.0: --approve-for-me는 --sandbox와 배타적).
+    args.extend(codex_write_args() if project_access == "write" else ["--sandbox", "read-only"])
     args.extend([
-        "--sandbox", sandbox,
         "--cd", str(working_directory),
         "--skip-git-repo-check", "--json", "-",
     ])
@@ -1484,7 +1928,7 @@ def new_state() -> dict:
         "agent_roles": normalize_agent_roles(None),
         "role_history": [],
         "roles_announced_signature": "",
-        "workspace_path": str(load_project_path()),
+        "workspace_path": str(project_path_or_none() or ""),
         "workspace_access": "write",
         "total_est_tokens": 0,
         "total_actual_tokens": 0,
@@ -1504,6 +1948,9 @@ def new_state() -> dict:
         "delegation_history": [],
         "pending_interventions": [],
         "coding_stage": "planning",
+        # 코딩 모드의 쓰기 턴은 사용자가 계획을 승인한 뒤에만 허용된다. 메모리(CONTROL)가 아니라
+        # 상태에 저장해야 재시작·모드 전환·거절 뒤 메시지로 승인을 건너뛸 수 없다.
+        "plan_approved": False,
         "coding_cycle": 0,
         "coding_cycle_step": 0,
         "coding_started_at": None,
@@ -1540,7 +1987,7 @@ def normalize_state(state: dict) -> dict:
     state["discussion_project_access"] = normalize_discussion_project_access(
         state.get("discussion_project_access")
     )
-    state.setdefault("workspace_path", str(load_project_path()))
+    state.setdefault("workspace_path", str(project_path_or_none() or ""))
     state.setdefault("workspace_access", "write")
     state["workspace_access"] = "write" if state.get("workspace_access") == "write" else "read"
     if state.get("mode") == "coding":
@@ -1582,6 +2029,25 @@ def normalize_state(state: dict) -> dict:
     )
     if state["pending_user_question"]:
         state["workflow_status"] = workflow.WAITING_FOR_USER_RESPONSE
+
+    # 실행 결과 상태(run_status)는 workflow_status와 별개로 보관한다.
+    # 서버가 재시작돼도 "사용자 중단"이 "진행 중"으로 되살아나면 안 된다.
+    saved_run_status = str(state.get("run_status", "") or "")
+    if saved_run_status not in runstatus.RUN_STATUSES:
+        if state.get("finished"):
+            saved_run_status = runstatus.RunStatus.COMPLETED
+        elif state["workflow_status"] == workflow.CANCELLED:
+            saved_run_status = runstatus.RunStatus.USER_CANCELLED
+        elif state["workflow_status"] == workflow.WAITING_FOR_USER_RESPONSE:
+            saved_run_status = runstatus.RunStatus.WAITING_FOR_USER_RESPONSE
+        elif state.get("topic"):
+            saved_run_status = runstatus.RunStatus.PAUSED
+        else:
+            saved_run_status = runstatus.RunStatus.IDLE
+    elif saved_run_status == runstatus.RunStatus.RUNNING:
+        # 프로세스가 새로 떴다면 이전 프로세스의 RUNNING은 더 이상 유효하지 않다.
+        saved_run_status = runstatus.RunStatus.PAUSED
+    state["run_status"] = saved_run_status
     state.setdefault("user_question_history", [])
     if not isinstance(state["user_question_history"], list):
         state["user_question_history"] = []
@@ -1611,6 +2077,10 @@ def normalize_state(state: dict) -> dict:
         )
         state["coding_cycle"] = max(0, int(state.get("coding_cycle", 0) or 0))
         state["coding_cycle_step"] = max(0, int(state.get("coding_cycle_step", 0) or 0))
+    # 이 필드가 생기기 전 세션: 목표 사이클까지 간 세션은 이미 승인된 것으로 본다.
+    state["plan_approved"] = bool(
+        state.get("plan_approved", state["coding_stage"] == "iteration")
+    )
     if state["coding_stage"] == "iteration" and not state.get("coding_started_at"):
         state["coding_started_at"] = time.time()
     state["agent_settings"] = normalize_agent_settings(state.get("agent_settings"))
@@ -1645,32 +2115,98 @@ def load_state() -> dict:
     return new_state()
 
 
+class StateSaveError(RuntimeError):
+    """상태를 디스크에 쓰지 못했다 (디스크 부족, 권한, 잠김 등)."""
+
+
 def atomic_write_json(path: Path, state: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """임시 파일에 쓰고 os.replace로 바꿔치기한다 (부분 저장 방지).
+
+    실패하면 조용히 넘어가지 않는다 — 디스크가 가득 찼는데 계속 진행하면
+    사용자는 저장됐다고 믿고 작업을 잃는다.
+    """
     payload = json.dumps(state, ensure_ascii=False, indent=2)
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         temp_path.write_text(payload, encoding="utf-8")
         os.replace(temp_path, path)
+    except OSError as exc:
+        raise StateSaveError(f"{path.name} 저장 실패: {exc.strerror or exc}") from exc
     finally:
         temp_path.unlink(missing_ok=True)
 
 
+#: 마지막 저장 실패 메시지. 상태 응답에 실어 대시보드에 띄운다.
+LAST_SAVE_ERROR: dict[str, str] = {"message": ""}
+
+
 def save_state(state: dict) -> None:
-    atomic_write_json(STATE_PATH, state)
-    SESSIONS_DIR.mkdir(exist_ok=True)
-    session_id = state.get("id")
-    if session_id:
-        atomic_write_json(SESSIONS_DIR / f"{session_id}.json", state)
+    # 세션 파일 저장 실패(목록 조회와 겹친 WinError 5 등)도 여기서 멈춰야 한다. 예외가 새면
+    # 워커 스레드가 죽고 finally의 save_state가 다시 실패해 worker_running이 True로 남는다.
+    try:
+        atomic_write_json(STATE_PATH, state)
+        session_id = state.get("id")
+        if session_id:
+            try:
+                session_path = session_json_path(session_id)
+            except UnsafePathError as exc:
+                # 세션 ID가 오염된 상태로는 어디에도 쓰지 않는다.
+                print(f"  ⚠️  세션 파일을 저장하지 않았습니다 — {exc}")
+            else:
+                atomic_write_json(session_path, state)
+    except StateSaveError as exc:
+        # 진행은 계속하되(메모리 상태는 살아 있다) 사용자에게 복구 가능한 오류로 알린다.
+        LAST_SAVE_ERROR["message"] = (
+            f"{exc} — 디스크 여유 공간과 폴더 권한을 확인한 뒤 다시 시도해주세요. "
+            "지금까지의 대화는 메모리에 남아 있으며, 저장이 복구되면 이어서 기록됩니다."
+        )
+        print(f"  ❌ {LAST_SAVE_ERROR['message']}")
+        return
+    if LAST_SAVE_ERROR["message"]:
+        LAST_SAVE_ERROR["message"] = ""
+        print("  ✅ 상태 저장이 복구되었습니다.")
+
+
+_SKIPPED_SESSION_WARNINGS: set[str] = set()
 
 
 def list_sessions() -> list[dict]:
     SESSIONS_DIR.mkdir(exist_ok=True)
     summaries = []
     for path in SESSIONS_DIR.glob("*.json"):
+        # 디스크에 비정상 이름이 있어도 자동으로 지우거나 옮기지 않는다.
+        # 목록에서만 빼고, 파일마다 한 번씩만 경고한다.
+        if not is_valid_session_id(path.stem):
+            if path.stem not in _SKIPPED_SESSION_WARNINGS:
+                _SKIPPED_SESSION_WARNINGS.add(path.stem)
+                print(f"  ⚠️  세션 ID 형식이 아니어서 목록에서 제외합니다 (파일은 그대로 둡니다): {path.name}")
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            # 손상된 세션 하나 때문에 전체 목록이 실패하면 안 된다.
+            if path.stem not in _SKIPPED_SESSION_WARNINGS:
+                _SKIPPED_SESSION_WARNINGS.add(path.stem)
+                print(f"  ⚠️  세션 파일을 읽지 못해 목록에서 제외합니다: {path.name} ({type(exc).__name__})")
+            summaries.append({
+                "id": path.stem,
+                "topic": "",
+                "name": f"(손상된 세션 파일) {path.name}",
+                "tags": [],
+                "favorite": False,
+                "archived": False,
+                "mode": "discussion",
+                "discussion_project_access": "read",
+                "enabled_agents": list(AGENT_ORDER),
+                "agent_settings": normalize_agent_settings(None),
+                "finished": False,
+                "created_at": "",
+                "message_count": 0,
+                "corrupt": True,
+            })
+            continue
+        if not isinstance(data, dict):
             continue
         summaries.append({
             "id": data.get("id", path.stem),
@@ -1679,7 +2215,9 @@ def list_sessions() -> list[dict]:
             "tags": data.get("tags", []),
             "favorite": bool(data.get("favorite", False)),
             "archived": bool(data.get("archived", False)),
-            "mode": data.get("mode", "discussion"),
+            # 구버전 "continuous" 세션은 코딩 모드로 읽는다 (normalize_state와 동일).
+            # 이게 없으면 목록에 원문 "continuous"가 그대로 보인다.
+            "mode": "coding" if data.get("mode") == "continuous" else data.get("mode", "discussion"),
             "discussion_project_access": normalize_discussion_project_access(
                 data.get("discussion_project_access")
             ),
@@ -1688,13 +2226,17 @@ def list_sessions() -> list[dict]:
             "finished": data.get("finished", False),
             "created_at": data.get("created_at", ""),
             "message_count": len(data.get("messages", [])),
+            "run_status": str(data.get("run_status", "") or ""),
         })
     summaries.sort(key=lambda s: s["created_at"], reverse=True)
     return summaries
 
 
 def load_session(session_id: str) -> dict | None:
-    path = SESSIONS_DIR / f"{session_id}.json"
+    try:
+        path = session_json_path(session_id)
+    except UnsafePathError:
+        return None
     if not path.exists():
         return None
     try:
@@ -1715,12 +2257,17 @@ def start_log_session() -> None:
         f.write(header)
 
 
+def session_json_path(session_id: str) -> Path:
+    """sessions/<id>.json — ID 검증 + 폴더 봉쇄 확인을 거친 경로."""
+    return safe_child(SESSIONS_DIR, f"{validate_session_id(session_id)}.json")
+
+
 def session_transcript_path(session_id: str) -> Path:
-    return SESSIONS_DIR / f"{session_id}.md"
+    return safe_child(SESSIONS_DIR, f"{validate_session_id(session_id)}.md")
 
 
 def session_memory_dir(session_id: str) -> Path:
-    return MEMORY_DIR / session_id
+    return safe_child(MEMORY_DIR, validate_session_id(session_id))
 
 
 def session_memory_paths(session_id: str) -> tuple[Path, Path]:
@@ -1729,11 +2276,11 @@ def session_memory_paths(session_id: str) -> tuple[Path, Path]:
 
 
 def session_profile_path(session_id: str) -> Path:
-    return session_memory_dir(session_id) / "Profile.md"
+    return safe_child(session_memory_dir(session_id), "Profile.md")
 
 
 def session_roles_path(session_id: str) -> Path:
-    return session_memory_dir(session_id) / "Roles.md"
+    return safe_child(session_memory_dir(session_id), "Roles.md")
 
 
 def write_session_roles(state: dict) -> None:
@@ -1775,12 +2322,13 @@ def write_session_roles(state: dict) -> None:
 
 
 def session_agent_profile_dir(session_id: str) -> Path:
-    return session_memory_dir(session_id) / "profiles"
+    return safe_child(session_memory_dir(session_id), "profiles")
 
 
 def session_agent_profile_path(session_id: str, agent: str) -> Path:
-    filename = f"{agent.upper()}_Profile.md"
-    return session_agent_profile_dir(session_id) / filename
+    if agent not in AGENTS:
+        raise UnsafePathError(f"알 수 없는 모델입니다: {agent!r}")
+    return safe_child(session_agent_profile_dir(session_id), f"{agent.upper()}_Profile.md")
 
 
 def agent_names(agent_keys: list[str]) -> str:
@@ -2136,12 +2684,20 @@ def compose_agent_prompt(
 # 공유 상태 (서버 스레드 ↔ 워커 스레드)
 # ──────────────────────────────────────────
 
+# 서버 실행마다 새로 만드는 예측 불가능한 토큰. 상태를 바꾸는 모든 요청이 이 값을
+# 제시해야 한다. 다른 웹페이지는 대시보드 HTML을 읽을 수 없으므로 이 값을 알 수 없다.
+CSRF_TOKEN = webguard.generate_csrf_token()
+
 STATE_LOCK = threading.Lock()
-STATE: dict = load_state()
-_RESTORED_INTERVENTIONS = list(STATE.get("pending_interventions", []))
+# 저장된 상태는 main()이 restore_saved_state()로 불러온다. 임포트만으로는 사용자 데이터를
+# 읽거나 다시 쓰지 않는다 — 테스트와 스모크 스크립트가 이 모듈을 임포트한다.
+STATE: dict = {}
 CONTROL = {
+    # /stop으로 사용자가 직접 멈췄는지. "stopped"는 예산 초과·승인 거절 등으로도
+    # 켜지기 때문에, 사용자 중단만 따로 구분해야 실패로 오분류하지 않는다.
+    "user_cancelled": False,
     "paused": False,
-    "stopped": bool(STATE.get("mode") == "coding" and STATE.get("coding_stopped")),
+    "stopped": False,
     "worker_running": False,
     "worker_session_id": None,
     "worker_start_pending": False,
@@ -2151,19 +2707,19 @@ CONTROL = {
     "approval_requested_by": [],
     "approval_rejected": False,
     "approval_seen_messages": 0,
-    "intervention_pending": bool(_RESTORED_INTERVENTIONS),
+    "intervention_pending": False,
     "intervention_seen_messages": 0,
-    "intervention_intent": _RESTORED_INTERVENTIONS[0].get("intent", "") if _RESTORED_INTERVENTIONS else "",
-    "intervention_queue": _RESTORED_INTERVENTIONS,
+    "intervention_intent": "",
+    "intervention_queue": [],
 }
 
 
 def waiting_for_user_response(state: dict | None = None) -> bool:
+    # 대기 여부는 질문 자체로만 판단한다 (normalize_state와 같은 규칙). workflow_status는
+    # 승인 대기·중단·거절이 덮어쓰기 때문에, 그 값을 보면 /approve·/resume·채팅이
+    # 답하지 않은 질문을 지나쳐 버린다. 질문은 답변이나 새 주제로만 지워진다.
     current = state if state is not None else STATE
-    return (
-        current.get("workflow_status") == workflow.WAITING_FOR_USER_RESPONSE
-        and bool(current.get("pending_user_question"))
-    )
+    return bool(current.get("pending_user_question"))
 
 
 def register_user_question(agent: str, phase: str, question_data: dict) -> bool:
@@ -2302,7 +2858,9 @@ def role_scope_violations(agent: str, changed_paths: list[dict], state: dict) ->
     violations = []
     for item in changed_paths:
         path = str(item.get("path", "")).replace("\\", "/")
-        top_level = path.rstrip("/").split("/", 1)[0]
+        if path.endswith("/"):
+            continue  # 폴더 항목(스냅샷의 "x/")은 파일 변경이 아니다 — 안의 파일은 따로 검사된다.
+        top_level = path.split("/", 1)[0]
         if top_level in {
             ".pytest_cache", ".ruff_cache", ".codex_pytest_tmp", ".agents",
             ".venv", "venv", "__pycache__", "roundtable_memory", "sessions",
@@ -2394,8 +2952,10 @@ def update_agent_roles(roles: dict) -> dict:
 
 def update_discussion_project_access(access: str) -> dict:
     normalized = normalize_discussion_project_access(access)
-    if normalized == "write" and not os.access(load_project_path(), os.W_OK):
-        return {"error": "현재 프로젝트 폴더에 쓰기 권한이 없습니다."}
+    if normalized in ("read", "write"):
+        resolution = resolve_project_workspace(require_write=normalized == "write")
+        if resolution.blocked:
+            return {"error": workspace_block_message(resolution)}
     with STATE_LOCK:
         if STATE.get("active_agent"):
             return {"error": "현재 모델 응답이 끝난 뒤 토론 접근 방식을 변경해주세요."}
@@ -2415,7 +2975,10 @@ def update_discussion_project_access(access: str) -> dict:
 
 
 def update_workspace_selection(path_text: str, access: str) -> dict:
-    candidate = Path(path_text).expanduser()
+    candidate = Path(path_text.strip()).expanduser()
+    if not path_text.strip() or not candidate.is_absolute():
+        # Path("")·상대 경로는 서버 실행 폴더로 풀려 그대로 저장된다 (fail closed 우회).
+        return {"error": "작업 폴더가 지정되지 않았습니다. '작업 폴더 선택'으로 폴더를 골라주세요."}
     try:
         candidate = candidate.resolve(strict=True)
     except (OSError, RuntimeError):
@@ -2488,30 +3051,48 @@ def orphaned_approval_followup_agents(messages: list[dict]) -> list[str]:
     ))
 
 
-_restored_approval_requesters = unresolved_approval_requesters(STATE.get("messages", []))
-if _restored_approval_requesters and not STATE.get("finished", False):
-    CONTROL["approval_requested"] = True
-    CONTROL["approval_requested_by"] = _restored_approval_requesters
-    CONTROL["awaiting_approval"] = True
-    if not waiting_for_user_response(STATE):
-        STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
+def restore_saved_state() -> None:
+    """디스크의 마지막 세션 상태를 STATE/CONTROL에 복원한다. 서버 시작 시(main) 한 번만 부른다.
 
-_orphaned_approval_agents = orphaned_approval_followup_agents(STATE.get("messages", []))
-if _orphaned_approval_agents and not any(
-    item.get("approved_followup") for item in CONTROL["intervention_queue"]
-):
-    CONTROL["intervention_queue"].append({
-        "intent": "execute",
-        "targets": _orphaned_approval_agents,
-        "cli_mode": "coding",
-        "custom_instruction": "사용자가 직전 승인 요청을 승인했다. 승인받은 작업을 지금 실제로 수행하고 결과를 보고해라.",
-        "approved_followup": True,
-    })
-    CONTROL["intervention_pending"] = True
-    CONTROL["intervention_intent"] = "execute"
-    STATE["pending_interventions"] = json.loads(json.dumps(CONTROL["intervention_queue"], ensure_ascii=False))
-    STATE["finished"] = False
-    save_state(STATE)
+    예전에는 모듈 임포트 때 실행돼서, 테스트가 임포트만 해도 실제 roundtable_state.json을
+    읽고 정규화 결과가 다르면 다시 써버렸다.
+    """
+    loaded = load_state()
+    restored_interventions = list(loaded.get("pending_interventions", []))
+    with STATE_LOCK:
+        STATE.clear()
+        STATE.update(loaded)
+        CONTROL["stopped"] = bool(STATE.get("mode") == "coding" and STATE.get("coding_stopped"))
+        CONTROL["intervention_queue"] = restored_interventions
+        CONTROL["intervention_pending"] = bool(restored_interventions)
+        CONTROL["intervention_intent"] = (
+            restored_interventions[0].get("intent", "") if restored_interventions else ""
+        )
+
+    restored_approval_requesters = unresolved_approval_requesters(STATE.get("messages", []))
+    if restored_approval_requesters and not STATE.get("finished", False):
+        CONTROL["approval_requested"] = True
+        CONTROL["approval_requested_by"] = restored_approval_requesters
+        CONTROL["awaiting_approval"] = True
+        if not waiting_for_user_response(STATE):
+            STATE["workflow_status"] = workflow.WAITING_FOR_USER_APPROVAL
+
+    orphaned_approval_agents = orphaned_approval_followup_agents(STATE.get("messages", []))
+    if orphaned_approval_agents and not any(
+        item.get("approved_followup") for item in CONTROL["intervention_queue"]
+    ):
+        CONTROL["intervention_queue"].append({
+            "intent": "execute",
+            "targets": orphaned_approval_agents,
+            "cli_mode": "coding",
+            "custom_instruction": "사용자가 직전 승인 요청을 승인했다. 승인받은 작업을 지금 실제로 수행하고 결과를 보고해라.",
+            "approved_followup": True,
+        })
+        CONTROL["intervention_pending"] = True
+        CONTROL["intervention_intent"] = "execute"
+        STATE["pending_interventions"] = json.loads(json.dumps(CONTROL["intervention_queue"], ensure_ascii=False))
+        STATE["finished"] = False
+        save_state(STATE)
 
 
 def add_runtime_event(text: str, level: str = "info") -> None:
@@ -2539,12 +3120,15 @@ def add_active_work_event(agent: str, event: dict) -> None:
         entry = {
             "time": ts(),
             "kind": event.get("kind", "log"),
-            "text": str(event.get("text", "작업 중"))[:300],
+            "text": clicheck.redact(event.get("text", "작업 중"), 300),
         }
         if event.get("paths"):
             entry["paths"] = [str(path)[:240] for path in event["paths"][:20]]
         if event.get("cost_usd") is not None:
             entry["cost_usd"] = event["cost_usd"]
+            # CLI 실행마다 한 번 오는 최종 비용이다. Claude 자동 교정 재시도처럼 한 턴에
+            # 두 번 실행되면 둘 다 더한다 (마지막 값만 쓰면 첫 실행 비용이 빠진다).
+            STATE["active_cost_usd"] = STATE.get("active_cost_usd", 0.0) + float(event["cost_usd"] or 0.0)
         logs = STATE.setdefault("active_work_log", [])
         if logs and logs[-1].get("kind") == entry["kind"] and logs[-1].get("text") == entry["text"]:
             logs[-1].update(entry)
@@ -2649,11 +3233,31 @@ def bubble_html(m: dict) -> str:
     if meta:
         changed_paths = meta.get("changed_paths", [])
         changes_html = f' · 파일 변경 {len(changed_paths)}개' if meta.get("cli_mode") == "coding" else ""
+        # meta는 세션 파일에서 그대로 오므로 키가 빠져 있을 수 있다. 예전에는
+        # meta["elapsed"] 하나가 없으면 KeyError로 대화 전체 렌더링이 죽었다.
+        run_status = str(meta.get("run_status", "") or "")
+        status_html = ""
+        if run_status and run_status != runstatus.RunStatus.COMPLETED:
+            status_html = (
+                f' · <span class="turn-status" data-status="{html.escape(run_status)}">'
+                f'{html.escape(runstatus.status_glyph(run_status))} '
+                f'{html.escape(runstatus.status_label(run_status))}</span>'
+            )
+        truncated_html = (
+            ' · <span class="turn-truncated" title="화면 표시만 줄였습니다. 전체 원문은 '
+            'roundtable_memory의 full.md에 그대로 보관됩니다.">표시 축약됨</span>'
+            if meta.get("output_truncated") else ""
+        )
+        partial_html = (
+            ' · <span class="turn-partial">중단 전 부분 출력</span>'
+            if meta.get("partial_output") else ""
+        )
         stats_html = (
-            f'<div class="stats">⏱ {meta["elapsed"]}초 · '
-            f'추정 토큰 ~{meta["est_tokens"]} · '
-            f'입력 {meta["prompt_chars"]}자/출력 {meta["output_chars"]}자 · '
-            f'{html.escape(meta["cli_mode"])}{changes_html}</div>'
+            f'<div class="stats">⏱ {meta.get("elapsed", "-")}초 · '
+            f'추정 토큰 ~{meta.get("est_tokens", 0)} · '
+            f'입력 {meta.get("prompt_chars", 0)}자/출력 {meta.get("output_chars", 0)}자 · '
+            f'{html.escape(str(meta.get("cli_mode", "-")))}{changes_html}'
+            f'{status_html}{partial_html}{truncated_html}</div>'
         )
         work_log = meta.get("work_log", [])
         if work_log:
@@ -2786,8 +3390,8 @@ def coding_limit_reason(state: dict) -> str | None:
     if started_at and time.time() - started_at >= limits["max_minutes"] * 60:
         return f"최대 실행 시간 {limits['max_minutes']}분 도달"
     used_tokens = max(
-        int(state.get("total_actual_tokens", 0) or 0),
-        int(state.get("total_est_tokens", 0) or 0),
+        int(state.get("total_actual_tokens", 0) or 0) - int(state.get("coding_start_actual_tokens", 0) or 0),
+        int(state.get("total_est_tokens", 0) or 0) - int(state.get("coding_start_est_tokens", 0) or 0),
     )
     if used_tokens >= limits["max_tokens"]:
         return f"최대 토큰 {limits['max_tokens']:,} 도달"
@@ -3076,10 +3680,18 @@ def process_pending_intervention(expected_session_id: str | None = None) -> bool
     return True
 
 
+def plan_approval_missing(state: dict) -> bool:
+    """코딩 모드인데 사용자가 아직 계획을 승인하지 않았는가 — 그동안 쓰기 턴은 허용하지 않는다."""
+    return state.get("mode") == "coding" and not state.get("plan_approved")
+
+
 def approve_pending_work() -> bool:
     was_waiting = CONTROL["awaiting_approval"] or CONTROL["approval_requested"]
     with STATE_LOCK:
         approval_requests = unresolved_approval_requests(STATE.get("messages", []))
+        if was_waiting and STATE.get("mode") == "coding":
+            STATE["plan_approved"] = True
+            save_state(STATE)
     if was_waiting:
         add_message("user", "승인", "승인")
         add_runtime_event("사용자가 진행을 승인했습니다.")
@@ -3220,6 +3832,17 @@ def run_step(
     else:
         cli_mode = effective_cli_mode(cli_mode)
     cli_mode = effective_cli_mode(cli_mode)
+    with STATE_LOCK:
+        approval_missing = plan_approval_missing(STATE)
+    if cli_mode == "coding" and approval_missing:
+        # 모든 쓰기 턴(정규 단계·개입·에이전트 호출)이 여기를 지난다. 승인 전에는 읽기 전용으로만 실행한다.
+        cli_mode = "discussion"
+        instruction = (
+            f"{instruction}\n\n"
+            "사용자가 아직 계획을 승인하지 않았다. 파일을 생성·수정·삭제하지 말고, "
+            "분석 결과와 변경 제안만 보고해라."
+        )
+        add_runtime_event(f"{AGENTS[agent]['label']} 코딩 요청을 승인 전이라 읽기 전용으로 전환")
     if requested_cli_mode == "coding" and cli_mode != "coding" and workspace_access_mode() != "write":
         instruction = (
             f"{instruction}\n\n"
@@ -3259,9 +3882,11 @@ def run_step(
         STATE["active_prompt_chars"] = len(prompt)
         STATE["active_work_log"] = []
         STATE["active_usage"] = {}
+        STATE["active_cost_usd"] = 0.0
         STATE["workflow_status"] = (
             workflow.CODING if cli_mode == "coding" else workflow.DEBATING
         )
+        STATE["run_status"] = runstatus.RunStatus.RUNNING
         save_state(STATE)
     add_active_work_event(agent, {"kind": "status", "text": "CLI 프로세스 시작"})
     if shared_messages:
@@ -3273,11 +3898,36 @@ def run_step(
     add_runtime_event(f"{label} — {phase} 시작 (cli_mode={cli_mode}, 입력 {len(prompt)}자)")
     render_html_snapshot()
     print(f"\U0001f914 {label} 생각 중... (입력 약 {len(prompt)}자, cli_mode={cli_mode})")
-    project_path = load_project_path()
+    try:
+        project_path = cli_working_directory(cli_mode)
+    except WorkspaceUnavailable as exc:
+        message = workspace_block_message(exc.resolution)
+        add_runtime_event(f"작업 폴더 차단으로 실행하지 않음 — {exc.resolution.message}", "error")
+        add_message(agent, phase, message, meta={
+            "run_status": runstatus.RunStatus.CLI_FAILED,
+            "workspace_blocked": True,
+        })
+        # 실패로 돌려줘야 워커가 단계를 넘기지 않고, 개입 요청도 재시도 큐에 남는다
+        # (CONTROL["stopped"]를 켜면 process_pending_intervention이 요청을 버린다).
+        with STATE_LOCK:
+            STATE["workflow_status"] = workflow.FAILED
+            save_state(STATE)
+        return False
     before_snapshot, before_truncated = (
         snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
     )
     before_texts = capture_project_texts(project_path) if cli_mode == "coding" else {}
+    if CONTROL["stopped"]:
+        # 프롬프트 작성·스냅샷 중에 /stop이 눌렸다. 아직 띄운 CLI가 없으니 여기서 멈춘다.
+        with STATE_LOCK:
+            if STATE.get("id") == session_id:
+                STATE["active_agent"] = None
+                STATE["active_phase"] = None
+                STATE["active_started_at"] = None
+                STATE["active_cli_mode"] = None
+                STATE["active_prompt_chars"] = 0
+                save_state(STATE)
+        return False
     t0 = time.time()
     try:
         ask_func = ASK_FUNCS[agent]
@@ -3296,6 +3946,10 @@ def run_step(
     except Exception as exc:
         raw_text = f"({label} 응답 없음 — 실행 중 예외: {exc})"
     elapsed = time.time() - t0
+    # 사용자가 /stop을 눌러 CLI 프로세스를 죽였다면, 뒤따라오는 "종료 코드 1"은
+    # 중단의 결과일 뿐 모델 실패가 아니다. 반드시 먼저 판단한다.
+    turn_cancelled = bool(CONTROL.get("user_cancelled"))
+    turn_timed_out = "실행 시간 초과" in raw_text or "TimeoutExpired" in raw_text
     after_snapshot, after_truncated = (
         snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
     )
@@ -3307,6 +3961,7 @@ def run_step(
         int(state_snapshot.get("step_index", 0)),
         agent,
         turn_diff,
+        workspace=project_path,
     ) if cli_mode == "coding" else ""
     if changed_paths:
         add_active_work_event(
@@ -3320,10 +3975,7 @@ def run_step(
     with STATE_LOCK:
         work_log = list(STATE.get("active_work_log", []))
         actual_usage = dict(STATE.get("active_usage", {}))
-    actual_cost_usd = next(
-        (event.get("cost_usd") for event in reversed(work_log) if event.get("cost_usd") is not None),
-        0.0,
-    )
+        actual_cost_usd = round(float(STATE.get("active_cost_usd", 0.0) or 0.0), 6)
     question_clean_text, pending_question = workflow.extract_stop_and_ask_user(raw_text)
     call_clean_text, agent_calls = extract_agent_calls(question_clean_text, agent, cli_mode)
     if not allow_agent_calls(state_snapshot.get("mode", "discussion"), phase):
@@ -3341,12 +3993,31 @@ def run_step(
         phase,
     )
     text, output_truncated = clip_agent_output(visible_text)
+    # 대화·로그·메모리·전사본에 남기 전에 API 키·토큰으로 보이는 값을 가린다.
+    text = clicheck.redact(text, None)
     if pending_question and not text:
         text = pending_question["question"]
     if approval_requested and not text:
         text = "사용자 승인을 요청했습니다."
     est_tokens = estimate_tokens(prompt, raw_text)
-    failed = is_cli_failure(raw_text) or bool(scope_violations)
+    outcome = runstatus.classify_turn(
+        text,
+        cancelled=turn_cancelled,
+        timed_out=turn_timed_out,
+        failure_marker=is_cli_failure(raw_text),
+        had_partial_output=bool(text.strip()),
+    )
+    if outcome.status == runstatus.RunStatus.USER_CANCELLED:
+        # 중단은 실패가 아니다 — 실패 재시도 CTA를 띄우지 않는다.
+        failed = False
+    else:
+        failed = outcome.is_failure or bool(scope_violations)
+    if scope_violations and outcome.status == runstatus.RunStatus.COMPLETED:
+        outcome = runstatus.TurnOutcome(
+            status=runstatus.RunStatus.CLI_FAILED,
+            text=text,
+            detail="역할 범위를 벗어난 파일을 변경했습니다.",
+        )
     if scope_violations:
         violation_list = ", ".join(scope_violations[:8])
         suffix = " ..." if len(scope_violations) > 8 else ""
@@ -3369,7 +4040,15 @@ def run_step(
         "output_truncated": output_truncated,
         "approval_requested": approval_requested,
         "ok": not failed,
-        "failure_kind": "role_scope" if scope_violations else ("cli" if failed else ""),
+        "run_status": outcome.status,
+        "run_status_label": outcome.label,
+        "run_status_detail": outcome.detail,
+        "partial_output": outcome.partial,
+        "failure_kind": (
+            "role_scope" if scope_violations
+            else ("user_cancelled" if outcome.status == runstatus.RunStatus.USER_CANCELLED
+                  else ("cli" if failed else ""))
+        ),
         "role_id": normalize_agent_roles(state_snapshot.get("agent_roles")).get(agent, ""),
         "role_label": role_label(normalize_agent_roles(state_snapshot.get("agent_roles")).get(agent, "")),
         "role_scope_violations": scope_violations,
@@ -3427,12 +4106,20 @@ def run_step(
             STATE["active_prompt_chars"] = 0
             STATE["active_work_log"] = []
             STATE["active_usage"] = {}
+            # 상단 배너·세션 목록·인스펙터가 모두 이 한 값을 본다.
+            STATE["run_status"] = outcome.status
+            if outcome.status == runstatus.RunStatus.USER_CANCELLED:
+                STATE["workflow_status"] = workflow.CANCELLED
             save_state(STATE)
     if not same_session:
         print(f"  \u26a0\ufe0f {label} 응답은 새 세션이 시작되어 폐기했습니다.")
         return False
-    level = "error" if failed else "info"
-    result_label = "실패" if failed else "완료"
+    if outcome.status == runstatus.RunStatus.USER_CANCELLED:
+        level, result_label = "warn", "사용자 중단"
+    elif failed:
+        level, result_label = "error", "실패"
+    else:
+        level, result_label = "info", "완료"
     add_runtime_event(
         f"{label} — {phase} {result_label} ({elapsed:.1f}초, 추정 토큰 ~{est_tokens})",
         level=level,
@@ -3519,7 +4206,11 @@ def worker_loop(session_id: str) -> None:
                     STATE["coding_stage"] = "iteration"
                     STATE["coding_cycle"] = 1
                     STATE["coding_cycle_step"] = 0
-                    STATE["coding_started_at"] = STATE.get("coding_started_at") or time.time()
+                    # 시간·토큰 한도는 목표 사이클부터 잰다. 계획·승인 단계(사용자 대기 포함)가
+                    # 한도를 먼저 써버리면 사이클 1이 시작하자마자 끝난다.
+                    STATE["coding_started_at"] = time.time()
+                    STATE["coding_start_actual_tokens"] = int(STATE.get("total_actual_tokens", 0) or 0)
+                    STATE["coding_start_est_tokens"] = int(STATE.get("total_est_tokens", 0) or 0)
                     STATE["coding_stopped"] = False
                     STATE["coding_stop_reason"] = ""
                     STATE["finished"] = False
@@ -3547,6 +4238,13 @@ def worker_loop(session_id: str) -> None:
 
             cycle_index = step_index
             agent, phase, instruction, cli_mode = steps[cycle_index]
+            with STATE_LOCK:
+                approval_missing = plan_approval_missing(STATE)
+            if cli_mode == "coding" and approval_missing:
+                # 승인 없이 쓰기 단계에 도달했다 (거절 뒤 메시지, 서버 재시작, 모드 전환 등).
+                # 읽기 전용으로 헛돌리지 말고 승인을 다시 요청한다 — 루프 맨 위에서 대기한다.
+                mark_approval_requested(agent, CONFIRM_PHASE)
+                continue
             display_phase = f"{phase} · 목표 사이클 {cycle_number}" if coding_iteration else phase
             if coding_iteration and cycle_index == 0:
                 add_runtime_event(f"목표 기반 코딩 사이클 {cycle_number} 시작")
@@ -3558,6 +4256,8 @@ def worker_loop(session_id: str) -> None:
                 expected_session_id=session_id,
             )
             if not succeeded:
+                if CONTROL["stopped"]:
+                    break  # 사용자 중단 — 실패로 기록하지 않는다 (/stop이 이미 상태를 정했다).
                 with STATE_LOCK:
                     if STATE.get("id") == session_id:
                         CONTROL["paused"] = True
@@ -3596,7 +4296,7 @@ def worker_loop(session_id: str) -> None:
                     if STATE.get("id") == session_id:
                         STATE["workflow_status"] = workflow.VALIDATING
                         save_state(STATE)
-                validation_results = run_project_validation(load_project_path())
+                validation_results = run_validation_for_current_workspace()
                 with STATE_LOCK:
                     if STATE.get("id") == session_id:
                         STATE["validation_results"] = validation_results
@@ -3640,7 +4340,7 @@ def worker_loop(session_id: str) -> None:
                 enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
                 steps = steps_for_mode(mode, enabled_agents)
                 finished = (
-                    mode == "discussion"
+                    mode in ("discussion", "quick")
                     and STATE["step_index"] >= len(steps)
                     and not CONTROL["stopped"]
                 ) or bool(STATE.get("finished", False))
@@ -3652,8 +4352,12 @@ def worker_loop(session_id: str) -> None:
                 STATE["active_started_at"] = None
                 STATE["active_cli_mode"] = None
                 STATE["active_prompt_chars"] = 0
-                save_state(STATE)
                 messages_copy = list(STATE["messages"])
+                # 완료 뒤 개입으로 워커가 다시 끝날 때마다 전체 대화를 프로필에 또 붙이지 않는다.
+                profiled_count = int(STATE.get("profiled_message_count", 0) or 0)
+                if finished:
+                    STATE["profiled_message_count"] = len(messages_copy)
+                save_state(STATE)
             if CONTROL.get("worker_session_id") == session_id:
                 CONTROL["worker_running"] = False
                 CONTROL["worker_session_id"] = None
@@ -3663,7 +4367,7 @@ def worker_loop(session_id: str) -> None:
             render_html_snapshot()
         if same_session and finished:
             for agent in ("codex", "antigravity", "claude"):
-                update_profile(agent, messages_copy)
+                update_profile(agent, messages_copy[profiled_count:])
         separator("워커 종료" if not finished else "완료")
         if restart_pending:
             start_worker_if_needed(force=True)
@@ -3682,6 +4386,8 @@ def start_worker_if_needed(force: bool = False) -> None:
         CONTROL["worker_session_id"] = session_id
         CONTROL["worker_start_pending"] = False
         CONTROL["stopped"] = False
+        # 이전 실행의 중단 표시가 남아 있으면 새 실행의 진짜 실패까지 "사용자 중단"으로 분류된다.
+        CONTROL["user_cancelled"] = False
         if STATE.get("coding_stopped"):
             STATE["coding_stopped"] = False
             STATE["coding_stop_reason"] = ""
@@ -3711,18 +4417,146 @@ def connection_status_html() -> str:
         if not info:
             items.append(f'<span class="conn-item">⏳ {html.escape(label)}</span>')
             continue
-        icon = "✅" if info["ok"] else "❌"
+        icon = "✅" if info.get("ok") else "❌"
+        # 읽기와 쓰기를 별도 상태로 보여준다. "버전 확인됨 = 연결됨"으로 뭉뚱그리면
+        # Codex처럼 읽기는 되고 쓰기는 실패하는 상태가 초록불로 보인다.
+        capability = []
+        if info.get("can_read"):
+            capability.append("읽기 ✓")
+        if info.get("can_write"):
+            capability.append("쓰기 ✓")
+        elif info.get("failed_step") == "write":
+            capability.append("쓰기 ✕")
+        capability_html = (
+            f' <small class="conn-caps">{html.escape(" · ".join(capability))}</small>'
+            if capability else ""
+        )
+
+        if info.get("ok"):
+            detail = info.get("version") or info.get("detail", "")
+            title = detail
+        else:
+            step = info.get("failed_step", "")
+            detail = f'[{step}] {info.get("failed_detail", "")}' if step else info.get("detail", "")
+            # 사용자가 취할 조치를 툴팁으로 붙인다.
+            title = f'{detail}\n{info.get("action", "")}'.strip()
+
         items.append(
-            f'<span class="conn-item">{icon} {html.escape(info["label"])} '
-            f'<small>{html.escape(info["detail"][:60])}</small></span>'
+            f'<span class="conn-item" title="{html.escape(title[:300])}">'
+            f'{icon} {html.escape(info["label"])}{capability_html} '
+            f'<small>{html.escape(str(detail)[:70])}</small></span>'
         )
     return "".join(items)
 
 
 MODE_LABELS = {
+    "quick": "빠른 질문",
     "discussion": "일반 토론 모드",
     "coding": "코딩 모드",
 }
+
+#: 각 모드의 실행 계획 — 시작 전에 화면에 그대로 보여준다.
+MODE_PLANS = {
+    "quick": {
+        "summary": "선택한 모델 1명을 한 번만 호출합니다.",
+        "min_calls": 1,
+        "max_calls": 1,
+        "single_agent": True,
+        "role_negotiation": False,
+        "auto_validation": False,
+        "default_access": "read",
+        "allow_write": False,
+        "note": "강점 분석·역할 협의·보고 단계를 생략하고, 길이와 형식은 요청한 대로 따릅니다.",
+    },
+    "discussion": {
+        "summary": "활성 모델들이 순서대로 발언한 뒤 한 모델이 정리 보고를 합니다.",
+        "single_agent": False,
+        "role_negotiation": True,
+        "auto_validation": False,
+        "default_access": "read",
+        "allow_write": True,
+        "note": "모델 수와 단계 수에 따라 시간이 길어질 수 있습니다.",
+    },
+    "coding": {
+        "summary": "계획 → 사용자 승인 → 구현 → 자동 검증 순으로 진행합니다.",
+        "single_agent": False,
+        "role_negotiation": True,
+        "auto_validation": True,
+        "default_access": "write",
+        "allow_write": True,
+        "note": "쓰기 권한과 유효한 작업 폴더가 확인되어야 시작합니다.",
+    },
+}
+
+
+def quick_steps(enabled_agents: list[str] | None, project_access: str = "read") -> list[tuple[str, str, str, str]]:
+    """빠른 질문: 모델 1명을 한 번만 부른다.
+
+    역할 협의·강점 분석·보고 단계를 만들지 않는다. 한 문장 요청에 최소 3회
+    모델을 호출하던 게 이 모드를 만든 이유다.
+    """
+    enabled = normalize_enabled_agents(enabled_agents)
+    agent = enabled[0]
+    instruction = (
+        "사용자의 요청에 곧바로 답해라. 역할 선언·강점 분석·다른 모델과의 협의는 하지 마라. "
+        "사용자가 길이나 형식을 지정했다면 그것을 다른 어떤 기본 형식보다 우선해라. "
+        "지정이 없으면 간결하게 답해라."
+    )
+    return [(agent, "빠른 답변", instruction, "discussion")]
+
+
+def mode_execution_plan(
+    mode: str,
+    enabled_agents: list[str] | None,
+    discussion_project_access: str = "read",
+    workspace_access: str = "read",
+) -> dict:
+    """실행 전에 보여줄 계획 — 모델 수, 예상 호출 횟수, 권한, 작업공간."""
+    mode = "coding" if mode == "continuous" else mode
+    if mode not in MODE_LABELS:
+        mode = "discussion"
+    plan = dict(MODE_PLANS.get(mode, MODE_PLANS["discussion"]))
+    enabled = normalize_enabled_agents(enabled_agents)
+    if plan.get("single_agent"):
+        enabled = enabled[:1]
+
+    if mode == "quick":
+        min_calls = max_calls = 1
+    else:
+        step_count = len(steps_for_mode(mode, enabled))
+        min_calls = step_count
+        # 개입·재시도·목표 사이클로 호출이 늘어날 수 있다.
+        max_calls = step_count * (3 if mode == "coding" else 2)
+
+    workspace = resolve_project_workspace()
+    access = "write" if mode == "coding" else normalize_discussion_project_access(
+        discussion_project_access
+    )
+    if not plan.get("allow_write", True):
+        access = normalize_discussion_project_access(discussion_project_access)
+        if access == "write":
+            access = "read"
+    return {
+        "mode": mode,
+        "mode_label": MODE_LABELS[mode],
+        "summary": plan["summary"],
+        "note": plan.get("note", ""),
+        "agents": enabled,
+        "agent_labels": [AGENTS[a]["label"] for a in enabled],
+        "agent_count": len(enabled),
+        "min_calls": min_calls,
+        "max_calls": max_calls,
+        "long_running_warning": max_calls >= 6,
+        "project_access": access,
+        "project_access_label": discussion_project_access_label(access),
+        "can_write": access == "write",
+        "auto_validation": bool(plan.get("auto_validation")),
+        "role_negotiation": bool(plan.get("role_negotiation")),
+        "workspace_path": str(workspace.path) if workspace.ok else "",
+        "workspace_ok": workspace.ok,
+        "workspace_message": workspace.message,
+        "workspace_configured": workspace.configured,
+    }
 
 
 def mode_notice_html(mode: str, discussion_project_access: str = "read") -> str:
@@ -3783,11 +4617,21 @@ def topic_section_html(
     discussion_project_access: str = "read",
 ) -> str:
     access_label = "읽기·쓰기" if workspace_access_mode() == "write" else "읽기 전용"
-    project_path_line = (
-        f'<p>코딩 모드 작업 경로: '
-        f'{html.escape(str(load_project_path()))} '
-        f'· 권한: {access_label}</p>'
-    )
+    workspace_resolution = resolve_project_workspace()
+    if workspace_resolution.ok:
+        project_path_line = (
+            f'<p>코딩 모드 작업 경로: '
+            f'{html.escape(str(workspace_resolution.path))} '
+            f'· 권한: {access_label}</p>'
+        )
+    else:
+        project_path_line = (
+            '<p class="workspace-blocked" role="status">'
+            '<strong>작업 폴더 차단됨</strong> — '
+            f'{html.escape(workspace_resolution.message)}<br>'
+            f'저장된 경로: <code>{html.escape(workspace_resolution.configured or "(설정 없음)")}</code><br>'
+            '유효한 폴더를 다시 선택하기 전까지 모델 실행이 차단됩니다.</p>'
+        )
 
     if topic:
         mode_label = MODE_LABELS.get(mode, mode)
@@ -3813,30 +4657,47 @@ def topic_section_html(
     return f"""
       <div class="panel">
         <p style="margin:0;color:var(--muted);font-size:13px">토론 주제를 입력하면 바로 시작합니다.</p>
-        <textarea id="topicInput" placeholder="예: 네이버 쇼핑 최저가 비교 웹앱을 같이 만들 거야" autofocus></textarea>
-        <div class="mode-choice">
-          <label><input type="radio" name="mode" value="discussion" checked> 일반 토론 모드</label>
-          <label><input type="radio" name="mode" value="coding"> 코딩 모드 (계획·승인 후 목표 기반 구현·검토 반복)</label>
+        <label class="visually-hidden" for="topicInput">토론 주제 또는 질문</label>
+        <textarea id="topicInput" placeholder="예: 네이버 쇼핑 최저가 비교 웹앱을 같이 만들 거야" autofocus aria-describedby="topicError"></textarea>
+        <fieldset class="mode-choice">
+          <legend>실행 모드</legend>
+          <label><input type="radio" name="mode" value="quick" onchange="refreshExecutionPlan()"> 빠른 질문 (모델 1명 · 1회 호출 · 읽기 전용)</label>
+          <label><input type="radio" name="mode" value="discussion" checked onchange="refreshExecutionPlan()"> 일반 토론 모드</label>
+          <label><input type="radio" name="mode" value="coding" onchange="refreshExecutionPlan()"> 코딩 모드 (계획·승인 후 목표 기반 구현·검토 반복)</label>
+        </fieldset>
+        <p class="inline-error" id="topicError" role="alert" aria-live="assertive" hidden></p>
+        <div class="primary-start">
+          <button type="button" class="start-button" onclick="submitTopic()">
+            시작하기
+          </button>
+          <button type="button" class="ghost compact" onclick="toggleStartOptions()"
+                  id="startOptionsToggle" aria-expanded="false" aria-controls="startOptions">
+            세부 설정
+          </button>
         </div>
-        <div class="discussion-access-choice">
-          <strong>일반 토론의 프로젝트 접근</strong>
-          <label><input type="radio" name="discussion_project_access" value="read" checked> 프로젝트 읽기</label>
-          <label><input type="radio" name="discussion_project_access" value="write"> 프로젝트 읽기·쓰기</label>
-          <label><input type="radio" name="discussion_project_access" value="none"> 프로젝트 읽지 않고 토론</label>
-        </div>
-        {agent_model_cards_html(agent_settings)}
-        {project_path_line}
-        <div class="direct-agent-start">
-          <strong>Agent 직접 호출</strong>
-          <span>선택한 모델이 첫 턴을 시작합니다.</span>
-          <div class="direct-agent-buttons">
-            {''.join(
-                f'<button type="button" class="direct-agent-button" data-direct-agent="{agent}" '
-                f'onclick="submitTopic(\'{agent}\')" style="--agent-color:{AGENTS[agent]["color"]}">'
-                f'<img src="{html.escape(AGENTS[agent]["avatar"])}" alt="">'
-                f'<span>{html.escape(AGENTS[agent]["label"])}부터 시작</span></button>'
-                for agent in AGENT_ORDER
-            )}
+        <div class="execution-plan" id="executionPlan" role="status" aria-live="polite"></div>
+
+        <div class="start-options" id="startOptions" hidden>
+          <fieldset class="discussion-access-choice">
+            <legend>프로젝트 접근</legend>
+            <label><input type="radio" name="discussion_project_access" value="read" checked onchange="refreshExecutionPlan()"> 프로젝트 읽기</label>
+            <label><input type="radio" name="discussion_project_access" value="write" onchange="refreshExecutionPlan()"> 프로젝트 읽기·쓰기</label>
+            <label><input type="radio" name="discussion_project_access" value="none" onchange="refreshExecutionPlan()"> 프로젝트 읽지 않고 토론</label>
+          </fieldset>
+          {agent_model_cards_html(agent_settings)}
+          {project_path_line}
+          <div class="direct-agent-start">
+            <strong>Agent 직접 호출</strong>
+            <span>선택한 모델이 첫 턴을 시작합니다.</span>
+            <div class="direct-agent-buttons">
+              {''.join(
+                  f'<button type="button" class="direct-agent-button" data-direct-agent="{agent}" '
+                  f'onclick="submitTopic(\'{agent}\')" style="--agent-color:{AGENTS[agent]["color"]}">'
+                  f'<img src="{html.escape(AGENTS[agent]["avatar"])}" alt="">'
+                  f'<span>{html.escape(AGENTS[agent]["label"])}부터 시작</span></button>'
+                  for agent in AGENT_ORDER
+              )}
+            </div>
           </div>
         </div>
       </div>"""
@@ -3854,8 +4715,21 @@ def render_dashboard() -> str:
             STATE.get("discussion_project_access")
         )
         active_id = STATE.get("id", "")
-    message_bubbles = "".join(bubble_html(m) for m in messages) if messages else \
-        '<div class="empty-state">아직 대화가 없습니다.</div>'
+    # 최초 페인트에는 최근 메시지만 넣는다. 1,500개짜리 세션에서 전체를 HTML로
+    # 굽던 게 첫 화면이 1MB를 넘던 원인이다. 나머지는 "이전 메시지 불러오기"로.
+    total_messages = len(messages)
+    recent = messages[-INITIAL_MESSAGE_WINDOW:] if total_messages else []
+    first_rendered_index = total_messages - len(recent)
+    if recent:
+        message_bubbles = "".join(bubble_html(m) for m in recent)
+    else:
+        message_bubbles = '<div class="empty-state">아직 대화가 없습니다.</div>'
+    if first_rendered_index > 0:
+        message_bubbles = (
+            '<div class="load-older" id="loadOlderWrap">'
+            '<button type="button" class="ghost" onclick="loadOlderMessages()">'
+            f'이전 메시지 {first_rendered_index:,}개 불러오기</button></div>'
+        ) + message_bubbles
     bubbles = (mode_notice_html(mode, discussion_project_access) if topic else "") + message_bubbles
     paused = CONTROL["paused"]
     stopped = CONTROL["stopped"]
@@ -3879,13 +4753,98 @@ def render_dashboard() -> str:
         "__RESUME_DISABLED__": resume_disabled,
         "__STOP_DISABLED__": stop_disabled,
         "__NO_TOPIC__": no_topic,
+        # 주제가 없으면(=아직 시작 전) composer를 화면 하단에 고정하지 않는다.
+        # 고정하면 모바일에서 주제 패널과 시작 버튼을 덮는다.
+        "__COMPOSER_STATE__": "no-topic" if not topic else "has-topic",
+        # 상태를 바꾸는 모든 요청이 제시해야 하는 토큰. 외부 페이지는 이 HTML을
+        # 읽을 수 없으므로 값을 알 수 없다.
+        "__CSRF_TOKEN__": html.escape(CSRF_TOKEN),
+        "__FEED_FIRST_INDEX__": str(first_rendered_index),
+        "__FEED_LAST_INDEX__": str(total_messages - 1),
+        "__MESSAGE_TOTAL__": str(total_messages),
     }
-    for token, value in replacements.items():
-        page = page.replace(token, value)
-    return page
+    # 한 번에 치환한다. 순서대로 replace하면 앞에서 넣은 주제·메시지 안의
+    # "__CSRF_TOKEN__" 같은 글자가 뒤 단계에서 진짜 값으로 바뀐다.
+    pattern = re.compile("|".join(map(re.escape, replacements)))
+    return pattern.sub(lambda match: replacements[match.group(0)], page)
 
 
-def state_json_payload() -> dict:
+#: 최초 진입 시 내려보낼 최근 메시지 개수. 나머지는 "이전 메시지 불러오기"로 가져온다.
+INITIAL_MESSAGE_WINDOW = int(os.environ.get("ROUNDTABLE_INITIAL_MESSAGES", "60"))
+MAX_MESSAGE_PAGE = 200
+
+
+def _messages_for_session(session_id: str) -> tuple[list[dict], str] | None:
+    clean_id = (session_id or "").strip()
+    with STATE_LOCK:
+        active_id = STATE.get("id", "")
+        if not clean_id or clean_id == active_id:
+            return list(STATE["messages"]), active_id
+    data = load_session(clean_id)
+    if data is None:
+        return None
+    return list(data.get("messages", [])), clean_id
+
+
+def messages_payload(session_id: str = "", after: str = "-1", limit: str = "80") -> dict:
+    """메시지를 증분으로 돌려준다.
+
+    ``after``는 마지막으로 받은 메시지의 인덱스. -1이면 "최근 ``limit``개".
+    상태 폴링(active_tick 등)이 1,500개 메시지를 매번 다시 실어 나르지 않게 하는
+    것이 목적이다.
+    """
+    try:
+        after_index = int(after)
+    except (TypeError, ValueError):
+        after_index = -1
+    try:
+        page_size = max(1, min(MAX_MESSAGE_PAGE, int(limit)))
+    except (TypeError, ValueError):
+        page_size = 80
+
+    found = _messages_for_session(session_id)
+    if found is None:
+        return {"error": "세션을 찾을 수 없습니다.", "messages_html": "", "total": 0}
+    messages, resolved_id = found
+
+    total = len(messages)
+    if after_index < 0:
+        start, end = max(0, total - page_size), total
+    else:
+        start = min(total, after_index + 1)
+        end = min(total, start + page_size)
+
+    chunk = messages[start:end]
+    return {
+        "session_id": resolved_id,
+        "total": total,
+        "from_index": start,
+        "to_index": end - 1 if end > start else start - 1,
+        "count": len(chunk),
+        "has_older": start > 0,
+        "has_newer": end < total,
+        "messages_html": "".join(bubble_html(m) for m in chunk),
+    }
+
+
+def older_messages_payload(session_id: str, before: int, limit: int = 60) -> dict:
+    """"이전 메시지 불러오기"용 역방향 페이지."""
+    found = _messages_for_session(session_id)
+    messages = found[0] if found else []
+    end = max(0, min(len(messages), before))
+    start = max(0, end - max(1, min(MAX_MESSAGE_PAGE, limit)))
+    chunk = messages[start:end]
+    return {
+        "total": len(messages),
+        "from_index": start,
+        "to_index": end - 1,
+        "count": len(chunk),
+        "has_older": start > 0,
+        "messages_html": "".join(bubble_html(m) for m in chunk),
+    }
+
+
+def state_json_payload(include_feed: bool = False) -> dict:
     with STATE_LOCK:
         messages = list(STATE["messages"])
         finished = STATE.get("finished", False)
@@ -3926,25 +4885,41 @@ def state_json_payload() -> dict:
         pending_user_question = workflow.normalize_user_question(
             STATE.get("pending_user_question")
         )
+        if pending_user_question:
+            # 승인 대기·중단이 상태 값을 덮어써도 화면은 계속 질문을 보여준다.
+            workflow_status = workflow.WAITING_FOR_USER_RESPONSE
+        run_status = str(STATE.get("run_status", "") or runstatus.RunStatus.IDLE)
         state_snapshot = dict(STATE)
+    if CONTROL["paused"] and run_status == runstatus.RunStatus.RUNNING:
+        run_status = runstatus.RunStatus.PAUSED
+    workspace_state = resolve_project_workspace()
     if active_id and not session_roles_path(active_id).exists():
         ensure_session_memory(state_snapshot)
     active_elapsed = max(0.0, round(time.time() - active_started_at, 1)) if active_started_at else 0.0
-    message_bubbles = "".join(bubble_html(m) for m in messages) if messages else \
-        '<div class="empty-state">아직 대화가 없습니다.</div>'
-    bubbles = (mode_notice_html(mode, discussion_project_access) if topic else "") + message_bubbles
+    if include_feed:
+        message_bubbles = "".join(bubble_html(m) for m in messages) if messages else \
+            '<div class="empty-state">아직 대화가 없습니다.</div>'
+        bubbles = (mode_notice_html(mode, discussion_project_access) if topic else "") + message_bubbles
+    else:
+        # 폴링 응답에는 메시지 본문을 싣지 않는다. 클라이언트가 /messages.json으로
+        # 새 메시지만 증분 조회한다 (1.2MB 세션을 1.8초마다 다시 보내던 비용 제거).
+        bubbles = None
     disabled_agents = [a for a in AGENT_ORDER if a not in enabled_agents]
     last_model_message = next((message for message in reversed(messages) if message.get("agent") in AGENT_ORDER), None)
+    last_meta = (last_model_message.get("meta") or {}) if last_model_message else {}
     can_retry = bool(
-        CONTROL["paused"] and last_model_message and not (last_model_message.get("meta") or {}).get("ok", True)
+        CONTROL["paused"]
+        and last_model_message
+        and not last_meta.get("ok", True)
+        # 사용자가 스스로 멈춘 턴에는 "실패 턴 재시도"를 권하지 않는다.
+        and runstatus.allows_failure_retry(last_meta.get("run_status", runstatus.RunStatus.CLI_FAILED))
     )
     can_continue_next = bool(
         CONTROL["paused"]
         and can_continue_after_failed_step(state_snapshot, messages)
         and not budget_exceeded_reason(state_snapshot)
     )
-    return {
-        "feed_html": bubbles,
+    payload = {
         "topic_section_html": topic_section_html(
             topic, mode, enabled_agents, active_id, agent_settings, discussion_project_access
         ),
@@ -3962,7 +4937,7 @@ def state_json_payload() -> dict:
         "workflow_status": workflow_status,
         "pending_user_question": pending_user_question,
         "topic": html.escape(topic) if topic else "",
-        "session_name": html.escape(session_name),
+        "session_name": session_name,
         "tags": list(STATE.get("tags", [])),
         "favorite": bool(STATE.get("favorite", False)),
         "archived": bool(STATE.get("archived", False)),
@@ -3986,10 +4961,10 @@ def state_json_payload() -> dict:
         "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
         "conn_html": connection_status_html(),
         "active_id": active_id,
-        "memory_dir": html.escape(str(session_memory_dir(active_id))) if active_id else "",
-        "profile_path": html.escape(str(session_profile_path(active_id))) if active_id else "",
-        "roles_path": html.escape(str(session_roles_path(active_id))) if active_id else "",
-        "workspace_path": str(load_project_path()),
+        "memory_dir": str(session_memory_dir(active_id)) if active_id else "",
+        "profile_path": str(session_profile_path(active_id)) if active_id else "",
+        "roles_path": str(session_roles_path(active_id)) if active_id else "",
+        "workspace_path": str(project_path_or_none() or ""),
         "workspace_access": workspace_access,
         "workspace_access_label": "읽기·쓰기" if workspace_access == "write" else "읽기 전용",
         "total_est_tokens": total_est_tokens,
@@ -4024,20 +4999,47 @@ def state_json_payload() -> dict:
         "coding_limit_reason": coding_limit_reason(state_snapshot),
         "agent_usage": agent_usage_summary(messages),
         "context_usage": agent_context_summary(messages, agent_settings),
+        "cost_breakdown": usage_domain.cost_breakdown(messages).as_dict(),
+        "run_status": run_status,
+        "run_status_label": runstatus.status_label(run_status),
+        "run_status_glyph": runstatus.status_glyph(run_status),
+        "mode_notice_html": mode_notice_html(mode, discussion_project_access) if topic else "",
+        "workspace": workspace_state.as_dict(),
+        "workspace_blocked": workspace_state.blocked,
+        "csrf_token": CSRF_TOKEN,
+        "save_error": LAST_SAVE_ERROR["message"],
     }
+    if include_feed:
+        payload["feed_html"] = bubbles
+    return payload
 
 
 def sessions_list_payload() -> dict:
     with STATE_LOCK:
         active_id = STATE.get("id", "")
+        active_run_status = str(STATE.get("run_status", "") or "")
+    if CONTROL["paused"] and active_run_status == runstatus.RunStatus.RUNNING:
+        active_run_status = runstatus.RunStatus.PAUSED
     items = []
     for s in list_sessions():
+        is_active = s["id"] == active_id
+        # 상단 배너와 같은 계산을 쓴다. 예전에는 목록이 "활성 세션 = 진행 중"으로
+        # 단정해서, 상단에 "중단됨"이 떠 있는데 목록은 "진행 중"인 모순이 났다.
+        run_status = active_run_status if is_active else s.get("run_status", "")
         items.append({
             **s,
             "topic": s["topic"] or "(주제 없음)",
             "name": s["name"],
             "mode_label": MODE_LABELS.get(s["mode"], s["mode"]),
-            "is_active": s["id"] == active_id,
+            "is_active": is_active,
+            "run_status": run_status,
+            "status_label": runstatus.session_list_status(
+                is_active_session=is_active,
+                has_topic=bool(s["topic"]),
+                finished=bool(s["finished"]),
+                run_status=run_status,
+            ),
+            "status_glyph": runstatus.status_glyph(run_status),
         })
     return {"sessions": items, "active_id": active_id}
 
@@ -4091,40 +5093,34 @@ def context_limit_for_agent(agent: str, agent_settings: dict | None = None) -> i
 
 
 def latest_context_token_count(agent: str, messages: list[dict]) -> tuple[int, bool]:
-    for message in reversed(messages):
-        if message.get("agent") != agent:
-            continue
-        meta = message.get("meta") or {}
-        usage = meta.get("actual_usage") or {}
-        if usage:
-            if agent == "claude" and usage.get("iterations"):
-                usage = usage["iterations"][-1]
-            tokens = actual_token_count(usage)
-            if tokens > 0:
-                return tokens, False
-        estimated = int(meta.get("est_tokens", 0) or 0)
-        if estimated > 0:
-            return estimated, True
-    return 0, True
+    """(토큰, 추정치 여부). 하위 호환용 얇은 래퍼."""
+    used, source = usage_domain.last_call_context_tokens(messages, agent)
+    return used, source != "measured"
 
 
 def agent_context_summary(
     messages: list[dict], agent_settings: dict | None = None
 ) -> dict[str, dict]:
+    """모델별 "현재 컨텍스트 점유율".
+
+    CLI가 주는 turn 단위 usage는 그 턴 안의 모든 내부 호출 합계라서, 그대로
+    컨텍스트 한도로 나누면 100%를 훌쩍 넘는다(실제로 461.1%가 표시됐다).
+    이제는 호출 단위 스냅샷이 있을 때만 measured로 쓰고, 없으면 추정치임을
+    명시하거나 "알 수 없음"으로 둔다. 세션 누적 토큰은 여기 쓰지 않는다.
+    """
     summary = {}
     for agent in AGENT_ORDER:
-        used, estimated = latest_context_token_count(agent, messages)
         limit = max(1, context_limit_for_agent(agent, agent_settings))
-        summary[agent] = {
-            "used_tokens": used,
-            "limit_tokens": limit,
-            "percent": round((used / limit) * 100, 1),
-            "estimated": estimated,
-        }
+        context = usage_domain.context_usage(messages, agent, limit)
+        row = context.as_dict()
+        # 누적 사용량은 별도 항목으로 — 절대 컨텍스트 퍼센트와 섞지 않는다.
+        row["session_cumulative_tokens"] = usage_domain.cumulative_tokens(messages, agent)
+        summary[agent] = row
     return summary
 
 
 def session_detail_payload(session_id: str) -> dict | None:
+    session_id = validate_session_id(session_id)
     data = load_session(session_id)
     if data is None:
         return None
@@ -4152,7 +5148,7 @@ def session_detail_payload(session_id: str) -> dict | None:
             discussion_project_access,
         ),
         "topic": html.escape(data.get("topic", "")),
-        "session_name": html.escape(data.get("name") or data.get("topic") or "새 세션"),
+        "session_name": data.get("name") or data.get("topic") or "새 세션",
         "tags": data.get("tags", []),
         "favorite": bool(data.get("favorite", False)),
         "archived": bool(data.get("archived", False)),
@@ -4173,10 +5169,10 @@ def session_detail_payload(session_id: str) -> dict | None:
         },
         "enabled_agents_label": html.escape(agent_names(enabled_agents)),
         "disabled_agents_label": html.escape(agent_names(disabled_agents) if disabled_agents else "없음"),
-        "memory_dir": html.escape(str(session_memory_dir(session_id))),
-        "profile_path": html.escape(str(session_profile_path(session_id))),
-        "roles_path": html.escape(str(session_roles_path(session_id))),
-        "workspace_path": data.get("workspace_path") or str(load_project_path()),
+        "memory_dir": str(session_memory_dir(session_id)),
+        "profile_path": str(session_profile_path(session_id)),
+        "roles_path": str(session_roles_path(session_id)),
+        "workspace_path": data.get("workspace_path") or str(project_path_or_none() or ""),
         "workspace_access": data.get("workspace_access", "write"),
         "workspace_access_label": "읽기·쓰기" if data.get("workspace_access", "write") == "write" else "읽기 전용",
         "finished": data.get("finished", False),
@@ -4204,6 +5200,8 @@ def session_detail_payload(session_id: str) -> dict | None:
 
 
 def profile_payload(session_id: str | None = None) -> dict | None:
+    if session_id is not None:
+        session_id = validate_session_id(session_id)
     with STATE_LOCK:
         active_id = STATE.get("id", "")
         state_snapshot = dict(STATE)
@@ -4228,6 +5226,7 @@ def profile_payload(session_id: str | None = None) -> dict | None:
 
 
 def rename_session(session_id: str, name: str) -> dict:
+    session_id = validate_session_id(session_id)
     clean_name = re.sub(r"\s+", " ", name).strip()[:80]
     if not clean_name:
         return {"error": "세션 이름을 입력해주세요."}
@@ -4240,12 +5239,12 @@ def rename_session(session_id: str, name: str) -> dict:
     if data is None:
         return {"error": "세션을 찾을 수 없습니다."}
     data["name"] = clean_name
-    path = SESSIONS_DIR / f"{session_id}.json"
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(session_json_path(session_id), data)
     return {"success": True, "id": session_id, "name": clean_name, "is_active": False}
 
 
 def update_session_metadata(session_id: str, tags: str, favorite: bool, archived: bool) -> dict:
+    session_id = validate_session_id(session_id)
     clean_tags = [item.strip()[:24] for item in tags.split(",") if item.strip()][:8]
     with STATE_LOCK:
         if STATE.get("id") == session_id:
@@ -4256,27 +5255,30 @@ def update_session_metadata(session_id: str, tags: str, favorite: bool, archived
     if data is None:
         return {"error": "세션을 찾을 수 없습니다."}
     data.update(tags=clean_tags, favorite=favorite, archived=archived)
-    (SESSIONS_DIR / f"{session_id}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(session_json_path(session_id), data)
     return {"success": True, "id": session_id, "tags": clean_tags, "favorite": favorite, "archived": archived}
 
 
 def delete_session(session_id: str) -> dict:
+    session_id = validate_session_id(session_id)
     with STATE_LOCK:
         if STATE.get("id") == session_id:
             return {"error": "현재 세션은 삭제할 수 없습니다. 새 세션을 만든 뒤 삭제해주세요."}
     removed = False
-    for path in (SESSIONS_DIR / f"{session_id}.json", SESSIONS_DIR / f"{session_id}.md"):
-        if path.exists():
+    # 삭제는 되돌릴 수 없으므로, 각 경로가 정말 허용 폴더 안인지 다시 확인한다.
+    for path in (session_json_path(session_id), session_transcript_path(session_id)):
+        if path.is_file():
             path.unlink()
             removed = True
     memory_path = session_memory_dir(session_id)
-    if memory_path.exists():
+    if memory_path.is_dir():
         shutil.rmtree(memory_path)
         removed = True
     return {"success": removed, "id": session_id} if removed else {"error": "세션을 찾을 수 없습니다."}
 
 
 def clone_session(session_id: str) -> dict:
+    session_id = validate_session_id(session_id)
     source = load_session(session_id)
     if source is None:
         return {"error": "세션을 찾을 수 없습니다."}
@@ -4311,7 +5313,8 @@ def clone_session(session_id: str) -> dict:
     return {"success": True, "id": clone["id"], "name": clone["name"]}
 
 
-def activate_session(session_id: str) -> dict:
+def activate_session(session_id: str, confirm_workspace_switch: bool = False) -> dict:
+    session_id = validate_session_id(session_id)
     with STATE_LOCK:
         if STATE.get("active_agent") or CONTROL["worker_running"]:
             return {"error": "모델이 실행 중일 때는 세션을 전환할 수 없습니다. 먼저 중단해주세요."}
@@ -4335,14 +5338,65 @@ def activate_session(session_id: str) -> dict:
     activated["active_work_log"] = []
     activated["active_usage"] = {}
 
-    workspace = Path(activated.get("workspace_path") or load_project_path()).expanduser()
-    if not workspace.is_dir() or not os.access(workspace, os.R_OK):
-        return {"error": f"세션의 작업 폴더를 사용할 수 없습니다: {workspace}"}
     access = "write" if activated.get("mode") == "coding" else activated.get("workspace_access", "read")
-    if access == "write" and not os.access(workspace, os.W_OK):
-        return {"error": f"세션의 작업 폴더에 쓰기 권한이 없습니다: {workspace}"}
-    save_project_path(workspace.resolve())
-    activated["workspace_path"] = str(workspace.resolve())
+    saved_workspace = str(activated.get("workspace_path") or "").strip()
+    current_configured = read_configured_project_path()
+
+    if not saved_workspace:
+        # 구버전 세션 — 어떤 폴더에서 돌았는지 기록이 없다. 현재 선택 폴더를 쓰되
+        # 그 사실을 사용자에게 남긴다.
+        resolution = resolve_project_workspace(require_write=access == "write")
+        if resolution.blocked:
+            return {"error": workspace_block_message(resolution)}
+        activated["workspace_path"] = str(resolution.path)
+        add_runtime_event(
+            "이 세션에는 작업 폴더 기록이 없어 현재 선택된 폴더를 사용합니다: "
+            f"{resolution.path}",
+            "warn",
+        )
+    else:
+        session_resolution = resolve_workspace(saved_workspace, require_write=access == "write")
+        if session_resolution.status == WorkspaceStatus.NOT_FOUND:
+            # 세션 폴더가 옮겨졌거나 지워졌다. 현재 선택 폴더가 유효하면 사용자 확인 후
+            # 그 폴더에서 이어간다 — 확인 없이 다른 폴더로 바꾸지는 않는다.
+            current_resolution = resolve_project_workspace(require_write=access == "write")
+            if current_resolution.blocked:
+                return {"error": workspace_block_message(current_resolution)}
+            if not confirm_workspace_switch:
+                return {
+                    "error": (
+                        "이 세션의 작업 폴더를 찾을 수 없습니다 (옮겨졌거나 삭제됨).\n"
+                        f"세션 폴더: {saved_workspace}\n"
+                        f"현재 폴더: {current_resolution.path}\n"
+                        "현재 폴더에서 이어서 진행하려면 다시 확인해주세요."
+                    ),
+                    "needs_workspace_confirm": True,
+                    "session_workspace": saved_workspace,
+                    "current_workspace": str(current_resolution.path),
+                }
+            activated["workspace_path"] = str(current_resolution.path)
+            add_runtime_event(
+                f"세션 폴더({saved_workspace})를 찾을 수 없어 현재 폴더에서 이어갑니다: "
+                f"{current_resolution.path}",
+                "warn",
+            )
+        elif session_resolution.blocked:
+            return {"error": workspace_block_message(session_resolution)}
+        elif not workspace_matches(saved_workspace, current_configured) and not confirm_workspace_switch:
+            return {
+                "error": (
+                    "이 세션은 다른 작업 폴더에서 진행됐습니다.\n"
+                    f"세션 폴더: {session_resolution.path}\n"
+                    f"현재 폴더: {current_configured or '(설정 없음)'}\n"
+                    "세션 폴더로 전환해 계속하려면 다시 확인해주세요."
+                ),
+                "needs_workspace_confirm": True,
+                "session_workspace": str(session_resolution.path),
+                "current_workspace": current_configured,
+            }
+        else:
+            save_project_path(session_resolution.path)
+            activated["workspace_path"] = str(session_resolution.path)
     activated["workspace_access"] = access
 
     pending_interventions = list(activated.get("pending_interventions", []))
@@ -4415,6 +5469,49 @@ def prompt_preview_payload(agent: str) -> dict:
     }
 
 
+def load_checkpoint_owner(checkpoint_path: Path) -> dict | None:
+    """체크포인트 옆에 저장된 소유권 정보를 읽는다. 없으면 None (레거시)."""
+    meta_path = checkpoint_meta_path(checkpoint_path)
+    if not meta_path.is_file():
+        return None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def verify_checkpoint_ownership(
+    checkpoint_path: Path, session_id: str, workspace: Path
+) -> str:
+    """이 체크포인트를 지금 세션·지금 작업공간에 적용해도 되는지 확인한다.
+
+    빈 문자열이면 통과, 아니면 거부 사유. "MEMORY_DIR 아래에 있다"는 것만으로는
+    허용하지 않는다 — 다른 세션이 다른 프로젝트에서 만든 패치일 수 있다.
+    """
+    owner = load_checkpoint_owner(checkpoint_path)
+    if owner is None:
+        return (
+            "소유권 정보가 없는 레거시 체크포인트입니다. "
+            "어느 세션·어느 프로젝트에서 만들어졌는지 확인할 수 없어 자동으로 적용하지 않습니다."
+        )
+    owner_session = str(owner.get("session_id", "")).strip()
+    if not owner_session or owner_session != session_id:
+        return (
+            "다른 세션에서 만든 체크포인트입니다 "
+            f"(체크포인트 세션: {owner_session or '알 수 없음'} / 현재 세션: {session_id})."
+        )
+    owner_workspace = str(owner.get("workspace_path", "")).strip()
+    if not owner_workspace:
+        return "체크포인트에 작업공간 정보가 없어 적용하지 않습니다."
+    if not workspace_matches(owner_workspace, workspace):
+        return (
+            "다른 작업공간에서 만든 체크포인트입니다 "
+            f"(체크포인트: {owner_workspace} / 현재: {workspace})."
+        )
+    return ""
+
+
 def rollback_checkpoint_files(checkpoint: str, paths: list[str]) -> dict:
     try:
         checkpoint_path = Path(checkpoint).resolve()
@@ -4423,15 +5520,54 @@ def rollback_checkpoint_files(checkpoint: str, paths: list[str]) -> dict:
             return {"error": "유효한 체크포인트가 아닙니다."}
     except (OSError, ValueError):
         return {"error": "체크포인트 경로를 확인할 수 없습니다."}
-    clean_paths = [path for path in paths if path and ".." not in Path(path).parts][:50]
+    workspace_resolution = resolve_project_workspace(require_write=True)
+    if workspace_resolution.blocked or workspace_resolution.path is None:
+        return {"error": workspace_block_message(workspace_resolution)}
+    workspace_root = workspace_resolution.path
+
+    clean_paths = []
+    for path in paths:
+        if not path:
+            continue
+        candidate = Path(path)
+        # 체크포인트 내부 파일 경로의 ..·절대경로·심볼릭 링크 우회를 모두 막는다.
+        if candidate.is_absolute() or ".." in candidate.parts or candidate.drive:
+            continue
+        try:
+            resolved = (workspace_root / candidate).resolve()
+        except OSError:
+            continue
+        if not resolved.is_relative_to(workspace_root):
+            continue
+        clean_paths.append(path)
+    clean_paths = clean_paths[:50]
     if not clean_paths:
         return {"error": "되돌릴 파일을 선택해주세요."}
+
+    with STATE_LOCK:
+        current_session_id = str(STATE.get("id", ""))
+    ownership_error = verify_checkpoint_ownership(
+        checkpoint_path, current_session_id, workspace_root
+    )
+    if ownership_error:
+        return {"error": ownership_error, "ownership_blocked": True}
+
+    # 패치에 없는 파일을 고르면 git apply는 아무것도 안 하고 성공(0)을 돌려준다.
+    in_patch = checkpoint_patch_paths(checkpoint_path.read_text(encoding="utf-8", errors="replace"))
+    not_restorable = [path for path in clean_paths if path not in in_patch]
+    if not_restorable:
+        return {"error": (
+            "이 체크포인트에는 다음 파일의 변경 전 내용이 없어 되돌릴 수 없습니다 "
+            f"(크기·용량 한도 초과 또는 텍스트가 아닌 파일): {', '.join(not_restorable[:6])}"
+        )}
+
     git = shutil.which("git") or "git"
-    command = [git, "apply", "--reverse", "--whitespace=nowarn"]
+    # core.autocrlf가 켜져 있으면 git apply가 LF 파일을 CRLF로 바꿔 써서 원래대로 돌아가지 않는다.
+    command = [git, "-c", "core.autocrlf=false", "apply", "--reverse", "--whitespace=nowarn"]
     for path in clean_paths:
         command.append(f"--include={path}")
     command.append(str(checkpoint_path))
-    result = subprocess.run(command, cwd=load_project_path(), capture_output=True)
+    result = subprocess.run(command, cwd=workspace_root, capture_output=True)
     if result.returncode != 0:
         detail = decode_cli_output(result.stderr or result.stdout).strip()
         return {"error": f"변경을 되돌리지 못했습니다: {detail[:500]}"}
@@ -4440,6 +5576,8 @@ def rollback_checkpoint_files(checkpoint: str, paths: list[str]) -> dict:
 
 
 def save_profile_content(content: str, session_id: str | None = None) -> dict:
+    if session_id is not None:
+        session_id = validate_session_id(session_id)
     with STATE_LOCK:
         active_id = STATE.get("id", "")
         state_snapshot = dict(STATE)
@@ -4460,7 +5598,7 @@ def switch_mode(mode: str) -> dict:
         mode = "coding"
     if mode not in MODE_LABELS:
         return {"error": "알 수 없는 모드입니다."}
-    if mode == "coding" and not os.access(load_project_path(), os.W_OK):
+    if mode == "coding" and resolve_project_workspace(require_write=True).blocked:
         return {"error": "코딩 모드는 작업 폴더의 쓰기 권한이 필요합니다."}
     with STATE_LOCK:
         if waiting_for_user_response(STATE):
@@ -4476,14 +5614,22 @@ def switch_mode(mode: str) -> dict:
             elif mode == "discussion" and STATE.get("step_index", 0) > common_step_count:
                 STATE["step_index"] = common_step_count
         STATE["mode"] = mode
+        if mode == "quick":
+            # 빠른 질문에서는 쓰기 권한을 끈다.
+            STATE["workspace_access"] = "read"
+            if normalize_discussion_project_access(
+                STATE.get("discussion_project_access")
+            ) == "write":
+                STATE["discussion_project_access"] = "read"
         if mode == "coding":
             STATE["workspace_access"] = "write"
             STATE["discussion_project_access"] = "write"
             if previous_mode != "coding":
                 STATE["coding_stage"] = "planning"
+                STATE["plan_approved"] = False
                 STATE["coding_cycle"] = 0
                 STATE["coding_cycle_step"] = 0
-                STATE["coding_started_at"] = time.time()
+                STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
                 STATE["coding_progress"] = normalize_coding_progress(None)
                 STATE["coding_stopped"] = False
                 STATE["coding_stop_reason"] = ""
@@ -4525,28 +5671,107 @@ def prepare_manual_resume_after_startup() -> None:
 # ──────────────────────────────────────────
 
 class RoundtableHandler(BaseHTTPRequestHandler):
+    #: 서버가 실제로 바인딩한 포트. start_server()가 채운다. Origin/Host 검증의 기준.
+    server_port_number = PORT
+
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *args) -> None:
         pass  # 콘솔에 HTTP 접근 로그를 찍지 않음
 
-    def _send_html(self, body: str, status: int = 200) -> None:
+    # ── 응답 헬퍼 ────────────────────────────────────────────
+    def _write_body(self, body: bytes, status: int, content_type: str, *, no_store: bool) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        if no_store:
+            # 상태 API는 절대 캐시되면 안 된다 (뒤로 가기 시 옛 상태가 보임).
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
         self.end_headers()
-        self.wfile.write(body.encode("utf-8"))
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
-    def _send_json(self, payload: dict) -> None:
+    def _send_html(self, body: str, status: int = 200) -> None:
+        self._write_body(body.encode("utf-8"), status, "text/html; charset=utf-8", no_store=True)
+
+    def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body, status, "application/json; charset=utf-8", no_store=True)
+
+    def _send_error_json(self, status: int, message: str) -> None:
+        """오류를 구조화해서 돌려준다. 내부 경로·스택은 절대 넣지 않는다."""
+        self._send_json({"error": message, "status": status}, status=status)
+
+    def _send_not_found(self) -> None:
+        self._send_error_json(404, "요청한 경로를 찾을 수 없습니다.")
+
+    # ── 요청 검증 ────────────────────────────────────────────
+    def _read_body_bytes(self) -> bytes:
+        length = webguard.parse_content_length(self.headers.get("Content-Length"))
+        if not length:
+            return b""
+        body = self.rfile.read(length)
+        if len(body) < length:
+            raise webguard.RequestRejected(400, "요청 본문이 예고된 길이보다 짧습니다.")
+        return body
+
+    #: 요청 본문은 소켓에서 한 번만 읽을 수 있다. 기존 분기들이 _read_form()을
+    #: 여러 번 부르므로 요청 단위로 캐시한다.
+    _form_cache: dict | None = None
 
     def _read_form(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8") if length else ""
-        return parse_qs(body)
+        if self._form_cache is not None:
+            return self._form_cache
+        body = self._read_body_bytes()
+        if not body:
+            self._form_cache = {}
+            return self._form_cache
+        try:
+            self._form_cache = parse_qs(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise webguard.RequestRejected(400, "요청 본문을 UTF-8로 해석할 수 없습니다.") from None
+        return self._form_cache
+
+    def _guard_state_change(self, form: dict | None = None) -> None:
+        """상태 변경 요청을 검증한다. 실패하면 RequestRejected."""
+        token = self.headers.get(webguard.CSRF_HEADER)
+        if not token and form is not None:
+            token = (form.get(webguard.CSRF_FORM_FIELD) or [""])[0]
+        webguard.check_state_changing_request(
+            origin=self.headers.get("Origin"),
+            host=self.headers.get("Host"),
+            token=token,
+            expected_token=CSRF_TOKEN,
+            port=self.server_port_number,
+        )
+
+    def _guard_get(self) -> None:
+        """GET도 Host는 확인한다 (DNS rebinding으로 로컬 데이터를 읽는 걸 막는다)."""
+        if not webguard.is_allowed_host(self.headers.get("Host"), self.server_port_number):
+            raise webguard.RequestRejected(403, "허용되지 않은 Host 헤더입니다.")
 
     def do_GET(self) -> None:
+        try:
+            self._guard_get()
+            self._handle_get()
+        except webguard.RequestRejected as rejected:
+            self._send_error_json(rejected.status, rejected.message)
+        except (UnsafePathError, ValueError) as exc:
+            self._send_error_json(400, str(exc))
+        except BrokenPipeError:
+            pass
+        except Exception:
+            # 내부 경로·스택을 브라우저에 그대로 노출하지 않는다. 서버 콘솔에만 남긴다.
+            traceback.print_exc()
+            self._send_error_json(500, "서버 내부 오류가 발생했습니다. 콘솔 로그를 확인해주세요.")
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
+
+    def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/version.json":
             with STATE_LOCK:
@@ -4605,53 +5830,116 @@ class RoundtableHandler(BaseHTTPRequestHandler):
 
                 try:
                     content = static_file.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Content-Length", str(len(content)))
-                    self.end_headers()
-                    self.wfile.write(content)
+                    self._write_body(content, 200, content_type, no_store=False)
                     return
                 except OSError:
                     pass
-            self.send_response(404)
-            self.end_headers()
+            self._send_not_found()
             return
 
         if parsed.path == "/state.json":
-            self._send_json(state_json_payload())
+            include_feed = parse_qs(parsed.query).get("feed", ["0"])[0] == "1"
+            self._send_json(state_json_payload(include_feed=include_feed))
+            return
+        if parsed.path == "/messages-older.json":
+            query = parse_qs(parsed.query)
+            try:
+                before = int(query.get("before", ["0"])[0])
+            except ValueError:
+                before = 0
+            self._send_json(older_messages_payload(query.get("id", [""])[0], before))
             return
         if parsed.path == "/sessions.json":
             self._send_json(sessions_list_payload())
             return
         if parsed.path == "/session.json":
             session_id = parse_qs(parsed.query).get("id", [""])[0]
-            payload = session_detail_payload(session_id)
+            try:
+                payload = session_detail_payload(session_id)
+            except UnsafeSessionIdError as exc:
+                self._send_error_json(400, f"세션 ID를 사용할 수 없습니다: {exc}")
+                return
             if payload is None:
-                self.send_response(404)
-                self.end_headers()
+                self._send_not_found()
                 return
             self._send_json(payload)
             return
         if parsed.path == "/profile.json":
             session_id = parse_qs(parsed.query).get("id", [""])[0] or None
-            payload = profile_payload(session_id)
+            try:
+                payload = profile_payload(session_id)
+            except UnsafeSessionIdError as exc:
+                self._send_error_json(400, f"세션 ID를 사용할 수 없습니다: {exc}")
+                return
             if payload is None:
-                self.send_response(404)
-                self.end_headers()
+                self._send_not_found()
                 return
             self._send_json(payload)
+            return
+        if parsed.path == "/messages.json":
+            # 대용량 세션용 증분 조회 — active_tick 때문에 1,500개 메시지를
+            # 매번 다시 보내지 않도록 상태 조회와 분리했다.
+            query = parse_qs(parsed.query)
+            self._send_json(messages_payload(
+                session_id=query.get("id", [""])[0],
+                after=query.get("after", ["-1"])[0],
+                limit=query.get("limit", ["80"])[0],
+            ))
+            return
+        if parsed.path == "/plan.json":
+            query = parse_qs(parsed.query)
+            with STATE_LOCK:
+                current_enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
+                current_access = normalize_discussion_project_access(
+                    STATE.get("discussion_project_access")
+                )
+                current_workspace_access = STATE.get("workspace_access", "read")
+            self._send_json(mode_execution_plan(
+                query.get("mode", ["discussion"])[0],
+                query.get("agent") or current_enabled,
+                query.get("access", [current_access])[0],
+                current_workspace_access,
+            ))
             return
         if parsed.path == "/prompt-preview.json":
             agent = parse_qs(parsed.query).get("agent", ["codex"])[0]
             self._send_json(prompt_preview_payload(agent))
             return
-        self._send_html(render_dashboard())
+        if parsed.path in ("/", "/index.html"):
+            self._send_html(render_dashboard())
+            return
+        # 존재하지 않는 API·정적 경로에 대시보드 HTML을 돌려주면, 오타난 fetch가
+        # HTML을 JSON으로 파싱하려다 엉뚱한 곳에서 실패한다.
+        self._send_not_found()
 
     def do_POST(self) -> None:
+        self._form_cache = None
+        try:
+            self._handle_post()
+        except webguard.RequestRejected as rejected:
+            self._send_error_json(rejected.status, rejected.message)
+        except UnsafeSessionIdError as exc:
+            self._send_error_json(400, f"세션 ID를 사용할 수 없습니다: {exc}")
+        except UnsafePathError as exc:
+            self._send_error_json(400, str(exc))
+        except WorkspaceUnavailable as exc:
+            self._send_error_json(409, workspace_block_message(exc.resolution))
+        except BrokenPipeError:
+            pass
+        except Exception:
+            traceback.print_exc()
+            self._send_error_json(500, "서버 내부 오류가 발생했습니다. 콘솔 로그를 확인해주세요.")
+
+    def _handle_post(self) -> None:
+        # 모든 POST는 상태를 바꾼다. 본문을 읽기 전에 Host/Origin부터 확인하고,
+        # 폼 본문에 담겨 오는 토큰도 받을 수 있도록 폼을 먼저 읽는다.
+        form = self._read_form()
+        self._guard_state_change(form)
+
         if self.path == "/workspace/select":
             form = self._read_form()
             access = form.get("access", ["read"])[0]
-            selected = choose_workspace_folder(load_project_path())
+            selected = choose_workspace_folder(project_path_or_none() or ROOT)
             if not selected:
                 payload = state_json_payload()
                 payload["cancelled"] = True
@@ -4663,7 +5951,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
         if self.path == "/workspace/access":
             form = self._read_form()
             access = form.get("access", ["read"])[0]
-            self._send_json(update_workspace_selection(str(load_project_path()), access))
+            self._send_json(update_workspace_selection(read_configured_project_path(), access))
             return
 
         if self.path == "/topic":
@@ -4686,6 +5974,14 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             })
             if mode not in MODE_LABELS:
                 mode = "discussion"
+            if mode == "quick":
+                # 빠른 질문은 모델 1명, 읽기 전용.
+                enabled_agents = enabled_agents[:1]
+                if discussion_project_access == "write":
+                    discussion_project_access = "read"
+            if not topic:
+                self._send_error_json(400, "주제를 입력해주세요.")
+                return
             if topic:
                 with STATE_LOCK:
                     STATE["topic"] = topic
@@ -4697,13 +5993,16 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     )
                     if mode == "coding" or discussion_project_access == "write":
                         STATE["workspace_access"] = "write"
+                    elif mode == "quick":
+                        STATE["workspace_access"] = "read"
                     STATE["enabled_agents"] = enabled_agents
                     STATE["start_agent"] = enabled_agents[0]
                     STATE["step_index"] = 0
                     STATE["coding_stage"] = "planning"
+                    STATE["plan_approved"] = False
                     STATE["coding_cycle"] = 0
                     STATE["coding_cycle_step"] = 0
-                    STATE["coding_started_at"] = time.time() if mode == "coding" else None
+                    STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
                     STATE["coding_progress"] = normalize_coding_progress(None)
                     STATE["coding_stopped"] = False
                     STATE["coding_stop_reason"] = ""
@@ -4725,8 +6024,12 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/preflight":
-            run_connection_checks()
-            self._send_json(state_json_payload())
+            # deep=1이면 격리된 임시 폴더에서 실제 읽기(및 쓰기 권한 선택 시 쓰기)까지 검사
+            deep = (form.get("deep", ["0"])[0] or "0") == "1"
+            run_connection_checks(deep=deep)
+            payload = state_json_payload()
+            payload["success"] = True
+            self._send_json(payload)
             return
 
         if self.path == "/mode":
@@ -4785,7 +6088,10 @@ class RoundtableHandler(BaseHTTPRequestHandler):
 
         if self.path == "/session/activate":
             form = self._read_form()
-            self._send_json(activate_session(form.get("id", [""])[0].strip()))
+            self._send_json(activate_session(
+                form.get("id", [""])[0].strip(),
+                form.get("confirm_workspace", ["false"])[0].lower() == "true",
+            ))
             return
 
         if self.path == "/checkpoint/rollback":
@@ -4889,13 +6195,17 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "대기 중인 질문에 먼저 답해주세요."})
                 return
             CONTROL["paused"] = False
+            CONTROL["user_cancelled"] = False
             start_worker_if_needed(force=True)
             self._send_json(state_json_payload())
             return
 
         if self.path == "/stop":
-            cancelled = cancel_active_cli_processes()
+            # 프로세스를 죽이기 전에 표시부터 켠다. 순서가 반대면 워커가 "종료 코드 1"을
+            # 먼저 보고 중단을 실패로 기록한다.
+            CONTROL["user_cancelled"] = True
             CONTROL["stopped"] = True
+            cancelled = cancel_active_cli_processes()
             CONTROL["paused"] = False
             CONTROL["awaiting_approval"] = False
             CONTROL["approval_deferred"] = False
@@ -4909,10 +6219,17 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     STATE["coding_stopped"] = True
                     STATE["coding_stop_reason"] = "사용자 중단"
                 STATE["workflow_status"] = workflow.CANCELLED
+                STATE["run_status"] = runstatus.RunStatus.USER_CANCELLED
+                # 중단 시 실행 중 표시를 즉시 지운다 — 남아 있으면 세션 목록이
+                # 계속 "진행 중"으로 보인다.
+                STATE["active_agent"] = None
+                STATE["active_phase"] = None
+                STATE["active_started_at"] = None
                 persist_intervention_queue_locked()
                 save_state(STATE)
             if cancelled:
-                add_runtime_event(f"실행 중 CLI 강제 종료: {', '.join(cancelled)}")
+                add_runtime_event(f"실행 중 CLI 강제 종료: {', '.join(cancelled)}", "warn")
+            add_runtime_event("사용자가 실행을 중단했습니다.", "warn")
             self._send_json(state_json_payload())
             return
 
@@ -4922,9 +6239,11 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 return
             CONTROL["paused"] = False
             CONTROL["stopped"] = False
+            CONTROL["user_cancelled"] = False
             with STATE_LOCK:
                 STATE["coding_stopped"] = False
                 STATE["coding_stop_reason"] = ""
+                STATE["run_status"] = runstatus.RunStatus.RUNNING
                 save_state(STATE)
             add_runtime_event("실패한 턴을 다시 실행합니다.")
             start_worker_if_needed(force=True)
@@ -4996,7 +6315,9 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             CONTROL["intervention_queue"] = []
             with STATE_LOCK:
                 STATE["workflow_status"] = workflow.CANCELLED
+                STATE["plan_approved"] = False
                 persist_intervention_queue_locked()
+                save_state(STATE)
             self._send_json(state_json_payload())
             return
 
@@ -5006,11 +6327,10 @@ class RoundtableHandler(BaseHTTPRequestHandler):
             self._send_json(state_json_payload())
             return
 
-        self.send_response(404)
-        self.end_headers()
+        self._send_not_found()
 
 
-class RoundtableServer(HTTPServer):
+class RoundtableServer(ThreadingHTTPServer):
     # HTTPServer의 기본값(allow_reuse_address=1)은 Windows에서 서로 다른 프로세스가
     # 같은 포트에 동시에 바인딩되는 걸 허용해버려서, 이전 테스트/좀비 프로세스가 떠 있으면
     # 요청이 죽은 프로세스로 튀어 빈 화면이 뜨는 원인이 된다. 끄면 포트 충돌이 제대로
@@ -5023,6 +6343,9 @@ def start_server() -> tuple[HTTPServer, int]:
     for candidate in range(port, port + 10):
         try:
             server = RoundtableServer(("127.0.0.1", candidate), RoundtableHandler)
+            # 8765~8774 중 어느 포트로 열리든 Origin/Host 검증이 그 포트를 기준으로
+            # 동작해야 한다.
+            RoundtableHandler.server_port_number = candidate
             return server, candidate
         except OSError:
             continue
@@ -5035,7 +6358,39 @@ def start_server() -> tuple[HTTPServer, int]:
 # 메인
 # ──────────────────────────────────────────
 
+def shutdown_cleanly(server) -> None:
+    """종료 시 실행 중인 CLI 자식 프로세스를 죽이고 상태를 마지막으로 저장한다.
+
+    예전에는 Ctrl+C가 서버만 내리고 자식 CLI를 그대로 남겨서, 다음 실행 때
+    좀비 프로세스가 포트와 파일을 붙잡고 있었다.
+    """
+    CONTROL["stopped"] = True
+    CONTROL["user_cancelled"] = True
+    cancelled = cancel_active_cli_processes()
+    if cancelled:
+        print(f"   실행 중이던 CLI 종료: {', '.join(cancelled)}")
+    try:
+        with STATE_LOCK:
+            # 진행 중 표시를 남긴 채 죽으면 다음 실행에서 "진행 중"으로 복원된다.
+            if STATE.get("active_agent"):
+                STATE["run_status"] = runstatus.RunStatus.USER_CANCELLED
+            STATE["active_agent"] = None
+            STATE["active_phase"] = None
+            STATE["active_started_at"] = None
+            STATE["active_cli_mode"] = None
+            STATE["active_work_log"] = []
+            save_state(STATE)
+    except Exception as exc:  # noqa: BLE001 - 종료 경로에서 예외로 죽지 않는다
+        print(f"   ⚠️  종료 중 상태 저장 실패: {exc}")
+    try:
+        server.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
+    print("   진행 상황을 저장했습니다.")
+
+
 def main() -> None:
+    restore_saved_state()
     print("\U0001f680 TriAgent Control — Codex, Antigravity & Claude Code")
     print(f"   Codex: {command_label(CODEX_CMD)}")
     print(f"   Antigravity: {command_label(AGY_CMD)}")
@@ -5043,7 +6398,12 @@ def main() -> None:
     ensure_team_prompt()
     print(f"   공통 지침: {TEAM_PROMPT_PATH}")
     ensure_project_path_file()
-    print(f"   코딩 대상 폴더: {load_project_path()}  (바꾸려면 {PROJECT_PATH_FILE.name} 수정)")
+    startup_workspace = resolve_project_workspace()
+    if startup_workspace.ok:
+        print(f"   코딩 대상 폴더: {startup_workspace.path}  (바꾸려면 {PROJECT_PATH_FILE.name} 수정)")
+    else:
+        print(f"   ⚠️  코딩 대상 폴더 차단됨: {startup_workspace.message}")
+        print(f"      대시보드에서 폴더를 다시 선택하거나 {PROJECT_PATH_FILE.name}을 고쳐주세요.")
     preflight()
 
     prepare_manual_resume_after_startup()
@@ -5057,9 +6417,9 @@ def main() -> None:
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
-        print("\n\n\U0001f6d1 Ctrl+C 감지 — 서버를 종료합니다. 진행 상황은 저장되어 있습니다.")
-        CONTROL["stopped"] = True
-        server.shutdown()
+        print("\n\n\U0001f6d1 Ctrl+C 감지 — 서버를 종료합니다.")
+    finally:
+        shutdown_cleanly(server)
 
     separator("종료")
     print(f"대화 상태: {STATE_PATH}")

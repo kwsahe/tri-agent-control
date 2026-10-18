@@ -1,4 +1,14 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap");
+/* 로컬 전용 대시보드다. 외부 폰트를 받아오면 열 때마다 인터넷에 나가고,
+   오프라인에서는 렌더링이 늦어진다. 시스템 폰트 스택으로 해결한다.
+   (Inter / Outfit이 설치돼 있으면 그대로 쓰이고, 없으면 OS 기본 UI 폰트) */
+:root {
+  --font-ui: Inter, Pretendard, "Segoe UI Variable Text", "Segoe UI",
+    "Apple SD Gothic Neo", "Malgun Gothic", system-ui, -apple-system, sans-serif;
+  --font-display: Outfit, Inter, Pretendard, "Segoe UI Variable Display",
+    "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Mono", "SF Mono", Consolas, "D2Coding",
+    ui-monospace, monospace;
+}
 
 :root {
   color-scheme: dark;
@@ -59,7 +69,7 @@ body {
 body {
   background: var(--bg-gradient);
   color: var(--text);
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-ui);
   letter-spacing: 0;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -114,22 +124,18 @@ body {
 }
 
 .brand-mark {
-  width: 34px;
-  height: 34px;
-  border-radius: 8px;
-  display: grid;
-  place-items: center;
-  background: #f4f4f5;
-  color: #090a0d;
-  font-family: Outfit, sans-serif;
-  font-weight: 700;
-  font-size: 13px;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  filter: drop-shadow(0 8px 16px rgba(0, 0, 0, .32));
 }
 
 .brand h1,
 .thread-header h2 {
   margin: 0;
-  font-family: Outfit, Inter, sans-serif;
+  font-family: var(--font-ui);
   font-weight: 650;
   letter-spacing: 0;
 }
@@ -345,6 +351,7 @@ button.danger {
 
 .thread-header,
 .connection-bar,
+.guide-carousel,
 .viewing-banner,
 .topic,
 .panel,
@@ -362,6 +369,7 @@ button.danger {
 
 .thread-header:hover,
 .connection-bar:hover,
+.guide-carousel:hover,
 .viewing-banner:hover,
 .topic:hover,
 .panel:hover,
@@ -539,6 +547,143 @@ button.danger {
   flex: 0 0 auto;
 }
 
+.guide-carousel {
+  position: relative;
+  max-width: 880px;
+  width: 100%;
+  min-height: 104px;
+  margin: 0 auto 10px;
+  padding: 10px 12px 11px;
+  overflow: hidden;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(circle at 12% 20%, color-mix(in srgb, var(--guide-accent, #4f8cff) 16%, transparent), transparent 44%),
+    var(--panel);
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, .25), inset 0 1px 0 rgba(255, 255, 255, .05);
+}
+
+.guide-carousel-kicker {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 5px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.guide-carousel-window {
+  position: relative;
+  min-height: 47px;
+  perspective: 900px;
+}
+
+.guide-card {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateX(24px) rotateY(-9deg) scale(.985);
+  transform-origin: 80% 50%;
+  transition: opacity .42s ease, transform .52s cubic-bezier(.2, .8, .2, 1), visibility .42s;
+  pointer-events: none;
+}
+
+.guide-card.is-active {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(0) rotateY(0) scale(1);
+  pointer-events: auto;
+}
+
+.guide-card-number {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--guide-accent) 55%, transparent);
+  border-radius: 11px;
+  color: var(--guide-accent);
+  background: color-mix(in srgb, var(--guide-accent) 10%, transparent);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.guide-card strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.guide-card p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.guide-carousel-controls {
+  position: absolute;
+  right: 10px;
+  bottom: 7px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.guide-arrow,
+.guide-toggle,
+.guide-dot {
+  min-height: 24px;
+  padding: 3px 7px;
+  border-color: rgba(255, 255, 255, .08);
+  color: var(--muted);
+  background: rgba(255, 255, 255, .035);
+  font-size: 11px;
+}
+
+.guide-arrow {
+  width: 24px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.guide-toggle {
+  min-width: 49px;
+}
+
+.guide-dots {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.guide-dot {
+  width: 6px;
+  height: 6px;
+  min-height: 6px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .24);
+  transition: width .2s ease, background .2s ease;
+}
+
+.guide-dot.is-active {
+  width: 17px;
+  background: #d8e4f8;
+}
+
 .conversation-scroll {
   flex: 1 1 auto;
   min-height: 0;
@@ -626,7 +771,7 @@ button.danger {
 
 .profile-editor textarea {
   min-height: 260px;
-  font-family: "SF Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -883,7 +1028,7 @@ input[type="checkbox"] {
 
 .name {
   color: var(--accent);
-  font-family: "Outfit", "Inter", sans-serif;
+  font-family: var(--font-display);
   font-weight: 600;
   font-size: 14px;
   letter-spacing: 0;
@@ -928,7 +1073,7 @@ input[type="checkbox"] {
   border: 1px solid var(--line);
   border-radius: 5px;
   padding: 1px 5px;
-  font-family: "SF Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12.5px;
 }
 
@@ -988,7 +1133,7 @@ input[type="checkbox"] {
 .turn-work-log li > span,
 .active-work-log li > span {
   color: var(--faint);
-  font-family: "SF Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 10px;
 }
 
@@ -1414,7 +1559,7 @@ select:focus {
 
 .live-line {
   color: var(--text);
-  font-family: Outfit, Inter, sans-serif;
+  font-family: var(--font-display);
   font-weight: 700;
   font-size: 14px;
   margin-bottom: 5px;
@@ -1568,7 +1713,7 @@ select:focus {
 }
 
 .usage-grid strong {
-  font-family: Outfit, Inter, sans-serif;
+  font-family: var(--font-display);
   font-size: 14px;
 }
 
@@ -1781,7 +1926,7 @@ select:focus {
 .token-model-card dd {
   margin: 0;
   color: var(--text);
-  font-family: "SF Mono", Consolas, monospace;
+  font-family: var(--font-mono);
   text-align: right;
 }
 
@@ -2143,6 +2288,35 @@ select:focus {
     overflow-x: auto;
   }
 
+  .guide-carousel {
+    min-height: 102px;
+    padding: 8px 9px 10px;
+  }
+
+  .guide-card {
+    grid-template-columns: 30px minmax(0, 1fr);
+    gap: 8px;
+    padding-right: 2px;
+  }
+
+  .guide-card-number {
+    width: 29px;
+    height: 29px;
+    border-radius: 9px;
+  }
+
+  .guide-card p {
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .guide-carousel-controls {
+    right: 7px;
+    bottom: 6px;
+  }
+
   .connection-bar .conn-list {
     flex-wrap: nowrap;
     min-width: max-content;
@@ -2275,7 +2449,527 @@ select:focus {
     flex: 0 0 auto;
   }
 
+  /* inspector를 display:none으로 지우지 않는다 — 작업공간·권한·상태·사용량·역할은
+     모바일에서도 확인할 수 있어야 한다. 상단 바의 "상태" 버튼으로 여는
+     바텀시트로 바꾼다. */
   .inspector {
-    display: none;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 60;
+    height: auto;
+    max-height: 78dvh;
+    transform: translateY(101%);
+    transition: transform 0.22s ease;
+    border-left: 0;
+    border-top: 1px solid var(--line-strong);
+    border-radius: 16px 16px 0 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
+
+  .inspector.is-open {
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .inspector,
+  .sidebar {
+    transition: none;
+  }
+
+  .guide-card,
+  .guide-dot {
+    transition: none;
+  }
+}
+
+
+/* ──────────────────────────────────────────────────────────────
+   보안·UX 개선분 (2026-09)
+   ────────────────────────────────────────────────────────────── */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 가로 스크롤 방지 — body가 옆으로 밀리면 모바일에서 버튼이 화면 밖으로 나간다. */
+html,
+body {
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+/* 포커스 표시는 절대 지우지 않는다 (키보드 탐색의 유일한 단서). */
+:focus-visible {
+  outline: 2px solid var(--codex, #3b82f6);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* 숨겨진 요소가 탭 순서에 남지 않게 한다. */
+[hidden] {
+  display: none !important;
+}
+
+/* ── 인라인 오류 ────────────────────────────────────────────── */
+.inline-error {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  background: rgba(248, 113, 113, 0.12);
+  color: #fca5a5;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* 색만으로 상태를 표현하지 않도록 기호를 함께 쓴다. */
+.s-glyph {
+  display: inline-block;
+  min-width: 1.1em;
+  margin-right: 4px;
+  font-weight: 700;
+}
+
+/* ── 주제 입력 dock: 스크롤 영역 밖에 고정 ──────────────────── */
+.topic-dock {
+  flex: 0 0 auto;
+  max-height: 46dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.workspace-blocked {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.12);
+  color: #fcd34d;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.workspace-blocked code {
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
+/* ── 실행 계획 미리보기 ─────────────────────────────────────── */
+.execution-plan {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-strong);
+  font-size: 12.5px;
+}
+
+.execution-plan:empty {
+  display: none;
+}
+
+.execution-plan-title {
+  font-weight: 650;
+  margin-bottom: 6px;
+}
+
+.execution-plan-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.execution-plan-row:last-of-type {
+  border-bottom: 0;
+}
+
+.execution-plan-row span {
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.execution-plan-row strong {
+  text-align: right;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.execution-plan-note,
+.execution-plan-warning {
+  margin: 6px 0 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.execution-plan-warning {
+  color: #fcd34d;
+}
+
+/* ── 컨텍스트 한도 초과 표시 (자르지 않고 드러낸다) ──────────── */
+.agent-context-track.is-overflow span,
+.token-model-track.is-overflow span {
+  background: repeating-linear-gradient(
+    45deg,
+    #f87171,
+    #f87171 6px,
+    #b91c1c 6px,
+    #b91c1c 12px
+  );
+}
+
+.token-model-cumulative {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.token-hint {
+  color: var(--faint);
+}
+
+/* ── 이전 메시지 불러오기 ───────────────────────────────────── */
+.load-older {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 12px;
+}
+
+/* ── 최신 메시지로 이동 ─────────────────────────────────────── */
+.jump-latest {
+  position: absolute;
+  right: 18px;
+  bottom: 168px;
+  z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+}
+
+.jump-latest svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
+.thread {
+  position: relative;
+}
+
+/* ── 모바일 전용 크롬 (데스크톱에서는 숨김) ──────────────────── */
+.mobile-bar,
+.mobile-scrim,
+.mobile-panel-close {
+  display: none;
+}
+
+@media (max-width: 760px) {
+  .mobile-bar {
+    position: sticky;
+    top: 0;
+    z-index: 70;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    padding-top: max(8px, env(safe-area-inset-top));
+    background: rgba(9, 12, 18, 0.92);
+    border-bottom: 1px solid var(--line);
+    backdrop-filter: blur(18px);
+  }
+
+  .mobile-bar-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex: 0 0 auto;
+    padding: 8px 10px;
+    min-height: 40px;
+    border-radius: 10px;
+    border: 1px solid var(--line-strong);
+    background: var(--panel-strong);
+    color: var(--text);
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+
+  .mobile-bar-button svg {
+    width: 16px;
+    height: 16px;
+    fill: currentColor;
+  }
+
+  .mobile-bar-status {
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: center;
+    font-size: 12.5px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mobile-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: rgba(0, 0, 0, 0.55);
+  }
+
+  .mobile-panel-close {
+    display: block;
+    align-self: flex-end;
+    margin-bottom: 4px;
+    padding: 7px 12px;
+    min-height: 38px;
+    border-radius: 8px;
+    border: 1px solid var(--line-strong);
+    background: var(--panel-strong);
+    color: var(--text);
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+
+  body.mobile-panel-open {
+    overflow: hidden;
+  }
+
+  .app-shell {
+    height: auto;
+    min-height: calc(100dvh - 56px);
+  }
+
+  /* 세션 목록도 기본으로 접어두고 상단 바에서 연다 — 예전에는 목록이 첫
+     화면의 218px를 차지해 주제 입력과 시작 버튼이 밀렸다. */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 60;
+    width: min(86vw, 320px);
+    max-width: 86vw;
+    max-height: 100dvh;
+    height: 100dvh;
+    transform: translateX(-102%);
+    transition: transform 0.22s ease;
+    border-right: 1px solid var(--line-strong);
+    border-bottom: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    padding-top: max(12px, env(safe-area-inset-top));
+  }
+
+  .sidebar.is-open {
+    transform: translateX(0);
+  }
+
+  .thread {
+    min-height: calc(100dvh - 56px);
+  }
+
+  /* 주제 입력과 주 시작 버튼이 첫 화면에 보이도록 대화 영역을 양보한다. */
+  .topic-dock {
+    max-height: none;
+  }
+
+  .conversation-scroll {
+    min-height: 30dvh;
+  }
+
+  /* 실행·중단·승인 버튼은 가로 스크롤 없이 줄바꿈으로 다 보이게 한다. */
+  .composer-actions,
+  .approve-actions {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
+
+  .composer-actions button,
+  .composer-actions select,
+  .approve-actions button {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 42px;
+  }
+
+  .jump-latest {
+    right: 12px;
+    bottom: 150px;
+  }
+
+  /* 터치 대상 최소 크기 */
+  .icon-button {
+    min-width: 40px;
+    min-height: 40px;
+  }
+}
+
+
+
+
+/* ── 주 시작 버튼: 입력 바로 아래, 첫 화면에 반드시 보이게 ───────── */
+.primary-start {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.start-button {
+  flex: 1 1 auto;
+  min-height: 44px;
+  padding: 10px 18px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: linear-gradient(135deg, #3b82f6, #6366f1);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.start-button:hover {
+  filter: brightness(1.08);
+}
+
+.start-options[hidden] {
+  display: none !important;
+}
+
+.start-options {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 세션 메뉴(•••)는 hover에서만 보였다. 키보드 포커스에서도 보여야 한다. */
+.session-rename:focus-visible,
+.session-row:focus-within .session-rename {
+  opacity: 1 !important;
+}
+
+@media (max-width: 760px) {
+  /* 실행·중단·승인 컨트롤을 화면 하단에 고정해 항상 손이 닿게 한다. */
+  .composer {
+    position: sticky;
+    bottom: 0;
+    z-index: 30;
+    background: rgba(9, 12, 18, 0.96);
+    backdrop-filter: blur(18px);
+    border-top: 1px solid var(--line-strong);
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+
+  .primary-start {
+    position: sticky;
+    bottom: 0;
+    background: transparent;
+  }
+
+  .start-button {
+    flex: 1 1 100%;
+  }
+}
+
+/* ── 모바일 마무리 ─────────────────────────────────────────────
+   sticky는 스크롤 조상에 overflow:hidden이 있으면 동작하지 않는다.
+   .app-shell의 기본 overflow:hidden 때문에 composer가 화면 하단에 고정되지
+   않았다 (측정값: 390px에서 composer top=956 > viewport 844). */
+@media (max-width: 760px) {
+  .app-shell {
+    overflow: visible;
+  }
+
+  .thread {
+    overflow: visible;
+  }
+}
+
+/* 마우스 hover가 없는 터치 기기에서는 세션 메뉴(•••)가 영영 보이지 않는다.
+   포인터가 coarse면 상시 표시한다. */
+@media (hover: none), (pointer: coarse) {
+  .session-rename {
+    opacity: 0.7;
+  }
+}
+
+
+/* ── 모바일 composer: 2열 그리드 + 높이 제한 ────────────────────
+   전체 폭 버튼 7개를 세로로 쌓으면 sticky composer가 화면을 덮어 주제 입력이
+   가려진다. 2열로 접고 높이를 제한해 대화·주제 영역을 확보한다. */
+@media (max-width: 760px) {
+  .composer {
+    max-height: 42dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .composer-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .composer-actions button,
+  .composer-actions select {
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 10px;
+    font-size: 12.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 중단은 실수로 누르면 안 되므로 한 줄을 다 쓰고 맨 앞에 둔다. */
+  #stopBtn {
+    grid-column: 1 / -1;
+  }
+}
+
+
+/* ── 시작 전에는 composer를 고정하지 않는다 ─────────────────────
+   주제가 없을 때는 제어할 실행이 없다. 이때 sticky로 화면 하단을 차지하면
+   주제 입력·실행 계획·시작 버튼을 덮는다 (390x844 스크린샷에서 확인). */
+@media (max-width: 760px) {
+  .composer.no-topic {
+    position: static;
+    max-height: none;
+    overflow: visible;
+    border-top: 0;
+  }
+
+  /* 주제 패널이 내부 스크롤로 잘리지 않게 한다 — 페이지가 대신 스크롤한다. */
+  .topic-dock {
+    max-height: none;
+    overflow: visible;
   }
 }
