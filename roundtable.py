@@ -141,6 +141,47 @@ def cancel_active_cli_processes() -> list[str]:
                 ACTIVE_PROCESSES.pop(tool_name, None)
     return cancelled
 
+
+def run_process_tree(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    input_bytes: bytes | None = None,
+    timeout: float | None = None,
+    active_name: str | None = None,
+) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True)과 같지만 시간 초과 시 프로세스 트리 전체를 끝낸다.
+
+    subprocess.run은 직계 자식만 죽인 뒤 communicate()로 파이프가 닫히길 끝없이 기다린다.
+    npm.cmd(cmd.exe) → node처럼 손자가 파이프를 물고 있으면 워커가 영원히 멈춘다.
+    ``active_name``을 주면 실행 중에 /stop이 이 프로세스 트리를 끝낼 수 있다.
+    """
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdin=subprocess.PIPE if input_bytes is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if active_name:
+        with ACTIVE_PROCESS_LOCK:
+            ACTIVE_PROCESSES[active_name] = process
+    try:
+        stdout, stderr = process.communicate(input_bytes, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        terminate_process_tree(process)
+        try:
+            exc.output, exc.stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass  # 트리 밖으로 빠져나간 손자가 아직 파이프를 쥐고 있다 — 출력 없이 포기한다.
+        raise exc
+    finally:
+        if active_name:
+            with ACTIVE_PROCESS_LOCK:
+                if ACTIVE_PROCESSES.get(active_name) is process:
+                    ACTIVE_PROCESSES.pop(active_name, None)
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
 SESSION_PROFILE_TEMPLATE = """# Session Role Profile
 
 이 파일은 이 채팅 세션의 역할/강점/분담을 관리하는 프로필이다.
@@ -364,6 +405,9 @@ AGY_CMD = os.environ.get("AGY_CMD", "agy")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "900"))
 AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "600"))
+#: CLI가 끝난 뒤 남은 출력을 기다리는 시간. 그 뒤에도 파이프가 열려 있으면 CLI가 띄운
+#: 자식(개발 서버 등)이 물려받은 것이므로 더 기다리지 않는다.
+CLI_PIPE_DRAIN_SECONDS = 2.0
 PORT = int(os.environ.get("ROUNDTABLE_PORT", "8765"))
 # 프롬프트에 매번 재전송할 최근 대화 개수 — 전체 기록은 roundtable_memory/<id>/full.md에
 # 남기고, 프롬프트에는 요약 + 최근 메시지만 넣어 토큰 낭비를 줄인다.
@@ -938,7 +982,14 @@ def separator(title: str) -> None:
 
 def command_parts(command: str) -> list[str]:
     try:
-        return shlex.split(command)
+        if os.name != "nt":
+            return shlex.split(command)
+        # POSIX 규칙은 백슬래시를 이스케이프로 먹는다 (C:\tools\codex.cmd → C:toolscodex.cmd).
+        # Windows 규칙으로 나누고 감싼 따옴표만 벗긴다.
+        return [
+            part[1:-1] if len(part) > 1 and part[0] == part[-1] and part[0] in "\"'" else part
+            for part in shlex.split(command, posix=False)
+        ]
     except ValueError:
         return [command]
 
@@ -1218,8 +1269,14 @@ def run_project_validation(
     for label, command in detect_validation_commands(root, environment):
         started = time.time()
         try:
-            result = subprocess.run(command, cwd=root, capture_output=True, timeout=180)
-            output = decode_cli_output(result.stdout or result.stderr).strip()
+            result = run_process_tree(command, cwd=root, timeout=180, active_name="자동 검증")
+            if CONTROL["stopped"]:
+                break  # /stop이 검증을 끊었다 — 끊긴 결과를 실패로 기록하지 않는다.
+            # unittest는 결과를 stderr에, pytest는 stdout에 쓴다. 둘 다 남긴다.
+            output = "\n".join(
+                part for part in (decode_cli_output(result.stdout).strip(),
+                                  decode_cli_output(result.stderr).strip()) if part
+            )
             results.append({
                 "label": label,
                 "ok": result.returncode == 0,
@@ -1354,9 +1411,6 @@ def run_cli(
             )
             with ACTIVE_PROCESS_LOCK:
                 ACTIVE_PROCESSES[tool_name] = process
-            if input_text is not None and process.stdin is not None:
-                process.stdin.write(input_text.encode("utf-8"))
-                process.stdin.close()
 
             output_queue: queue.Queue = queue.Queue()
 
@@ -1365,10 +1419,22 @@ def run_cli(
                     output_queue.put((name, raw_line))
                 output_queue.put((name, None))
 
+            def write_stdin() -> None:
+                # 읽기 스레드와 함께 돌려야 큰 프롬프트를 쓰는 동안 출력 파이프가 차서 서로
+                # 기다리지 않는다. CLI가 먼저 끝나 파이프가 닫히면(BrokenPipeError) 진짜 원인은
+                # stderr와 종료 코드에 남으므로 여기서는 삼킨다.
+                try:
+                    process.stdin.write(input_text.encode("utf-8"))
+                    process.stdin.close()
+                except OSError:
+                    pass
+
             threads = [
                 threading.Thread(target=read_stream, args=("stdout", process.stdout), daemon=True),
                 threading.Thread(target=read_stream, args=("stderr", process.stderr), daemon=True),
             ]
+            if input_text is not None and process.stdin is not None:
+                threads.append(threading.Thread(target=write_stdin, daemon=True))
             for thread in threads:
                 thread.start()
 
@@ -1377,10 +1443,23 @@ def run_cli(
             final_messages: list[str] = []
             closed_streams = 0
             deadline = time.monotonic() + timeout if timeout else None
+            exited_at = None
             while closed_streams < 2:
-                if deadline and time.monotonic() >= deadline:
+                now = time.monotonic()
+                if deadline and now >= deadline:
                     terminate_process_tree(process)
-                    raise subprocess.TimeoutExpired(cmd, timeout)
+                    raise subprocess.TimeoutExpired(
+                        cmd, timeout,
+                        output="\n".join(final_messages or stdout_lines),
+                        stderr="\n".join(stderr_lines),
+                    )
+                if exited_at is None:
+                    if process.poll() is not None:
+                        exited_at = now
+                elif now - exited_at >= CLI_PIPE_DRAIN_SECONDS and output_queue.empty():
+                    # CLI는 끝났는데 CLI가 띄운 자식(개발 서버 등)이 출력 파이프를 물려받아
+                    # 붙잡고 있다. 기다리면 시간 초과까지 멈추고 끝난 답변을 버리게 된다.
+                    break
                 try:
                     stream_name, raw_line = output_queue.get(timeout=0.2)
                 except queue.Empty:
@@ -1404,11 +1483,10 @@ def run_cli(
             stdout = "\n".join(final_messages) if final_messages else "\n".join(stdout_lines)
             return subprocess.CompletedProcess(cmd, returncode, stdout, "\n".join(stderr_lines))
 
-        result = subprocess.run(
+        result = run_process_tree(
             cmd,
             cwd=cwd or ROOT,
-            capture_output=True,
-            input=input_text.encode("utf-8") if input_text is not None else None,
+            input_bytes=input_text.encode("utf-8") if input_text is not None else None,
             timeout=timeout,
         )
         return subprocess.CompletedProcess(
@@ -1421,12 +1499,18 @@ def run_cli(
         print_cli_hint(tool_name, command, f"명령을 찾을 수 없음 ({exc})")
     except PermissionError as exc:
         print_cli_hint(tool_name, command, f"권한 거부 ({exc})")
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         with ACTIVE_PROCESS_LOCK:
             active = ACTIVE_PROCESSES.get(tool_name)
             if active is not None and active.poll() is not None:
                 ACTIVE_PROCESSES.pop(tool_name, None)
         print_cli_hint(tool_name, command, "실행 시간 초과")
+        # "실행하지 못함"과 구분하고, 시간 초과 전까지 받은 부분 출력을 보존한다.
+        result = subprocess.CompletedProcess(
+            cmd, -1, decode_cli_output(exc.output), decode_cli_output(exc.stderr)
+        )
+        result.timed_out = timeout
+        return result
     return None
 
 
@@ -1467,11 +1551,7 @@ def _probe_runner(command: str):
 
     def run(args: list[str]) -> clicheck.CommandResult:
         try:
-            result = subprocess.run(
-                resolve_command(command) + args,
-                capture_output=True,
-                timeout=30,
-            )
+            result = run_process_tree(resolve_command(command) + args, timeout=30)
         except FileNotFoundError:
             return clicheck.CommandResult(returncode=127, not_found=True)
         except PermissionError as exc:
@@ -1498,11 +1578,7 @@ def _make_probe_workspace(name: str) -> Path:
 
 def _codex_help_text() -> str:
     try:
-        result = subprocess.run(
-            resolve_command(CODEX_CMD) + ["exec", "--help"],
-            capture_output=True,
-            timeout=30,
-        )
+        result = run_process_tree(resolve_command(CODEX_CMD) + ["exec", "--help"], timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return decode_cli_output(result.stdout) + decode_cli_output(result.stderr)
@@ -1653,6 +1729,10 @@ def _finalize_cli_result(tool_name: str, result) -> str:
     """subprocess 결과를 응답 문자열로 정리한다. 실패/빈 응답을 구분해서 원인을 남긴다."""
     if result is None:
         return f"({tool_name} 응답 없음 — 실행 실패: 프로세스를 실행하지 못함)"
+    if getattr(result, "timed_out", None):
+        partial = (result.stdout or "").strip()
+        notice = f"({tool_name} 응답 없음 — 실행 시간 초과: {result.timed_out}초)"
+        return f"{notice}\n\n시간 초과 전 부분 출력:\n{partial}" if partial else notice
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         return f"({tool_name} 응답 없음 — 종료 코드 {result.returncode}: {detail[:300]})"
@@ -2045,10 +2125,10 @@ def atomic_write_json(path: Path, state: dict) -> None:
     실패하면 조용히 넘어가지 않는다 — 디스크가 가득 찼는데 계속 진행하면
     사용자는 저장됐다고 믿고 작업을 잃는다.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(state, ensure_ascii=False, indent=2)
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         temp_path.write_text(payload, encoding="utf-8")
         os.replace(temp_path, path)
     except OSError as exc:
@@ -2062,8 +2142,19 @@ LAST_SAVE_ERROR: dict[str, str] = {"message": ""}
 
 
 def save_state(state: dict) -> None:
+    # 세션 파일 저장 실패(목록 조회와 겹친 WinError 5 등)도 여기서 멈춰야 한다. 예외가 새면
+    # 워커 스레드가 죽고 finally의 save_state가 다시 실패해 worker_running이 True로 남는다.
     try:
         atomic_write_json(STATE_PATH, state)
+        session_id = state.get("id")
+        if session_id:
+            try:
+                session_path = session_json_path(session_id)
+            except UnsafePathError as exc:
+                # 세션 ID가 오염된 상태로는 어디에도 쓰지 않는다.
+                print(f"  ⚠️  세션 파일을 저장하지 않았습니다 — {exc}")
+            else:
+                atomic_write_json(session_path, state)
     except StateSaveError as exc:
         # 진행은 계속하되(메모리 상태는 살아 있다) 사용자에게 복구 가능한 오류로 알린다.
         LAST_SAVE_ERROR["message"] = (
@@ -2075,14 +2166,6 @@ def save_state(state: dict) -> None:
     if LAST_SAVE_ERROR["message"]:
         LAST_SAVE_ERROR["message"] = ""
         print("  ✅ 상태 저장이 복구되었습니다.")
-    SESSIONS_DIR.mkdir(exist_ok=True)
-    session_id = state.get("id")
-    if session_id:
-        try:
-            atomic_write_json(session_json_path(session_id), state)
-        except UnsafePathError as exc:
-            # 세션 ID가 오염된 상태로는 어디에도 쓰지 않는다.
-            print(f"  ⚠️  세션 파일을 저장하지 않았습니다 — {exc}")
 
 
 _SKIPPED_SESSION_WARNINGS: set[str] = set()
@@ -2632,11 +2715,11 @@ CONTROL = {
 
 
 def waiting_for_user_response(state: dict | None = None) -> bool:
+    # 대기 여부는 질문 자체로만 판단한다 (normalize_state와 같은 규칙). workflow_status는
+    # 승인 대기·중단·거절이 덮어쓰기 때문에, 그 값을 보면 /approve·/resume·채팅이
+    # 답하지 않은 질문을 지나쳐 버린다. 질문은 답변이나 새 주제로만 지워진다.
     current = state if state is not None else STATE
-    return (
-        current.get("workflow_status") == workflow.WAITING_FOR_USER_RESPONSE
-        and bool(current.get("pending_user_question"))
-    )
+    return bool(current.get("pending_user_question"))
 
 
 def register_user_question(agent: str, phase: str, question_data: dict) -> bool:
@@ -2775,7 +2858,9 @@ def role_scope_violations(agent: str, changed_paths: list[dict], state: dict) ->
     violations = []
     for item in changed_paths:
         path = str(item.get("path", "")).replace("\\", "/")
-        top_level = path.rstrip("/").split("/", 1)[0]
+        if path.endswith("/"):
+            continue  # 폴더 항목(스냅샷의 "x/")은 파일 변경이 아니다 — 안의 파일은 따로 검사된다.
+        top_level = path.split("/", 1)[0]
         if top_level in {
             ".pytest_cache", ".ruff_cache", ".codex_pytest_tmp", ".agents",
             ".venv", "venv", "__pycache__", "roundtable_memory", "sessions",
@@ -2890,7 +2975,10 @@ def update_discussion_project_access(access: str) -> dict:
 
 
 def update_workspace_selection(path_text: str, access: str) -> dict:
-    candidate = Path(path_text).expanduser()
+    candidate = Path(path_text.strip()).expanduser()
+    if not path_text.strip() or not candidate.is_absolute():
+        # Path("")·상대 경로는 서버 실행 폴더로 풀려 그대로 저장된다 (fail closed 우회).
+        return {"error": "작업 폴더가 지정되지 않았습니다. '작업 폴더 선택'으로 폴더를 골라주세요."}
     try:
         candidate = candidate.resolve(strict=True)
     except (OSError, RuntimeError):
@@ -3032,12 +3120,15 @@ def add_active_work_event(agent: str, event: dict) -> None:
         entry = {
             "time": ts(),
             "kind": event.get("kind", "log"),
-            "text": str(event.get("text", "작업 중"))[:300],
+            "text": clicheck.redact(event.get("text", "작업 중"), 300),
         }
         if event.get("paths"):
             entry["paths"] = [str(path)[:240] for path in event["paths"][:20]]
         if event.get("cost_usd") is not None:
             entry["cost_usd"] = event["cost_usd"]
+            # CLI 실행마다 한 번 오는 최종 비용이다. Claude 자동 교정 재시도처럼 한 턴에
+            # 두 번 실행되면 둘 다 더한다 (마지막 값만 쓰면 첫 실행 비용이 빠진다).
+            STATE["active_cost_usd"] = STATE.get("active_cost_usd", 0.0) + float(event["cost_usd"] or 0.0)
         logs = STATE.setdefault("active_work_log", [])
         if logs and logs[-1].get("kind") == entry["kind"] and logs[-1].get("text") == entry["text"]:
             logs[-1].update(entry)
@@ -3299,8 +3390,8 @@ def coding_limit_reason(state: dict) -> str | None:
     if started_at and time.time() - started_at >= limits["max_minutes"] * 60:
         return f"최대 실행 시간 {limits['max_minutes']}분 도달"
     used_tokens = max(
-        int(state.get("total_actual_tokens", 0) or 0),
-        int(state.get("total_est_tokens", 0) or 0),
+        int(state.get("total_actual_tokens", 0) or 0) - int(state.get("coding_start_actual_tokens", 0) or 0),
+        int(state.get("total_est_tokens", 0) or 0) - int(state.get("coding_start_est_tokens", 0) or 0),
     )
     if used_tokens >= limits["max_tokens"]:
         return f"최대 토큰 {limits['max_tokens']:,} 도달"
@@ -3791,6 +3882,7 @@ def run_step(
         STATE["active_prompt_chars"] = len(prompt)
         STATE["active_work_log"] = []
         STATE["active_usage"] = {}
+        STATE["active_cost_usd"] = 0.0
         STATE["workflow_status"] = (
             workflow.CODING if cli_mode == "coding" else workflow.DEBATING
         )
@@ -3815,15 +3907,27 @@ def run_step(
             "run_status": runstatus.RunStatus.CLI_FAILED,
             "workspace_blocked": True,
         })
-        CONTROL["stopped"] = True
+        # 실패로 돌려줘야 워커가 단계를 넘기지 않고, 개입 요청도 재시도 큐에 남는다
+        # (CONTROL["stopped"]를 켜면 process_pending_intervention이 요청을 버린다).
         with STATE_LOCK:
             STATE["workflow_status"] = workflow.FAILED
             save_state(STATE)
-        return message
+        return False
     before_snapshot, before_truncated = (
         snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
     )
     before_texts = capture_project_texts(project_path) if cli_mode == "coding" else {}
+    if CONTROL["stopped"]:
+        # 프롬프트 작성·스냅샷 중에 /stop이 눌렸다. 아직 띄운 CLI가 없으니 여기서 멈춘다.
+        with STATE_LOCK:
+            if STATE.get("id") == session_id:
+                STATE["active_agent"] = None
+                STATE["active_phase"] = None
+                STATE["active_started_at"] = None
+                STATE["active_cli_mode"] = None
+                STATE["active_prompt_chars"] = 0
+                save_state(STATE)
+        return False
     t0 = time.time()
     try:
         ask_func = ASK_FUNCS[agent]
@@ -3871,10 +3975,7 @@ def run_step(
     with STATE_LOCK:
         work_log = list(STATE.get("active_work_log", []))
         actual_usage = dict(STATE.get("active_usage", {}))
-    actual_cost_usd = next(
-        (event.get("cost_usd") for event in reversed(work_log) if event.get("cost_usd") is not None),
-        0.0,
-    )
+        actual_cost_usd = round(float(STATE.get("active_cost_usd", 0.0) or 0.0), 6)
     question_clean_text, pending_question = workflow.extract_stop_and_ask_user(raw_text)
     call_clean_text, agent_calls = extract_agent_calls(question_clean_text, agent, cli_mode)
     if not allow_agent_calls(state_snapshot.get("mode", "discussion"), phase):
@@ -3892,6 +3993,8 @@ def run_step(
         phase,
     )
     text, output_truncated = clip_agent_output(visible_text)
+    # 대화·로그·메모리·전사본에 남기 전에 API 키·토큰으로 보이는 값을 가린다.
+    text = clicheck.redact(text, None)
     if pending_question and not text:
         text = pending_question["question"]
     if approval_requested and not text:
@@ -4103,7 +4206,11 @@ def worker_loop(session_id: str) -> None:
                     STATE["coding_stage"] = "iteration"
                     STATE["coding_cycle"] = 1
                     STATE["coding_cycle_step"] = 0
-                    STATE["coding_started_at"] = STATE.get("coding_started_at") or time.time()
+                    # 시간·토큰 한도는 목표 사이클부터 잰다. 계획·승인 단계(사용자 대기 포함)가
+                    # 한도를 먼저 써버리면 사이클 1이 시작하자마자 끝난다.
+                    STATE["coding_started_at"] = time.time()
+                    STATE["coding_start_actual_tokens"] = int(STATE.get("total_actual_tokens", 0) or 0)
+                    STATE["coding_start_est_tokens"] = int(STATE.get("total_est_tokens", 0) or 0)
                     STATE["coding_stopped"] = False
                     STATE["coding_stop_reason"] = ""
                     STATE["finished"] = False
@@ -4149,6 +4256,8 @@ def worker_loop(session_id: str) -> None:
                 expected_session_id=session_id,
             )
             if not succeeded:
+                if CONTROL["stopped"]:
+                    break  # 사용자 중단 — 실패로 기록하지 않는다 (/stop이 이미 상태를 정했다).
                 with STATE_LOCK:
                     if STATE.get("id") == session_id:
                         CONTROL["paused"] = True
@@ -4231,7 +4340,7 @@ def worker_loop(session_id: str) -> None:
                 enabled_agents = normalize_enabled_agents(STATE.get("enabled_agents"))
                 steps = steps_for_mode(mode, enabled_agents)
                 finished = (
-                    mode == "discussion"
+                    mode in ("discussion", "quick")
                     and STATE["step_index"] >= len(steps)
                     and not CONTROL["stopped"]
                 ) or bool(STATE.get("finished", False))
@@ -4243,8 +4352,12 @@ def worker_loop(session_id: str) -> None:
                 STATE["active_started_at"] = None
                 STATE["active_cli_mode"] = None
                 STATE["active_prompt_chars"] = 0
-                save_state(STATE)
                 messages_copy = list(STATE["messages"])
+                # 완료 뒤 개입으로 워커가 다시 끝날 때마다 전체 대화를 프로필에 또 붙이지 않는다.
+                profiled_count = int(STATE.get("profiled_message_count", 0) or 0)
+                if finished:
+                    STATE["profiled_message_count"] = len(messages_copy)
+                save_state(STATE)
             if CONTROL.get("worker_session_id") == session_id:
                 CONTROL["worker_running"] = False
                 CONTROL["worker_session_id"] = None
@@ -4254,7 +4367,7 @@ def worker_loop(session_id: str) -> None:
             render_html_snapshot()
         if same_session and finished:
             for agent in ("codex", "antigravity", "claude"):
-                update_profile(agent, messages_copy)
+                update_profile(agent, messages_copy[profiled_count:])
         separator("워커 종료" if not finished else "완료")
         if restart_pending:
             start_worker_if_needed(force=True)
@@ -4771,6 +4884,9 @@ def state_json_payload(include_feed: bool = False) -> dict:
         pending_user_question = workflow.normalize_user_question(
             STATE.get("pending_user_question")
         )
+        if pending_user_question:
+            # 승인 대기·중단이 상태 값을 덮어써도 화면은 계속 질문을 보여준다.
+            workflow_status = workflow.WAITING_FOR_USER_RESPONSE
         run_status = str(STATE.get("run_status", "") or runstatus.RunStatus.IDLE)
         state_snapshot = dict(STATE)
     if CONTROL["paused"] and run_status == runstatus.RunStatus.RUNNING:
@@ -5512,7 +5628,7 @@ def switch_mode(mode: str) -> dict:
                 STATE["plan_approved"] = False
                 STATE["coding_cycle"] = 0
                 STATE["coding_cycle_step"] = 0
-                STATE["coding_started_at"] = time.time()
+                STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
                 STATE["coding_progress"] = normalize_coding_progress(None)
                 STATE["coding_stopped"] = False
                 STATE["coding_stop_reason"] = ""
@@ -5885,7 +6001,7 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     STATE["plan_approved"] = False
                     STATE["coding_cycle"] = 0
                     STATE["coding_cycle_step"] = 0
-                    STATE["coding_started_at"] = time.time() if mode == "coding" else None
+                    STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
                     STATE["coding_progress"] = normalize_coding_progress(None)
                     STATE["coding_stopped"] = False
                     STATE["coding_stop_reason"] = ""

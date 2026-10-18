@@ -45,14 +45,16 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(sk-[A-Za-z0-9_\-]{8,})"),
     re.compile(r"(?i)\b(gh[pousr]_[A-Za-z0-9]{8,})"),
     re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{8,})"),
-    re.compile(r"(?i)\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*\s*[=:]\s*)(\S+)"),
+    # TOKEN(?!S): "max_tokens: 4096", "input_tokens=120" 같은 토큰 개수는 비밀값이 아니다.
+    re.compile(r"(?i)\b([A-Z0-9_]*(?:API_KEY|TOKEN(?!S)|SECRET|PASSWORD)[A-Z0-9_]*\s*[=:]\s*)(\S+)"),
     re.compile(r"(?i)(--(?:api-key|token|password)[= ])(\S+)"),
     re.compile(r"(?i)\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})"),
+    re.compile(r"\b(AIza[0-9A-Za-z_\-]{35})"),  # Google(Gemini) API 키
 )
 
 
-def redact(text: object, limit: int = 600) -> str:
-    """CLI 출력에서 인증 정보로 보이는 부분을 지운다."""
+def redact(text: object, limit: int | None = 600) -> str:
+    """CLI 출력에서 인증 정보로 보이는 부분을 지운다. ``limit=None``이면 자르지 않는다."""
     value = str(text or "")
     for pattern in _SECRET_PATTERNS:
         if pattern.groups >= 2:
