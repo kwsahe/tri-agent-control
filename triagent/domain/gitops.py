@@ -16,7 +16,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["GitResult", "is_repo", "is_clean", "current_branch", "prepare_work_branch", "commit_all"]
+__all__ = ["GitResult", "is_repo", "is_clean", "current_branch", "prepare_work_branch", "commit_paths"]
 
 
 @dataclass(frozen=True)
@@ -25,11 +25,11 @@ class GitResult:
     detail: str = ""
 
 
-def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
+def _git(root: Path, *args: str, input_text: str | None = None) -> subprocess.CompletedProcess:
     git = shutil.which("git") or "git"
     return subprocess.run(
         [git, "-C", str(root), *args],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+        input=input_text, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
     )
 
 
@@ -55,27 +55,45 @@ def prepare_work_branch(root: Path, branch: str) -> GitResult:
     """깨끗한 저장소에서 작업 브랜치로 옮긴다. 이미 그 브랜치면 그대로 둔다."""
     if not is_repo(root):
         return GitResult(False, "Git 저장소가 아니라 자동 커밋을 하지 않습니다.")
-    if current_branch(root) == branch:
-        return GitResult(True, branch)
-    if not is_clean(root):
-        return GitResult(False, "커밋되지 않은 변경이 있어 자동 커밋을 하지 않습니다. 먼저 커밋하거나 정리해주세요.")
-    result = _git(root, "switch", "-c", branch)
-    if result.returncode != 0:
-        result = _git(root, "switch", branch)   # 이미 있는 브랜치 (세션 재개)
+    try:
+        if current_branch(root) == branch:
+            return GitResult(True, branch)
+        if not is_clean(root):
+            return GitResult(False, "커밋되지 않은 변경이 있어 자동 커밋을 하지 않습니다. 먼저 커밋하거나 정리해주세요.")
+        result = _git(root, "switch", "-c", branch)
+        if result.returncode != 0:
+            result = _git(root, "switch", branch)   # 이미 있는 브랜치 (세션 재개)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return GitResult(False, f"git 실행 실패로 자동 커밋을 하지 않습니다: {exc}")
     if result.returncode != 0:
         return GitResult(False, f"작업 브랜치를 만들지 못했습니다: {result.stderr.strip()[:300]}")
     return GitResult(True, branch)
 
 
-def commit_all(root: Path, message: str) -> GitResult:
-    """변경이 있으면 전부 커밋하고 짧은 SHA를 돌려준다. 변경이 없으면 ok=True, detail=''."""
+def commit_paths(root: Path, message: str, paths: list[str]) -> GitResult:
+    """에이전트가 바꾼 파일만 커밋하고 짧은 SHA를 돌려준다. 바뀐 것이 없으면 ok=True, detail=''.
+
+    ``git add -A``로 전부 담지 않는다 — 사용자가 실행 중에 고친 파일, 이미 스테이지해 둔 것,
+    작업 폴더 밖(상위 저장소)의 파일이 섞이면 안 된다. 경로는 작업 폴더 기준 상대 경로다.
+    경로 목록은 stdin으로 넘겨 Windows 명령줄 길이 한도에 걸리지 않게 한다.
+    """
     try:
-        added = _git(root, "add", "-A")
+        listed = _git(root, "ls-files", "-z")
+        tracked = set(listed.stdout.split("\0")) if listed.returncode == 0 else set()
+        # 생성 후 삭제된 파일처럼 디스크에도 저장소에도 없는 경로는 git이 오류를 내므로 뺀다.
+        keep = [path for path in dict.fromkeys(paths) if path and ((root / path).exists() or path in tracked)]
+        if not keep:
+            return GitResult(True, "")
+        added = _git(root, "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul",
+                     input_text="\0".join(keep))
         if added.returncode != 0:
             return GitResult(False, added.stderr.strip()[:300])
-        if _git(root, "diff", "--cached", "--quiet").returncode == 0:
+        staged = _git(root, "diff", "--cached", "--name-only", "-z", "--relative")
+        to_commit = [path for path in keep if path in set(staged.stdout.split("\0"))]
+        if not to_commit:
             return GitResult(True, "")
-        committed = _git(root, "commit", "-q", "-m", message)
+        committed = _git(root, "commit", "-q", "-m", message, "--pathspec-from-file=-",
+                         "--pathspec-file-nul", input_text="\0".join(to_commit))
         if committed.returncode != 0:
             # 사용자 이름/이메일 미설정, pre-commit 훅 실패 등
             return GitResult(False, (committed.stderr or committed.stdout).strip()[:300])

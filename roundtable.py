@@ -657,7 +657,13 @@ ROLE_CATALOG = {
         "summary": "테스트, 재현 절차, 회귀 검증과 품질 기준을 담당합니다.",
         "scope": "테스트 코드와 테스트 설정",
         "can_write": True,
-        "patterns": ["tests/**", "test/**", "spec/**", "test_*.py", "*_test.*", "*.spec.*", "*.test.*", "pytest.ini", "tox.ini", "pyproject.toml", "playwright.config.*", "vitest.config.*", "jest.config.*"],
+        # fnmatch의 *는 "/"도 넘으므로 "*/tests/*"가 하위 폴더의 테스트까지 잡는다.
+        # 코딩 파이프라인의 테스트 담당이 이 범위를 쓴다 — 흔한 테스트 배치와 실행 산출물을 포함한다.
+        "patterns": ["tests/**", "test/**", "spec/**", "*/tests/*", "*/test/*", "*/spec/*",
+                     "__tests__/*", "*/__tests__/*", "test_*.py", "*/test_*.py", "tests.py", "*/tests.py",
+                     "conftest.py", "*/conftest.py", "*_test.*", "*.spec.*", "*.test.*",
+                     "pytest.ini", "tox.ini", "pyproject.toml", "playwright.config.*", "vitest.config.*", "jest.config.*",
+                     ".coverage", "coverage/*", "htmlcov/*", "test-results/*", "playwright-report/*"],
     },
     "reviewer": {
         "label": "코드 리뷰어",
@@ -2047,15 +2053,14 @@ def normalize_state(state: dict) -> dict:
     )
     # 파이프라인 전환 전에 진행 중이던 코딩 세션: 옛 단계 번호로 새 표를 가리키지 않게
     # 계획 처음(승인됐으면 사이클 진입 직전) 또는 현재 사이클 처음으로 옮기고 역할을 고정한다.
-    if (
-        state.get("mode") == "coding"
-        and state.get("pipeline_version") != PIPELINE_VERSION
-        and not state.get("finished")
-    ):
-        if state["coding_stage"] == "iteration":
-            state["coding_cycle_step"] = 0
-        else:
-            state["step_index"] = len(pipeline_planning_steps()) if state["plan_approved"] else 0
+    if state.get("mode") == "coding" and state.get("pipeline_version") != PIPELINE_VERSION:
+        # 끝난 세션도 역할은 고정한다 — 코딩 모드에서는 /roles로 바꿀 수 없어서, 토론 시절 역할이
+        # 남으면 후속 코딩 메시지가 고칠 수 없는 범위 위반에 걸린다. 위치는 진행 중일 때만 옮긴다.
+        if not state.get("finished"):
+            if state["coding_stage"] == "iteration":
+                state["coding_cycle_step"] = 0
+            else:
+                state["step_index"] = len(pipeline_planning_steps()) if state["plan_approved"] else 0
         state["agent_roles"] = pipeline_agent_roles()
     state["pipeline_version"] = PIPELINE_VERSION
     if state["coding_stage"] == "iteration" and not state.get("coding_started_at"):
@@ -2590,7 +2595,8 @@ def extract_review_verdict(text: str) -> tuple[str, str]:
     """
     lines = (text or "").rstrip().splitlines()
     if lines:
-        match = _REVIEW_VERDICT_RE.match(lines[-1])
+        # **REVIEW: PASS**, `REVIEW: PASS`처럼 마크다운으로 감싼 줄도 받는다.
+        match = _REVIEW_VERDICT_RE.match(lines[-1].strip().strip("*`_ "))
         if match:
             return "\n".join(lines[:-1]).rstrip(), match.group(1).lower()
     return text, ""
@@ -2889,6 +2895,9 @@ def can_continue_after_failed_step(state: dict, messages: list[dict]) -> bool:
     if step_index >= len(steps):
         return False
     expected_agent, expected_phase, _instruction, _cli_mode = steps[step_index]
+    if state.get("mode") == "coding" and expected_phase == CONFIRM_PHASE:
+        # 계획 턴을 건너뛰면 쓰지도 않은 계획에 승인을 묻게 된다 — 재시도만 허용한다.
+        return False
     actual_phase = str(last.get("phase", "")).split(" · ", 1)[0]
     return last.get("agent") == expected_agent and actual_phase == expected_phase
 
@@ -4177,8 +4186,11 @@ def prepare_pipeline_git(session_id: str) -> None:
         STATE["pipeline_git"] = {
             "enabled": result.ok,
             "branch": result.detail if result.ok else "",
+            "workspace": str(resolution.path),
             "note": "" if result.ok else result.detail,
             "commits": [],
+            # 여기 이후 메시지의 변경 파일만 다음 사이클 커밋에 담는다.
+            "committed_upto": len(STATE.get("messages", [])),
         }
         save_state(STATE)
     if result.ok:
@@ -4193,35 +4205,71 @@ def commit_cycle(session_id: str, cycle_number: int, verdict: str, validation_ok
             return
         git_state = dict(STATE.get("pipeline_git") or {})
         topic = re.sub(r"\s+", " ", STATE.get("topic", "")).strip()[:60]
+        messages = list(STATE.get("messages", []))
     if not git_state.get("enabled"):
         return
     resolution = resolve_project_workspace(require_write=True)
     if resolution.blocked or resolution.path is None:
         return
-    message = (
+    # 준비한 그 폴더의 그 작업 브랜치일 때만 커밋한다. 사용자가 main으로 돌아갔거나 작업 폴더를
+    # 바꿨거나 다른 세션의 브랜치에 있으면, 그 브랜치에 사용자 작업과 섞어 커밋하게 된다.
+    branch = git_state.get("branch", "")
+    on_branch = gitops.current_branch(resolution.path)
+    if str(resolution.path) != git_state.get("workspace") or on_branch != branch:
+        add_runtime_event(
+            f"사이클 {cycle_number} 커밋 안 함 — 작업 브랜치 {branch}가 아닙니다 "
+            f"(현재: {on_branch or '알 수 없음'}, 폴더: {resolution.path}).",
+            "warn",
+        )
+        return
+    # 마지막 커밋 이후 에이전트 턴(개입 포함)이 바꾼 파일만 담는다.
+    start = int(git_state.get("committed_upto", 0) or 0)
+    paths = list(dict.fromkeys(
+        str(item.get("path", ""))
+        for message in messages[start:]
+        for item in (message.get("meta") or {}).get("changed_paths", [])
+        if item.get("path") and not str(item.get("path")).endswith("/")
+    ))
+    message_text = (
         f"TriAgent cycle {cycle_number}: {topic}\n\n"
         f"Review: {verdict or 'none'} · Validation: {'pass' if validation_ok else 'fail'}\n"
         f"Session: {session_id}"
     )
-    result = gitops.commit_all(resolution.path, message)
+    result = gitops.commit_paths(resolution.path, message_text, paths)
     if not result.ok:
         add_runtime_event(f"사이클 {cycle_number} 커밋 실패 — {result.detail}", "warn")
         return
+    with STATE_LOCK:
+        if STATE.get("id") == session_id:
+            current = dict(STATE.get("pipeline_git") or {})
+            current["committed_upto"] = len(messages)
+            if result.detail:
+                current["commits"] = [*current.get("commits", []), {"cycle": cycle_number, "sha": result.detail}]
+            STATE["pipeline_git"] = current
+            save_state(STATE)
     if not result.detail:
         add_runtime_event(f"사이클 {cycle_number}: 변경이 없어 커밋하지 않았습니다.")
         return
-    with STATE_LOCK:
-        if STATE.get("id") == session_id:
-            commits = list((STATE.get("pipeline_git") or {}).get("commits", []))
-            commits.append({"cycle": cycle_number, "sha": result.detail})
-            STATE["pipeline_git"] = {**git_state, "commits": commits}
-            save_state(STATE)
     add_runtime_event(f"사이클 {cycle_number} 커밋: {result.detail} ({git_state.get('branch', '')})")
 
 
 def finish_pipeline_cycle(session_id: str, cycle_number: int) -> bool:
     """사이클 끝: 커밋하고, 검토 통과 + 검증 통과면 세션을 완료한다. 완료했으면 True."""
     marker = f"{REVIEW_PHASE} · 목표 사이클 {cycle_number}"
+    with STATE_LOCK:
+        if STATE.get("id") != session_id:
+            return False
+        validated_this_cycle = STATE.get("validation_cycle") == cycle_number
+    if not validated_this_cycle:
+        # 실패 턴 건너뛰기 등으로 이번 사이클 검증이 빠졌다. 이전 결과로 판정하지 않고 지금 검증한다.
+        add_runtime_event(f"사이클 {cycle_number} 자동 검증 (완료 판정 전)")
+        results = run_validation_for_current_workspace()
+        with STATE_LOCK:
+            if STATE.get("id") != session_id:
+                return False
+            STATE["validation_results"] = results
+            STATE["validation_cycle"] = cycle_number
+            save_state(STATE)
     with STATE_LOCK:
         if STATE.get("id") != session_id:
             return False
@@ -4275,12 +4323,21 @@ def worker_loop(session_id: str) -> None:
                     if coding_iteration else 0
                 )
                 limit_reason = coding_limit_reason(STATE) if coding_iteration else None
+                finished_already = bool(STATE.get("finished"))
+            if mode == "coding" and PIPELINE_IMPLEMENTER not in enabled_agents:
+                # 옛 세션을 Claude Code 없이 재개한 경우 — 구현 담당 없이 파이프라인을 돌리지 않는다.
+                CONTROL["paused"] = True
+                add_runtime_event("코딩 모드에는 구현 담당 Claude Code가 필요합니다. Claude Code를 켜고 재개해주세요.", "error")
+                break
             if CONTROL["approval_requested"]:
                 if not wait_for_user_approval(session_id):
                     break
                 continue
             if process_pending_intervention(session_id):
                 continue
+            if mode == "coding" and finished_already:
+                # 검토·검증 통과로 끝난 세션: 추가 질문에는 답하지만 새 사이클은 돌리지 않는다.
+                break
             if limit_reason:
                 with STATE_LOCK:
                     if STATE.get("id") == session_id:
@@ -4292,6 +4349,13 @@ def worker_loop(session_id: str) -> None:
                 add_runtime_event(f"목표 기반 코딩 종료: {limit_reason}")
                 break
             if mode == "coding" and not coding_iteration and step_index >= len(steps):
+                with STATE_LOCK:
+                    approval_missing = plan_approval_missing(STATE)
+                if approval_missing:
+                    # 거절 뒤 메시지 등으로 계획 다음에 왔지만 승인이 없다. 브랜치 전환·시간 측정
+                    # 전에 승인을 다시 받는다 — 루프 맨 위에서 대기한다.
+                    mark_approval_requested(PIPELINE_IMPLEMENTER, CONFIRM_PHASE)
+                    continue
                 with STATE_LOCK:
                     if STATE.get("id") != session_id:
                         break
@@ -4311,6 +4375,9 @@ def worker_loop(session_id: str) -> None:
                 prepare_pipeline_git(session_id)
                 continue
             if coding_iteration and step_index >= len(steps):
+                # 실패 턴을 건너뛰어 사이클 끝을 넘긴 경우에도 검증·커밋·완료 판정을 거친다.
+                if finish_pipeline_cycle(session_id, cycle_number):
+                    break
                 with STATE_LOCK:
                     STATE["coding_cycle"] = cycle_number + 1
                     STATE["coding_cycle_step"] = 0
@@ -4396,6 +4463,8 @@ def worker_loop(session_id: str) -> None:
                 with STATE_LOCK:
                     if STATE.get("id") == session_id:
                         STATE["validation_results"] = validation_results
+                        # 완료 판정이 이전 사이클의 결과를 쓰지 않도록 어느 사이클의 검증인지 남긴다.
+                        STATE["validation_cycle"] = cycle_number if coding_iteration else 0
                         failed_validations = [
                             result for result in validation_results if not result["ok"]
                         ]

@@ -643,7 +643,7 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         roundtable.STATE.update(
             topic="한도 테스트",
             mode="coding",
-            enabled_agents=["codex"],
+            enabled_agents=["claude", "codex"],   # 코딩 파이프라인은 구현 담당 Claude Code가 필요하다
             coding_stage="iteration",
             coding_cycle=4,
             coding_cycle_step=0,
