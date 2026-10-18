@@ -3,6 +3,7 @@
 모든 파일 조작은 TemporaryDirectory 안에서만 한다. 실제 모델 CLI는 부르지 않는다.
 """
 
+import json
 import shutil
 import subprocess
 import tempfile
@@ -558,6 +559,47 @@ class ValidationDetectionTests(unittest.TestCase):
         self.assertEqual(self.detect({"test_calc.py": ""}, has_pytest=True),
                          [("Python pytest", ["python", "-m", "pytest", "-q"])])
         self.assertEqual(self.detect({"calc.py": "", "tests/helpers.py": ""}), [])
+
+    def test_run_in_band_is_only_passed_to_jest(self):
+        """vitest는 --runInBand를 모르는 옵션으로 거부한다 (link21-ai-agent-hub에서 확인)."""
+        def npm_test(script):
+            commands = self.detect({"package.json": json.dumps({"scripts": {"test": script}})}, has_npm=True)
+            return commands[0][1]
+
+        self.assertEqual(npm_test("vitest run"), ["npm", "test"])
+        self.assertEqual(npm_test("jest"), ["npm", "test", "--", "--runInBand"])
+        self.assertEqual(npm_test("react-scripts test"), ["npm", "test"])
+
+    def test_project_venv_python_and_its_pytest_are_used(self):
+        """프로젝트 의존성과 pytest는 프로젝트 .venv에 있다 — TriAgent 자신의 Python으로는 못 돌린다."""
+        for venv_name in (".venv", "venv"):
+            with self.subTest(venv=venv_name):
+                [(label, command)] = self.detect({
+                    f"{venv_name}/Scripts/python.exe": "",
+                    f"{venv_name}/Lib/site-packages/pytest/__init__.py": "",
+                    "tests/test_app.py": "",
+                })
+                self.assertEqual(label, f"Python pytest · {venv_name}")
+                self.assertTrue(command[0].endswith(f"{venv_name}\\Scripts\\python.exe")
+                                or command[0].endswith(f"{venv_name}/Scripts/python.exe"), command)
+                self.assertEqual(command[1:], ["-m", "pytest", "-q"])
+
+    def test_project_venv_without_pytest_falls_back_to_unittest_in_that_venv(self):
+        [(label, command)] = self.detect({
+            ".venv/bin/python": "",                       # macOS/Linux 배치
+            "tests/test_app.py": "",
+        })
+        self.assertEqual(label, "Python unittest · .venv")
+        self.assertTrue(command[0].replace("\\", "/").endswith(".venv/bin/python"), command)
+        self.assertEqual(command[1:], ["-m", "unittest", "discover", "-s", "tests"])
+
+    def test_posix_venv_pytest_is_detected(self):
+        [(label, _command)] = self.detect({
+            ".venv/bin/python": "",
+            ".venv/lib/python3.12/site-packages/pytest/__init__.py": "",
+            "test_app.py": "",
+        })
+        self.assertEqual(label, "Python pytest · .venv")
 
 
 class ExecutionPlanTests(unittest.TestCase):

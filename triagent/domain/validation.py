@@ -74,6 +74,23 @@ def _npm_scripts(root: Path) -> dict:
     return scripts if isinstance(scripts, dict) else {}
 
 
+def _project_venv(root: Path) -> tuple[str, str, bool] | None:
+    """프로젝트 가상환경 ``(.venv|venv, Python 경로, pytest 설치 여부)``. 없으면 None.
+
+    프로젝트 의존성과 pytest는 보통 이 가상환경에만 있다. TriAgent 자신의 Python으로
+    돌리면 import가 실패하거나 pytest가 없어 unittest로 떨어져 테스트를 하나도 못 찾는다.
+    """
+    for name in (".venv", "venv"):
+        venv = root / name
+        for python in (venv / "Scripts" / "python.exe", venv / "bin" / "python"):
+            if python.is_file():
+                has_pytest = (venv / "Lib" / "site-packages" / "pytest").is_dir() or any(
+                    venv.glob("lib/python*/site-packages/pytest")
+                )
+                return name, str(python), has_pytest
+    return None
+
+
 def _python_test_start(root: Path) -> str:
     """unittest가 시작할 폴더 — ``tests/``에 테스트가 있으면 "tests", 루트에만 있으면 ".", 없으면 "".
 
@@ -111,31 +128,25 @@ def detect_validation_commands(
     if scripts and environment.has_npm:
         test_script = str(scripts.get("test") or "")
         if test_script and _PLACEHOLDER_TEST_SCRIPT not in test_script:
-            commands.append(("npm test", [environment.npm_executable, "test", "--", "--runInBand"]))
+            # --runInBand는 Jest 전용이다. vitest 등은 모르는 옵션으로 거부해 검증이 매번 실패한다.
+            extra = ["--", "--runInBand"] if "jest" in test_script else []
+            commands.append(("npm test", [environment.npm_executable, "test", *extra]))
         if scripts.get("build"):
             commands.append(("npm run build", [environment.npm_executable, "run", "build"]))
 
     test_start = _python_test_start(root)
     if test_start:
-        if environment.has_pytest:
+        venv = _project_venv(root)
+        python = venv[1] if venv else environment.python_executable
+        has_pytest = venv[2] if venv else environment.has_pytest
+        suffix = f" · {venv[0]}" if venv else ""
+        if has_pytest:
             # pytest는 루트와 tests/ 양쪽의 test_*.py를 스스로 찾는다.
-            commands.append(
-                ("Python pytest", [environment.python_executable, "-m", "pytest", "-q"])
-            )
+            commands.append((f"Python pytest{suffix}", [python, "-m", "pytest", "-q"]))
         else:
             # pytest가 없어도 test*.py는 표준 unittest로 실행할 수 있다.
             commands.append(
-                (
-                    "Python unittest",
-                    [
-                        environment.python_executable,
-                        "-m",
-                        "unittest",
-                        "discover",
-                        "-s",
-                        test_start,
-                    ],
-                )
+                (f"Python unittest{suffix}", [python, "-m", "unittest", "discover", "-s", test_start])
             )
 
     return commands[:MAX_VALIDATION_COMMANDS]
