@@ -539,18 +539,20 @@ REVIEW_PHASE = "검토"
 #: 코딩 단계 표가 바뀌면 올린다. 옛 세션의 단계 번호는 새 표에서 의미가 없다.
 PIPELINE_VERSION = 1
 
+# 답변 형식은 짧게 고정한다 — 함수 하나 추가에 계획 1,400자, 보고 수백 자가 나와 대화창이 읽히지 않았다.
 PIPELINE_CYCLE_STEPS = [
     ("claude", "구현",
-     "승인된 계획과 직전 사이클의 Codex 검토·자동 검증 결과(있다면)를 먼저 확인해. 아직 끝나지 않은 항목을 "
-     "계획 보고로 끝내지 말고 실제 코드로 구현해. 검토에서 지적된 결함이 있으면 그것부터 고쳐. "
-     "변경 파일과 결과만 간결하게 보고해.", "coding"),
+     "승인된 계획과 직전 사이클의 Codex 검토·자동 검증 결과(있다면)를 확인하고 실제 코드로 구현해. "
+     "검토에서 지적된 결함이 있으면 그것부터 고쳐. 테스트 파일은 Antigravity 담당이니 고치지 마. "
+     "답변은 2줄 이내로만 써라: `변경: 바꾼 파일` / `결과: 한 줄 요약`.", "coding"),
     ("antigravity", "테스트",
-     "Claude Code가 이번 사이클에 바꾼 기능을 확인하는 테스트를 테스트 파일(tests/, test_*.py, *.test.* 등)에만 "
-     "추가·수정하고 실행해. 제품 코드는 고치지 마. 실패하면 실패한 테스트, 원인과 재현 방법을 보고해.", "coding"),
+     "Claude Code가 이번 사이클에 바꾼 기능의 테스트를 테스트 파일(tests/, test_*.py, *.test.* 등)에만 "
+     "추가·수정하고 실행해. 제품 코드는 고치지 마. "
+     "답변은 2줄 이내로만 써라: `테스트: 추가·수정한 파일과 경우 수` / `결과: 통과 n개, 또는 실패한 테스트와 원인`.", "coding"),
     ("codex", REVIEW_PHASE,
-     "이번 사이클의 변경과 자동 검증 결과를 승인된 계획에 대조해 읽기 전용으로 검토해. 결함, 누락된 요구사항, "
-     "회귀 위험, 빠진 테스트를 우선순위로 정리해. 파일은 수정하지 마. 고칠 것이 없으면 마지막 줄에 "
-     "REVIEW: PASS, 고칠 것이 있으면 마지막 줄에 REVIEW: CHANGES만 써라.", "discussion"),
+     "이번 사이클의 변경과 자동 검증 결과를 승인된 계획에 대조해 읽기 전용으로 검토해. 파일은 수정하지 마. "
+     "답변은 최대 3줄: 고칠 점을 중요한 순서로 한 줄씩(없으면 `지적 없음`). "
+     "마지막 줄에는 고칠 것이 없으면 REVIEW: PASS, 있으면 REVIEW: CHANGES만 써라.", "discussion"),
 ]
 
 
@@ -558,9 +560,10 @@ def pipeline_planning_steps(enabled_agents: list[str] | None = None) -> list[tup
     """계획 단계 — Claude 한 번. 이 턴이 곧 승인 요청이다."""
     return [(
         PIPELINE_IMPLEMENTER, CONFIRM_PHASE,
-        "사용자 요청과 프로젝트 파일을 읽고 이번 작업의 구현 계획을 3~7개 항목으로 정리해. 각 항목에 수정할 파일과 "
-        "완료 기준(어떤 테스트·검증으로 확인할지)을 적어. 담당은 고정이다: Claude Code가 구현, Antigravity가 테스트, "
-        "Codex가 검토. 아직 파일은 수정하지 마. "
+        "사용자 요청과 프로젝트 파일을 읽고 구현 계획을 짧게 써라. 아직 파일은 수정하지 마. "
+        "담당은 고정이다(구현 Claude Code, 테스트 Antigravity, 검토 Codex) — 다시 설명하지 마. "
+        "계획은 5줄 이내, 이 형식만: `파일: 바꿀 파일` / `변경: 핵심 동작 한 줄씩(최대 3줄)` / "
+        "`테스트: 확인할 경우를 쉼표로 나열`. 서론·배경·완료 기준 표는 쓰지 마. "
         f"마지막 줄에 {APPROVAL_TOKEN}만 써라.",
         "discussion",
     )]
@@ -3322,6 +3325,22 @@ def bubble_html(m: dict) -> str:
                 f'</details>'
             )
 
+    if m["agent"] in AGENT_ORDER and meta:
+        # 모델 턴은 한 줄 요약으로 접는다. 승인할 계획·실패·최종 보고는 읽어야 하므로 펼친 채 둔다.
+        open_attr = " open" if (
+            phase in {CONFIRM_PHASE, "최종 보고"} or meta.get("ok") is False or meta.get("approval_requested")
+        ) else ""
+        return f"""
+    <div class="row {side}{highlight_class}">
+      <details class="bubble turn-fold"{open_attr} style="--accent:{agent['color']}">
+        <summary class="turn-line">{avatar_html}{turn_summary_html(m, meta)}
+          <span class="time">{html.escape(m['time'])}</span></summary>
+        <div class="text">{render_text_html(m['text'])}</div>
+        {stats_html}
+        {work_html}
+      </details>
+    </div>"""
+
     return f"""
     <div class="row {side}{highlight_class}">
       <div class="bubble" style="--accent:{agent['color']}">
@@ -3336,6 +3355,32 @@ def bubble_html(m: dict) -> str:
         {work_html}
       </div>
     </div>"""
+
+
+def turn_summary_html(m: dict, meta: dict) -> str:
+    """접힌 턴의 한 줄: 상태 · 모델 · 단계 · 시간 · 바꾼 파일 · 판정 · 답변 첫 줄."""
+    phase = m.get("phase", "")
+    icon = "❌" if meta.get("ok") is False else ("📝" if phase == CONFIRM_PHASE else "✅")
+    facts = []
+    if meta.get("elapsed") is not None:
+        facts.append(f'{meta["elapsed"]:.0f}초' if isinstance(meta["elapsed"], (int, float)) else f'{meta["elapsed"]}초')
+    files = [Path(item["path"]).name for item in meta.get("changed_paths", [])
+             if item.get("path") and not str(item["path"]).endswith("/")]
+    if files:
+        facts.append(", ".join(files[:3]) + (f" 외 {len(files) - 3}개" if len(files) > 3 else ""))
+    verdict = str(meta.get("review_verdict") or "")
+    if verdict:
+        facts.append(verdict.upper())
+    if meta.get("approval_requested"):
+        facts.append("승인 필요")
+    first_line = next((line.strip(" #*-`>") for line in str(m.get("text", "")).splitlines() if line.strip()), "")
+    facts_html = f'<span class="turn-facts">{html.escape(" · ".join(facts))}</span>' if facts else ""
+    return (
+        f'<span class="turn-icon" aria-hidden="true">{icon}</span>'
+        f'<span class="name">{html.escape(AGENTS[m["agent"]]["label"])}</span>'
+        f'<span class="phase">{html.escape(phase)}</span>{facts_html}'
+        f'<span class="turn-preview">{html.escape(first_line[:120])}</span>'
+    )
 
 
 def status_text() -> str:

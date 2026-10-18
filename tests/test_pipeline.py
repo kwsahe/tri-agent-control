@@ -602,6 +602,63 @@ class ValidationDetectionTests(unittest.TestCase):
         self.assertEqual(label, "Python pytest · .venv")
 
 
+class CompactOutputTests(unittest.TestCase):
+    """함수 하나 추가에 계획 1,400자·보고 수백 자가 나왔다 — 단계별 답변 형식을 짧게 고정한다."""
+
+    def test_step_instructions_fix_a_short_answer_format(self):
+        plan = roundtable.pipeline_planning_steps()[0][2]
+        implement, test, review = (step[2] for step in roundtable.PIPELINE_CYCLE_STEPS)
+        self.assertIn("5줄 이내", plan)
+        self.assertIn(roundtable.APPROVAL_TOKEN, plan)
+        self.assertIn("2줄 이내", implement)
+        self.assertIn("테스트 파일은 Antigravity 담당", implement)
+        self.assertIn("2줄 이내", test)
+        self.assertIn("최대 3줄", review)
+        self.assertIn("REVIEW: PASS", review)
+
+
+class TurnSummaryTests(unittest.TestCase):
+    """대화창은 모델 턴마다 한 줄 요약을 보여주고, 원문·통계·diff는 펼쳐야 보인다."""
+
+    def message(self, agent="claude", phase="구현 · 목표 사이클 1", text="변경: text_tools.py\n결과: slugify 추가", **meta):
+        base = {"elapsed": 64.3, "ok": True, "cli_mode": "coding",
+                "changed_paths": [{"path": "playground/text_tools.py", "change": "수정"},
+                                  {"path": "tests/", "change": "생성"}]}
+        base.update(meta)
+        return {"agent": agent, "phase": phase, "time": "18:12:01", "text": text, "meta": base}
+
+    def test_model_turn_is_one_folded_line_with_the_key_facts(self):
+        html_text = roundtable.bubble_html(self.message())
+        self.assertIn('<details class="bubble turn-fold"', html_text)
+        self.assertNotIn(" open>", html_text.split("<summary")[0])
+        summary = html_text.split("<summary", 1)[1].split("</summary>", 1)[0]
+        for fact in ("✅", "Claude Code", "구현 · 목표 사이클 1", "64초", "text_tools.py", "변경: text_tools.py"):
+            self.assertIn(fact, summary)
+        self.assertNotIn("tests/", summary)   # 폴더 항목은 파일 목록에서 뺀다
+        self.assertIn("slugify 추가", html_text.split("</summary>", 1)[1])   # 원문은 펼친 안쪽
+
+    def test_review_verdict_shows_in_the_line(self):
+        html_text = roundtable.bubble_html(self.message(
+            agent="codex", phase=f"{roundtable.REVIEW_PHASE} · 목표 사이클 1", text="지적 없음",
+            cli_mode="discussion", changed_paths=[], review_verdict="pass"))
+        self.assertIn("PASS", html_text.split("</summary>", 1)[0])
+
+    def test_plans_waiting_for_approval_and_failures_start_open(self):
+        plan = roundtable.bubble_html(self.message(phase=roundtable.CONFIRM_PHASE, approval_requested=True))
+        failed = roundtable.bubble_html(self.message(ok=False))
+        for html_text in (plan, failed):
+            self.assertIn('<details class="bubble turn-fold" open', html_text)
+        self.assertIn("❌", failed.split("</summary>", 1)[0])
+
+    def test_user_messages_are_not_folded(self):
+        html_text = roundtable.bubble_html({"agent": "user", "phase": "승인", "time": "18:11", "text": "승인"})
+        self.assertNotIn("turn-fold", html_text)
+
+    def test_summary_escapes_model_text(self):
+        html_text = roundtable.bubble_html(self.message(text="<img src=x onerror=alert(1)> 결과"))
+        self.assertNotIn("<img src=x", html_text.split("</summary>", 1)[0])
+
+
 class ExecutionPlanTests(unittest.TestCase):
     def test_coding_plan_counts_one_plan_call_plus_three_per_cycle(self):
         plan = roundtable.mode_execution_plan("coding", ALL)
