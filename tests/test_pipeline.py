@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import isolation  # noqa: F401  (실제 데이터 폴더 격리 — 반드시 roundtable보다 먼저)
 import roundtable
+from triagent.domain import gitops
 
 SESSION_ID = "20260101_000000_000030"
 ALL = list(roundtable.AGENT_ORDER)
@@ -104,6 +105,65 @@ class ReviewTurnTests(unittest.TestCase):
     def test_verdict_survives_a_clipped_long_review(self, *_):
         result = self.run_review("가" * (roundtable.OUTPUT_MAX_CHARS * 2) + "\nREVIEW: CHANGES")
         self.assertEqual(result["meta"]["review_verdict"], "changes")
+
+
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(root), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@unittest.skipUnless(shutil.which("git"), "git이 없으면 커밋을 검증할 수 없다")
+class GitOpsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def init_repo(self) -> None:
+        git(self.root, "init", "-q", "-b", "main")
+        git(self.root, "config", "user.email", "test@example.com")
+        git(self.root, "config", "user.name", "Test")
+        git(self.root, "config", "core.autocrlf", "false")
+        (self.root / "app.py").write_text("x = 1\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "init")
+
+    def test_not_a_repo_is_refused_without_side_effects(self):
+        result = gitops.prepare_work_branch(self.root, "triagent/s1")
+        self.assertFalse(result.ok)
+        self.assertIn("Git 저장소가 아니", result.detail)
+        self.assertFalse((self.root / ".git").exists())
+
+    def test_clean_repo_switches_to_the_work_branch(self):
+        self.init_repo()
+        result = gitops.prepare_work_branch(self.root, "triagent/s1")
+        self.assertEqual(result, gitops.GitResult(True, "triagent/s1"))
+        self.assertEqual(gitops.current_branch(self.root), "triagent/s1")
+        # 다시 불러도 그대로 성공한다 (재개 시).
+        self.assertTrue(gitops.prepare_work_branch(self.root, "triagent/s1").ok)
+
+    def test_dirty_repo_keeps_the_users_changes_and_branch(self):
+        self.init_repo()
+        (self.root / "app.py").write_text("x = 2  # 사용자 작업 중\n", encoding="utf-8")
+        result = gitops.prepare_work_branch(self.root, "triagent/s1")
+        self.assertFalse(result.ok)
+        self.assertIn("커밋되지 않은 변경", result.detail)
+        self.assertEqual(gitops.current_branch(self.root), "main")
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "x = 2  # 사용자 작업 중\n")
+
+    def test_commit_all_returns_sha_and_skips_when_nothing_changed(self):
+        self.init_repo()
+        gitops.prepare_work_branch(self.root, "triagent/s1")
+        (self.root / "new.py").write_text("y = 1\n", encoding="utf-8")
+        result = gitops.commit_all(self.root, "TriAgent cycle 1: test")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.detail, git(self.root, "rev-parse", "--short", "HEAD"))
+        self.assertEqual(git(self.root, "log", "-1", "--format=%s"), "TriAgent cycle 1: test")
+        self.assertEqual(git(self.root, "rev-parse", "--short", "main"),
+                         git(self.root, "rev-parse", "--short", "HEAD~1"))  # main은 그대로
+        self.assertEqual(gitops.commit_all(self.root, "again"), gitops.GitResult(True, ""))
 
 
 if __name__ == "__main__":
