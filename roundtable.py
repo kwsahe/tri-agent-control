@@ -4199,7 +4199,8 @@ def prepare_pipeline_git(session_id: str) -> None:
         add_runtime_event(f"자동 커밋 안 함 — {result.detail}", "warn")
 
 
-def commit_cycle(session_id: str, cycle_number: int, verdict: str, validation_ok: bool) -> None:
+def commit_cycle(session_id: str, cycle_number: int, verdict: str, validation: str) -> None:
+    """validation은 "pass" | "fail" | "none"(검증 명령 없음)."""
     with STATE_LOCK:
         if STATE.get("id") != session_id:
             return
@@ -4232,7 +4233,7 @@ def commit_cycle(session_id: str, cycle_number: int, verdict: str, validation_ok
     ))
     message_text = (
         f"TriAgent cycle {cycle_number}: {topic}\n\n"
-        f"Review: {verdict or 'none'} · Validation: {'pass' if validation_ok else 'fail'}\n"
+        f"Review: {verdict or 'none'} · Validation: {validation}\n"
         f"Session: {session_id}"
     )
     result = gitops.commit_paths(resolution.path, message_text, paths)
@@ -4279,20 +4280,30 @@ def finish_pipeline_cycle(session_id: str, cycle_number: int) -> bool:
              if message.get("phase") == marker),
             "",
         )
-        validation_ok = all(result.get("ok") for result in STATE.get("validation_results") or [])
+        results = list(STATE.get("validation_results") or [])
+        # 검증 명령이 없으면 "통과"가 아니라 "없음"이다 — 통과로 기록하면 검증한 척하게 된다.
+        validation = "none" if not results else ("pass" if all(r.get("ok") for r in results) else "fail")
         has_reviewer = any(step[1] == REVIEW_PHASE for step in goal_coding_steps(STATE.get("enabled_agents")))
-    commit_cycle(session_id, cycle_number, verdict, validation_ok)
-    if not validation_ok or (has_reviewer and verdict != "pass"):
+    commit_cycle(session_id, cycle_number, verdict, validation)
+    if validation == "fail" or (has_reviewer and verdict != "pass"):
         return False
+    reason = {
+        (True, "pass"): "검토·검증 통과",
+        (True, "none"): "검토 통과 · 자동 검증 없음",
+        (False, "pass"): "자동 검증 통과 · 검토 담당 없음",
+        (False, "none"): "검토·자동 검증 없이 완료",
+    }[(has_reviewer, validation)]
     with STATE_LOCK:
         if STATE.get("id") != session_id:
             return False
         STATE["finished"] = True
         STATE["coding_stopped"] = True
-        STATE["coding_stop_reason"] = "검토·검증 통과"
+        STATE["coding_stop_reason"] = reason
         STATE["workflow_status"] = workflow.COMPLETED
         save_state(STATE)
-    add_runtime_event(f"사이클 {cycle_number}: 검토·검증 통과 — 작업 완료")
+    if validation == "none":
+        add_runtime_event("자동 검증 명령을 찾지 못해 검증 없이 완료했습니다. 테스트가 실제로 실행됐는지 확인해주세요.", "warn")
+    add_runtime_event(f"사이클 {cycle_number}: {reason} — 작업 완료")
     return True
 
 

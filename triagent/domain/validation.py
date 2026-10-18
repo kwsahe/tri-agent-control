@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 __all__ = [
     "ToolEnvironment",
@@ -75,14 +74,21 @@ def _npm_scripts(root: Path) -> dict:
     return scripts if isinstance(scripts, dict) else {}
 
 
-def _has_python_tests(root: Path, exists: Callable[[Path], bool] | None = None) -> bool:
-    tests_dir = root / "tests"
-    if not tests_dir.is_dir():
-        return False
+def _python_test_start(root: Path) -> str:
+    """unittest가 시작할 폴더 — ``tests/``에 테스트가 있으면 "tests", 루트에만 있으면 ".", 없으면 "".
+
+    코딩 파이프라인의 테스트 담당은 루트에 ``test_*.py``를 만들기도 한다. 예전에는 ``tests/``만
+    봐서 그런 테스트가 있어도 자동 검증을 아예 건너뛰었다.
+    """
     try:
-        return any(tests_dir.glob("test*.py"))
+        tests_dir = root / "tests"
+        if tests_dir.is_dir() and any(tests_dir.glob("test*.py")):
+            return "tests"
+        if any(path.is_file() for path in root.glob("test*.py")):
+            return "."
     except OSError:
-        return False
+        pass
+    return ""
 
 
 def detect_validation_commands(
@@ -109,13 +115,15 @@ def detect_validation_commands(
         if scripts.get("build"):
             commands.append(("npm run build", [environment.npm_executable, "run", "build"]))
 
-    if _has_python_tests(root):
+    test_start = _python_test_start(root)
+    if test_start:
         if environment.has_pytest:
+            # pytest는 루트와 tests/ 양쪽의 test_*.py를 스스로 찾는다.
             commands.append(
                 ("Python pytest", [environment.python_executable, "-m", "pytest", "-q"])
             )
         else:
-            # pytest가 없어도 tests/test*.py는 표준 unittest로 실행할 수 있다.
+            # pytest가 없어도 test*.py는 표준 unittest로 실행할 수 있다.
             commands.append(
                 (
                     "Python unittest",
@@ -125,7 +133,7 @@ def detect_validation_commands(
                         "unittest",
                         "discover",
                         "-s",
-                        "tests",
+                        test_start,
                     ],
                 )
             )

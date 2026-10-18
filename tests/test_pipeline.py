@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import isolation  # noqa: F401  (실제 데이터 폴더 격리 — 반드시 roundtable보다 먼저)
 import roundtable
-from triagent.domain import gitops
+from triagent.domain import gitops, validation
 
 SESSION_ID = "20260101_000000_000030"
 ALL = list(roundtable.AGENT_ORDER)
@@ -267,6 +267,30 @@ class CycleFinishTests(unittest.TestCase):
     def test_without_a_reviewer_green_validation_is_enough(self):
         roundtable.STATE["enabled_agents"] = ["claude", "antigravity"]
         self.assertTrue(self.finish())
+        self.assertEqual(roundtable.STATE["coding_stop_reason"], "자동 검증 통과 · 검토 담당 없음")
+
+    def finish_without_validation_commands(self) -> tuple[bool, list]:
+        roundtable.STATE.update(validation_results=[], validation_cycle=1)
+        with patch.object(roundtable, "save_state"), \
+             patch.object(roundtable, "add_runtime_event") as event, \
+             patch.object(roundtable, "commit_cycle") as commit:
+            done = roundtable.finish_pipeline_cycle(SESSION_ID, 1)
+        self.assertEqual(commit.call_args.args[3], "none")
+        return done, [call.args[0] for call in event.call_args_list]
+
+    def test_no_validation_commands_is_labelled_as_no_validation_not_a_pass(self):
+        """실사용 검증: 검증 명령이 없었는데 '검토·검증 통과'와 'Validation: pass'로 기록됐다."""
+        self.review(1, "pass")
+        done, events = self.finish_without_validation_commands()
+        self.assertTrue(done)
+        self.assertEqual(roundtable.STATE["coding_stop_reason"], "검토 통과 · 자동 검증 없음")
+        self.assertTrue(any("검증 없이 완료" in text for text in events))
+
+    def test_no_reviewer_and_no_validation_says_nothing_was_checked(self):
+        roundtable.STATE["enabled_agents"] = ["claude", "antigravity"]
+        done, _events = self.finish_without_validation_commands()
+        self.assertTrue(done)
+        self.assertEqual(roundtable.STATE["coding_stop_reason"], "검토·자동 검증 없이 완료")
 
 
 class CycleCommitTests(unittest.TestCase):
@@ -286,7 +310,7 @@ class CycleCommitTests(unittest.TestCase):
         state.update(overrides)
         return state
 
-    def call(self, git_state: dict, commit_result=None, on_branch: str = "triagent/x"):
+    def call(self, git_state: dict, commit_result=None, on_branch: str = "triagent/x", validation: str = "pass"):
         roundtable.STATE["pipeline_git"] = git_state
         with patch.object(roundtable, "save_state"), \
              patch.object(roundtable, "add_runtime_event") as event, \
@@ -294,15 +318,19 @@ class CycleCommitTests(unittest.TestCase):
              patch.object(roundtable.gitops, "current_branch", return_value=on_branch), \
              patch.object(roundtable.gitops, "commit_paths",
                           return_value=commit_result or roundtable.gitops.GitResult(True, "abc1234")) as commit:
-            roundtable.commit_cycle(SESSION_ID, 2, "changes", True)
+            roundtable.commit_cycle(SESSION_ID, 2, "changes", validation)
         return commit, event
 
     def test_commit_message_and_recorded_sha(self):
         commit, _event = self.call(self.git_state())
         message = commit.call_args.args[1]
         self.assertTrue(message.startswith("TriAgent cycle 2: 장바구니 기능 추가"))
-        self.assertIn("Review: changes", message)
+        self.assertIn("Review: changes · Validation: pass", message)
         self.assertEqual(roundtable.STATE["pipeline_git"]["commits"], [{"cycle": 2, "sha": "abc1234"}])
+
+    def test_missing_validation_is_recorded_as_none_not_pass(self):
+        commit, _event = self.call(self.git_state(), validation="none")
+        self.assertIn("Validation: none", commit.call_args.args[1])
 
     def test_only_files_changed_by_agent_turns_since_the_last_commit_are_committed(self):
         def turn(*paths):
@@ -498,6 +526,38 @@ class ReviewFollowUpTests(unittest.TestCase):
     def test_markdown_wrapped_verdicts_are_read(self):
         self.assertEqual(roundtable.extract_review_verdict("좋음\n**REVIEW: PASS**")[1], "pass")
         self.assertEqual(roundtable.extract_review_verdict("고칠 것\n`REVIEW: CHANGES`")[1], "changes")
+
+
+class ValidationDetectionTests(unittest.TestCase):
+    """실사용 검증에서 테스트 담당이 루트에 test_calc.py를 만들었는데 자동 검증이 못 찾았다."""
+
+    ENV = validation.ToolEnvironment(python_executable="python", has_pytest=False, has_npm=False)
+
+    def detect(self, files: dict[str, str], **env) -> list:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text, encoding="utf-8")
+            environment = validation.ToolEnvironment(**{**self.ENV.__dict__, **env})
+            return validation.detect_validation_commands(root, environment)
+
+    def test_root_level_test_files_are_run_with_unittest_from_the_root(self):
+        self.assertEqual(
+            self.detect({"calc.py": "", "test_calc.py": "import unittest\n"}),
+            [("Python unittest", ["python", "-m", "unittest", "discover", "-s", "."])],
+        )
+
+    def test_tests_folder_keeps_its_existing_command(self):
+        self.assertEqual(
+            self.detect({"tests/test_calc.py": "", "test_root.py": ""}),
+            [("Python unittest", ["python", "-m", "unittest", "discover", "-s", "tests"])],
+        )
+
+    def test_pytest_runs_for_either_layout_and_nothing_runs_without_tests(self):
+        self.assertEqual(self.detect({"test_calc.py": ""}, has_pytest=True),
+                         [("Python pytest", ["python", "-m", "pytest", "-q"])])
+        self.assertEqual(self.detect({"calc.py": "", "tests/helpers.py": ""}), [])
 
 
 class ExecutionPlanTests(unittest.TestCase):
