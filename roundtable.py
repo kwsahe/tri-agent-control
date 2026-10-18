@@ -4265,7 +4265,13 @@ def prepare_pipeline_git(session_id: str, start: str = "HEAD") -> None:
     if repo is None:
         git_state["note"] = "Git 저장소가 아니라 자동 커밋 없이 사용자 폴더에서 작업합니다."
     else:
-        worktree = WORKTREE_ROOT / f"{project.name}-{session_id}"
+        # Claude 데스크톱 같은 패키지 앱 안에서 서버를 띄우면 Windows가 %LOCALAPPDATA%를 앱 전용 폴더로
+        # 바꿔 준다. 실제 경로로 바꿔 둬야 git 기록과 화면의 경로가 바깥에서도 맞는다.
+        try:
+            WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass   # create_worktree가 이유를 알려 준다
+        worktree = WORKTREE_ROOT.resolve() / f"{project.name}-{session_id}"
         result = gitops.create_worktree(repo, worktree, branch, start)
         if result.ok:
             try:

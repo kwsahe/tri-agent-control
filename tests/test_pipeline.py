@@ -415,7 +415,8 @@ class PipelineWorktreeTests(unittest.TestCase):
         roundtable.STATE = roundtable.new_state()
         roundtable.STATE.update(id=SESSION_ID, topic="기능 추가", mode="coding", messages=[])
         self.patches = [
-            patch.object(roundtable, "WORKTREE_ROOT", base / "worktrees"),
+            # 일부러 정규화 안 된 경로 — 앱이 실제 경로로 바꿔 저장하는지 본다.
+            patch.object(roundtable, "WORKTREE_ROOT", base / "x" / ".." / "worktrees"),
             patch.object(roundtable, "read_configured_project_path", return_value=str(self.repo)),
             patch.object(roundtable, "save_state"),
         ]
@@ -439,6 +440,8 @@ class PipelineWorktreeTests(unittest.TestCase):
     def test_cycle_runs_and_commits_in_the_worktree_without_touching_the_user_folder(self):
         workspace = self.prepare()
         self.assertEqual(workspace, Path(self._tmp.name).resolve() / "worktrees" / f"proj-{SESSION_ID}")
+        # 패키지 앱이 바꿔 준 가상 경로가 아니라 실제 경로를 저장해야 앱 밖에서 띄운 서버도 지울 수 있다.
+        self.assertEqual(roundtable.STATE["pipeline_git"]["worktree"], str(workspace))
         self.assertEqual(roundtable.cli_working_directory("coding"), workspace)
         self.assertEqual(roundtable.cli_working_directory("discussion"), workspace)  # 검토도 worktree를 읽는다
         self.assertTrue(any("커밋되지 않은 변경" in call.args[0] for call in self.events.call_args_list))
