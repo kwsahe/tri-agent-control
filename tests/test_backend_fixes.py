@@ -279,7 +279,8 @@ class WorkerLoopTests(BackendTestBase):
     def test_goal_limits_are_measured_from_the_first_cycle(self, *_):
         roundtable.STATE.update(
             mode="coding", coding_stage="planning", plan_approved=True,
-            step_index=len(roundtable.steps_for_mode("coding", ["codex"])),
+            enabled_agents=["claude", "codex"],   # 코딩 파이프라인은 구현 담당 Claude Code가 필요하다
+            step_index=len(roundtable.steps_for_mode("coding", ["claude", "codex"])),
             coding_started_at=time.time() - 3 * 3600,   # 계획·승인 단계에서 3시간을 보냈다
             total_est_tokens=500_000,                    # 계획 단계에서 쓴 토큰
         )

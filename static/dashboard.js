@@ -1208,10 +1208,11 @@ async function activateViewedSession() {
 
 async function deleteManagedSession() {
   const id = $("sessionActionId").value;
-  if (!confirm("이 세션과 저장된 메모리를 삭제할까요?")) return;
+  if (!confirm("이 세션과 저장된 메모리, 세션 작업 폴더(worktree)를 삭제할까요? Git 브랜치와 커밋은 남습니다.")) return;
   const response = await fetch("/session/delete", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ id }).toString() });
   const data = await response.json();
   if (data.error) { alert(data.error); return; }
+  if (data.warning) alert(data.warning);
   closeSessionActions();
   // 보던 세션을 지웠으면 읽기 전용 화면을 닫고 현재 세션으로 돌아간다.
   if (id === viewingId) await backToLive();
@@ -1482,6 +1483,7 @@ async function refreshExecutionPlan() {
       ["작업 폴더", plan.workspace_ok ? plan.workspace_path : `차단됨 — ${plan.workspace_message}`],
       ["자동 검증", plan.auto_validation ? "실행함" : "실행하지 않음"],
     ];
+    if (plan.pipeline_roles) rows.splice(2, 0, ["역할", plan.pipeline_roles]);
     const warning = plan.long_running_warning
       ? '<p class="execution-plan-warning">단계가 많아 실행 시간이 길어질 수 있습니다.</p>'
       : "";
