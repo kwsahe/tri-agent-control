@@ -208,6 +208,7 @@ python -m unittest discover -s tests -v
 | `tests/test_workspace_and_status.py` | 작업공간 fail-closed, 체크포인트 소유권, 실행 상태 전이, 토큰·비용 계산 |
 | `tests/test_cli_and_scale.py` | CLI 사전 점검(mock), Codex 옵션 기능 감지, 인증정보 마스킹, 1,500개 메시지 세션 |
 | `tests/test_stability.py` | 원자적 저장, 저장 실패 알림, 출력 잘림 표시, 종료 정리, 빠른 질문 모드 |
+| `tests/test_backend_fixes.py` | 질문 대기 우회 차단, 남은 자식 프로세스·시간 초과 처리, 실행 직전 중단, 세션 파일 저장 실패, 목표 사이클 한도 기준, 출력 마스킹 |
 
 Ruff가 설치돼 있으면 추가로 실행할 수 있습니다(선택 사항).
 
