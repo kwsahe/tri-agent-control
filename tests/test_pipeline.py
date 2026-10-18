@@ -485,6 +485,16 @@ class ReviewFollowUpTests(unittest.TestCase):
                                             "agent_roles": {"claude": "frontend"}, "enabled_agents": ALL})
         self.assertEqual(state["agent_roles"], roundtable.pipeline_agent_roles())
 
+    def test_tests_never_point_at_or_run_git_in_the_real_repository(self):
+        """작업 폴더를 정하지 않은 테스트가 실제 저장소에서 파이프라인 브랜치를 만든 적이 있다."""
+        real_repo = roundtable.ROOT.resolve()
+        configured = Path(roundtable.read_configured_project_path()).resolve()
+        self.assertNotEqual(configured, real_repo)
+        self.assertNotIn(real_repo, configured.parents)
+        self.assertFalse(gitops.is_repo(roundtable.ROOT))          # 안전망이 막는다
+        self.assertEqual(gitops.current_branch(roundtable.ROOT), "")
+        self.assertFalse(gitops.prepare_work_branch(roundtable.ROOT, "triagent/x").ok)
+
     def test_markdown_wrapped_verdicts_are_read(self):
         self.assertEqual(roundtable.extract_review_verdict("좋음\n**REVIEW: PASS**")[1], "pass")
         self.assertEqual(roundtable.extract_review_verdict("고칠 것\n`REVIEW: CHANGES`")[1], "changes")

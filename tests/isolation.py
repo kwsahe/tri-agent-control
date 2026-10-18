@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 
 import roundtable
+from triagent.domain import gitops
 
 _TEMP = tempfile.TemporaryDirectory(prefix="triagent-tests-")
 _ROOT = Path(_TEMP.name).resolve()
@@ -47,6 +48,28 @@ roundtable.HTML_PATH = _ROOT / "roundtable.html"
 roundtable.PROJECT_PATH_FILE = _ROOT / "PROJECT_PATH.txt"
 for _agent in roundtable.PROFILE_PATHS:
     roundtable.PROFILE_PATHS[_agent] = _ROOT / f"{_agent.upper()}_Profile.md"
+
+# 기본 작업 폴더도 임시 폴더로 둔다. PROJECT_PATH.txt가 없으면 앱이 기본값(= 이 프로젝트 폴더,
+# 즉 실제 Git 저장소)으로 만들어서, 작업 폴더를 따로 정하지 않은 테스트가 실제 저장소에서
+# 파이프라인 브랜치를 만든 적이 있다.
+WORKSPACE = _ROOT / "workspace"
+WORKSPACE.mkdir(parents=True, exist_ok=True)
+roundtable.PROJECT_PATH_FILE.write_text(f"# 테스트용 작업 폴더\n\n{WORKSPACE}\n", encoding="utf-8")
+
+# 안전망: 테스트 중에는 실제 저장소(이 프로젝트와 그 하위 폴더)에서 git을 실행하지 않는다.
+# gitops는 OSError를 "git 사용 불가"로 처리하므로 브랜치 전환·커밋 없이 넘어간다.
+_REAL_REPO = roundtable.ROOT.resolve()
+_real_git = gitops._git
+
+
+def _git_outside_real_repo(root, *args, **kwargs):
+    target = Path(root).resolve()
+    if target == _REAL_REPO or _REAL_REPO in target.parents:
+        raise OSError(f"테스트에서 실제 저장소의 git 실행을 막았습니다: {target}")
+    return _real_git(root, *args, **kwargs)
+
+
+gitops._git = _git_outside_real_repo
 
 # roundtable은 임포트 때 상태를 불러오지 않는다(빈 dict). 경로를 바꾼 뒤에 새 세션을 만든다.
 roundtable.STATE = roundtable.new_state()

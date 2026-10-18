@@ -47,7 +47,11 @@ def is_clean(root: Path) -> bool:
 
 
 def current_branch(root: Path) -> str:
-    result = _git(root, "branch", "--show-current")
+    """현재 브랜치 이름. 알 수 없으면(분리된 HEAD, git 오류) ''."""
+    try:
+        result = _git(root, "branch", "--show-current")
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
