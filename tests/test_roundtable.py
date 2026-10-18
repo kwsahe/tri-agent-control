@@ -271,6 +271,7 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
 
     def test_legacy_continuous_session_migrates_to_goal_coding_position(self):
         state = roundtable.new_state()
+        state.pop("pipeline_version")   # 파이프라인 이전에 저장된 파일처럼
         cycle_length = len(roundtable.goal_coding_steps(roundtable.AGENT_ORDER))
         state.update(
             mode="continuous",
@@ -283,7 +284,8 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         self.assertEqual(normalized["mode"], "coding")
         self.assertEqual(normalized["coding_stage"], "iteration")
         self.assertEqual(normalized["coding_cycle"], 2)
-        self.assertEqual(normalized["coding_cycle_step"], 2)
+        # 옛 사이클의 단계 번호는 파이프라인 표에서 의미가 없어 사이클 처음으로 간다.
+        self.assertEqual(normalized["coding_cycle_step"], 0)
         self.assertTrue(normalized["coding_stopped"])
 
     def test_loading_legacy_session_persists_migrated_mode(self):
@@ -1640,7 +1642,7 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         roundtable.STATE.update(
             topic="테스트",
             mode="discussion",
-            enabled_agents=["codex"],
+            enabled_agents=["claude", "codex"],
             step_index=3,
             finished=True,
         )
@@ -1648,7 +1650,9 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         payload = roundtable.switch_mode("coding")
 
         self.assertTrue(payload["success"])
-        self.assertEqual(roundtable.STATE["step_index"], 2)
+        # 코딩 파이프라인은 토론 단계를 공유하지 않아 항상 계획(승인 요청) 단계부터 시작한다.
+        self.assertEqual(roundtable.STATE["step_index"], 0)
+        self.assertEqual(roundtable.steps_for_mode("coding", ["claude", "codex"])[0][1], roundtable.CONFIRM_PHASE)
         self.assertEqual(roundtable.STATE["workspace_access"], "write")
         self.assertFalse(roundtable.STATE["finished"])
         start_worker.assert_called_once_with(force=True)
@@ -1671,7 +1675,8 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         payload = roundtable.switch_mode("discussion")
 
         self.assertTrue(payload["success"])
-        self.assertEqual(roundtable.STATE["step_index"], 2)
+        # 코딩 파이프라인의 위치는 토론 단계와 무관하다 — 토론은 처음부터 한다.
+        self.assertEqual(roundtable.STATE["step_index"], 0)
         self.assertFalse(roundtable.CONTROL["awaiting_approval"])
         start_worker.assert_called_once_with(force=True)
 

@@ -255,5 +255,87 @@ class CycleCommitTests(unittest.TestCase):
         self.assertEqual(roundtable.STATE["pipeline_git"]["commits"], [])
 
 
+class StartGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        self.original_control = dict(roundtable.CONTROL)
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="가드 테스트", mode="discussion")
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+        roundtable.CONTROL.clear()
+        roundtable.CONTROL.update(self.original_control)
+        self._tmp.cleanup()
+
+    def switch(self):
+        with patch.object(roundtable, "read_configured_project_path", return_value=self._tmp.name), \
+             patch.object(roundtable, "save_state"), patch.object(roundtable, "add_runtime_event"), \
+             patch.object(roundtable, "start_worker_if_needed"):
+            return roundtable.switch_mode("coding")
+
+    def test_switching_to_coding_without_claude_is_refused(self):
+        roundtable.STATE["enabled_agents"] = ["codex", "antigravity"]
+        result = self.switch()
+        self.assertIn("Claude Code", result.get("error", ""))
+        self.assertEqual(roundtable.STATE["mode"], "discussion")
+
+    def test_switching_to_coding_fixes_the_roles(self):
+        roundtable.STATE.update(enabled_agents=ALL, agent_roles={"codex": "backend", "antigravity": "", "claude": "qa"})
+        self.assertTrue(self.switch().get("success"))
+        self.assertEqual(roundtable.STATE["agent_roles"], roundtable.pipeline_agent_roles())
+
+    def test_roles_cannot_be_changed_in_coding_mode(self):
+        roundtable.STATE.update(mode="coding", agent_roles=roundtable.pipeline_agent_roles())
+        result = roundtable.update_agent_roles({"codex": "backend", "antigravity": "qa", "claude": ""})
+        self.assertIn("역할이 고정", result.get("error", ""))
+        self.assertEqual(roundtable.STATE["agent_roles"], roundtable.pipeline_agent_roles())
+
+
+class MigrationTests(unittest.TestCase):
+    def test_old_planning_session_restarts_at_the_plan_step(self):
+        state = roundtable.normalize_state({"mode": "coding", "coding_stage": "planning", "step_index": 11,
+                                            "enabled_agents": ALL})
+        self.assertEqual(state["step_index"], 0)
+        self.assertEqual(state["pipeline_version"], roundtable.PIPELINE_VERSION)
+        self.assertEqual(state["agent_roles"], roundtable.pipeline_agent_roles())
+        roundtable.steps_for_mode("coding", ALL)[state["step_index"]]   # IndexError 없어야 함
+
+    def test_old_approved_planning_session_goes_straight_to_cycles(self):
+        state = roundtable.normalize_state({"mode": "coding", "coding_stage": "planning", "step_index": 11,
+                                            "plan_approved": True, "enabled_agents": ALL})
+        self.assertEqual(state["step_index"], len(roundtable.steps_for_mode("coding", ALL)))
+
+    def test_old_iteration_session_restarts_its_current_cycle(self):
+        state = roundtable.normalize_state({"mode": "coding", "coding_stage": "iteration", "coding_cycle": 2,
+                                            "coding_cycle_step": 5, "enabled_agents": ALL})
+        self.assertEqual((state["coding_cycle"], state["coding_cycle_step"]), (2, 0))
+
+    def test_new_and_migrated_sessions_are_left_alone(self):
+        fresh = roundtable.new_state()
+        fresh.update(mode="coding", coding_stage="iteration", coding_cycle_step=2)
+        self.assertEqual(roundtable.normalize_state(fresh)["coding_cycle_step"], 2)
+
+    def test_finished_and_discussion_sessions_are_not_touched(self):
+        done = roundtable.normalize_state({"mode": "coding", "coding_stage": "planning", "step_index": 11,
+                                           "finished": True, "enabled_agents": ALL})
+        self.assertEqual(done["step_index"], 11)
+        talk = roundtable.normalize_state({"mode": "discussion", "step_index": 4, "enabled_agents": ALL})
+        self.assertEqual(talk["step_index"], 4)
+
+
+class ExecutionPlanTests(unittest.TestCase):
+    def test_coding_plan_counts_one_plan_call_plus_three_per_cycle(self):
+        plan = roundtable.mode_execution_plan("coding", ALL)
+        cycles = roundtable.DEFAULT_CODING_LIMITS["max_cycles"]
+        self.assertEqual((plan["min_calls"], plan["max_calls"]), (1 + 3, 1 + 3 * cycles))
+        self.assertFalse(plan["role_negotiation"])
+        self.assertEqual(plan["pipeline_roles"], "Claude Code=구현, Antigravity=테스트, Codex=검토")
+
+    def test_other_modes_have_no_pipeline_roles(self):
+        self.assertEqual(roundtable.mode_execution_plan("quick", ALL)["pipeline_roles"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -226,7 +226,7 @@ class PlanApprovalGateTests(SafetyTestBase):
         self.assertFalse(rejected["plan_approved"])
 
     def test_switching_into_coding_mode_requires_a_new_approval(self, *_):
-        roundtable.STATE.update(mode="discussion", plan_approved=True)
+        roundtable.STATE.update(mode="discussion", plan_approved=True, enabled_agents=["claude", "codex"])
         with patch.object(roundtable, "read_configured_project_path", return_value=str(self.workspace)), \
              patch.object(roundtable, "start_worker_if_needed"):
             result = roundtable.switch_mode("coding")

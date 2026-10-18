@@ -536,6 +536,8 @@ PIPELINE_ROLE_LABELS = {"implement": "구현", "test": "테스트", "review": "�
 PIPELINE_CATALOG_ROLES = {"implement": "", "test": "qa", "review": "reviewer"}
 PIPELINE_IMPLEMENTER = next(agent for agent, role in PIPELINE_ROLES.items() if role == "implement")
 REVIEW_PHASE = "검토"
+#: 코딩 단계 표가 바뀌면 올린다. 옛 세션의 단계 번호는 새 표에서 의미가 없다.
+PIPELINE_VERSION = 1
 
 PIPELINE_CYCLE_STEPS = [
     ("claude", "구현",
@@ -1912,6 +1914,7 @@ def new_state() -> dict:
         # 코딩 모드의 쓰기 턴은 사용자가 계획을 승인한 뒤에만 허용된다. 메모리(CONTROL)가 아니라
         # 상태에 저장해야 재시작·모드 전환·거절 뒤 메시지로 승인을 건너뛸 수 없다.
         "plan_approved": False,
+        "pipeline_version": PIPELINE_VERSION,
         "coding_cycle": 0,
         "coding_cycle_step": 0,
         "coding_started_at": None,
@@ -2042,6 +2045,19 @@ def normalize_state(state: dict) -> dict:
     state["plan_approved"] = bool(
         state.get("plan_approved", state["coding_stage"] == "iteration")
     )
+    # 파이프라인 전환 전에 진행 중이던 코딩 세션: 옛 단계 번호로 새 표를 가리키지 않게
+    # 계획 처음(승인됐으면 사이클 진입 직전) 또는 현재 사이클 처음으로 옮기고 역할을 고정한다.
+    if (
+        state.get("mode") == "coding"
+        and state.get("pipeline_version") != PIPELINE_VERSION
+        and not state.get("finished")
+    ):
+        if state["coding_stage"] == "iteration":
+            state["coding_cycle_step"] = 0
+        else:
+            state["step_index"] = len(pipeline_planning_steps()) if state["plan_approved"] else 0
+        state["agent_roles"] = pipeline_agent_roles()
+    state["pipeline_version"] = PIPELINE_VERSION
     if state["coding_stage"] == "iteration" and not state.get("coding_started_at"):
         state["coding_started_at"] = time.time()
     state["agent_settings"] = normalize_agent_settings(state.get("agent_settings"))
@@ -2906,6 +2922,9 @@ def update_agent_roles(roles: dict) -> dict:
     if len(selected) != len(set(selected)):
         return {"error": "세 모델에 같은 역할을 중복 배정할 수 없습니다."}
     with STATE_LOCK:
+        if STATE.get("mode") == "coding":
+            return {"error": "코딩 모드는 역할이 고정입니다: "
+                             + pipeline_roles_label(STATE.get("enabled_agents"))}
         if STATE.get("active_agent"):
             return {"error": "모델이 실행 중일 때는 역할을 변경할 수 없습니다."}
         previous = normalize_agent_roles(STATE.get("agent_roles"))
@@ -4559,13 +4578,14 @@ MODE_PLANS = {
         "note": "모델 수와 단계 수에 따라 시간이 길어질 수 있습니다.",
     },
     "coding": {
-        "summary": "계획 → 사용자 승인 → 구현 → 자동 검증 순으로 진행합니다.",
+        "summary": "계획(Claude) → 승인 → [구현 Claude → 테스트 Antigravity → 자동 검증 → 검토 Codex] 반복 → 사이클마다 Git 커밋",
         "single_agent": False,
-        "role_negotiation": True,
+        "role_negotiation": False,
         "auto_validation": True,
         "default_access": "write",
         "allow_write": True,
-        "note": "쓰기 권한과 유효한 작업 폴더가 확인되어야 시작합니다.",
+        "note": "검토가 PASS이고 자동 검증이 통과하면 끝납니다. Git 저장소이고 커밋되지 않은 변경이 없으면 "
+                "사이클 커밋을 triagent/<세션ID> 브랜치에 남깁니다.",
     },
 }
 
@@ -4603,11 +4623,16 @@ def mode_execution_plan(
 
     if mode == "quick":
         min_calls = max_calls = 1
+    elif mode == "coding":
+        planning = len(steps_for_mode("coding", enabled))
+        cycle = len(goal_coding_steps(enabled))
+        min_calls = planning + cycle
+        max_calls = planning + cycle * DEFAULT_CODING_LIMITS["max_cycles"]
     else:
         step_count = len(steps_for_mode(mode, enabled))
         min_calls = step_count
-        # 개입·재시도·목표 사이클로 호출이 늘어날 수 있다.
-        max_calls = step_count * (3 if mode == "coding" else 2)
+        # 개입·재시도로 호출이 늘어날 수 있다.
+        max_calls = step_count * 2
 
     workspace = resolve_project_workspace()
     access = "write" if mode == "coding" else normalize_discussion_project_access(
@@ -4633,6 +4658,7 @@ def mode_execution_plan(
         "can_write": access == "write",
         "auto_validation": bool(plan.get("auto_validation")),
         "role_negotiation": bool(plan.get("role_negotiation")),
+        "pipeline_roles": pipeline_roles_label(enabled) if mode == "coding" else "",
         "workspace_path": str(workspace.path) if workspace.ok else "",
         "workspace_ok": workspace.ok,
         "workspace_message": workspace.message,
@@ -4744,7 +4770,7 @@ def topic_section_html(
           <legend>실행 모드</legend>
           <label><input type="radio" name="mode" value="quick" onchange="refreshExecutionPlan()"> 빠른 질문 (모델 1명 · 1회 호출 · 읽기 전용)</label>
           <label><input type="radio" name="mode" value="discussion" checked onchange="refreshExecutionPlan()"> 일반 토론 모드</label>
-          <label><input type="radio" name="mode" value="coding" onchange="refreshExecutionPlan()"> 코딩 모드 (계획·승인 후 목표 기반 구현·검토 반복)</label>
+          <label><input type="radio" name="mode" value="coding" onchange="refreshExecutionPlan()"> 코딩 모드 (Claude 구현 · Antigravity 테스트 · Codex 검토 · 사이클마다 Git 커밋)</label>
         </fieldset>
         <p class="inline-error" id="topicError" role="alert" aria-live="assertive" hidden></p>
         <div class="primary-start">
@@ -5679,6 +5705,11 @@ def switch_mode(mode: str) -> dict:
         mode = "coding"
     if mode not in MODE_LABELS:
         return {"error": "알 수 없는 모드입니다."}
+    if mode == "coding":
+        with STATE_LOCK:
+            implementer_enabled = PIPELINE_IMPLEMENTER in normalize_enabled_agents(STATE.get("enabled_agents"))
+        if not implementer_enabled:
+            return {"error": "코딩 모드에는 구현 담당 Claude Code가 필요합니다. Claude Code를 켠 세션에서 전환해주세요."}
     if mode == "coding" and resolve_project_workspace(require_write=True).blocked:
         return {"error": "코딩 모드는 작업 폴더의 쓰기 권한이 필요합니다."}
     with STATE_LOCK:
@@ -5690,8 +5721,10 @@ def switch_mode(mode: str) -> dict:
         enabled = normalize_enabled_agents(STATE.get("enabled_agents"))
         common_step_count = len([step for step in DISCUSSION_STEPS if step[0] in enabled])
         if previous_mode != mode:
-            if mode == "coding" and STATE.get("step_index", 0) >= common_step_count:
-                STATE["step_index"] = common_step_count
+            # 코딩 파이프라인은 토론 단계를 공유하지 않는다. 코딩에 들어가거나 나올 때는 그 모드의
+            # 처음부터 한다 — 코딩은 반드시 계획·승인부터 시작해야 한다.
+            if mode == "coding" or previous_mode == "coding":
+                STATE["step_index"] = 0
             elif mode == "discussion" and STATE.get("step_index", 0) > common_step_count:
                 STATE["step_index"] = common_step_count
         STATE["mode"] = mode
@@ -5708,6 +5741,8 @@ def switch_mode(mode: str) -> dict:
             if previous_mode != "coding":
                 STATE["coding_stage"] = "planning"
                 STATE["plan_approved"] = False
+                STATE["agent_roles"] = pipeline_agent_roles()
+                STATE["pipeline_git"] = {}
                 STATE["coding_cycle"] = 0
                 STATE["coding_cycle_step"] = 0
                 STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
@@ -6060,6 +6095,11 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                 enabled_agents = enabled_agents[:1]
                 if discussion_project_access == "write":
                     discussion_project_access = "read"
+            if mode == "coding" and PIPELINE_IMPLEMENTER not in enabled_agents:
+                self._send_error_json(
+                    400, "코딩 모드에는 구현 담당 Claude Code가 필요합니다. Claude Code를 켜고 다시 시작해주세요."
+                )
+                return
             if not topic:
                 self._send_error_json(400, "주제를 입력해주세요.")
                 return
@@ -6081,6 +6121,9 @@ class RoundtableHandler(BaseHTTPRequestHandler):
                     STATE["step_index"] = 0
                     STATE["coding_stage"] = "planning"
                     STATE["plan_approved"] = False
+                    if mode == "coding":
+                        STATE["agent_roles"] = pipeline_agent_roles()
+                    STATE["pipeline_git"] = {}
                     STATE["coding_cycle"] = 0
                     STATE["coding_cycle_step"] = 0
                     STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다

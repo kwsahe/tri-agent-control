@@ -1482,6 +1482,7 @@ async function refreshExecutionPlan() {
       ["작업 폴더", plan.workspace_ok ? plan.workspace_path : `차단됨 — ${plan.workspace_message}`],
       ["자동 검증", plan.auto_validation ? "실행함" : "실행하지 않음"],
     ];
+    if (plan.pipeline_roles) rows.splice(2, 0, ["역할", plan.pipeline_roles]);
     const warning = plan.long_running_warning
       ? '<p class="execution-plan-warning">단계가 많아 실행 시간이 길어질 수 있습니다.</p>'
       : "";

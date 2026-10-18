@@ -433,3 +433,26 @@ class UserCancelOverHttpTests(HttpServerTestCase):
         restored = roundtable.normalize_state(snapshot)
         self.assertEqual(restored["run_status"], runstatus.RunStatus.USER_CANCELLED)
         self.assertIsNone(restored["active_agent"])
+
+
+class TopicGuardOverHttpTests(HttpServerTestCase):
+    """코딩 파이프라인은 구현 담당(Claude Code)이 꺼져 있으면 시작하지 않는다."""
+
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        roundtable.STATE = roundtable.new_state()
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+
+    def test_coding_topic_without_claude_is_rejected_with_400(self):
+        body = "topic=x&mode=coding&agent=codex&agent=antigravity"
+        with patch.object(roundtable, "start_worker_if_needed") as start:
+            status, text = self.request(
+                "/topic", method="POST", body=body,
+                headers={webguard.CSRF_HEADER: self.token, "Origin": f"http://127.0.0.1:{self.port}",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+            )
+        self.assertEqual(status, 400, text[:200])
+        self.assertIn("Claude Code", text)
+        start.assert_not_called()
