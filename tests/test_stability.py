@@ -175,7 +175,9 @@ class QuickModeTests(unittest.TestCase):
         discussion = roundtable.steps_for_mode("discussion", list(roundtable.AGENT_ORDER))
         coding = roundtable.steps_for_mode("coding", list(roundtable.AGENT_ORDER))
         self.assertGreater(len(discussion), 3)
-        self.assertGreater(len(coding), len(discussion))
+        # 코딩은 토론 없이 계획 1회 후 고정 사이클로 간다.
+        self.assertEqual(len(coding), 1)
+        self.assertEqual(len(roundtable.goal_coding_steps(list(roundtable.AGENT_ORDER))), 3)
 
     def test_execution_plan_shows_call_counts_per_mode(self):
         quick = roundtable.mode_execution_plan("quick", list(roundtable.AGENT_ORDER))

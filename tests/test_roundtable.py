@@ -241,9 +241,9 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         )
 
     def test_scheduled_coding_step_cannot_delegate_duplicate_work(self):
-        self.assertFalse(roundtable.allow_agent_calls("coding", "작업 수행"))
-        self.assertTrue(roundtable.allow_agent_calls("coding", "개선안 제안"))
-        self.assertTrue(roundtable.allow_agent_calls("coding", "개발 진행"))
+        self.assertFalse(roundtable.allow_agent_calls("coding", "구현"))
+        self.assertFalse(roundtable.allow_agent_calls("coding", roundtable.REVIEW_PHASE))
+        self.assertTrue(roundtable.allow_agent_calls("discussion", "개입 답변"))
 
     def test_codex_read_only_turn_keeps_isolated_user_config(self):
         roundtable.STATE["mode"] = "discussion"
@@ -266,11 +266,8 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
 
     def test_goal_coding_cycle_contains_development_review_and_synthesis(self):
         steps = roundtable.goal_coding_steps(roundtable.AGENT_ORDER)
-        self.assertEqual([step[1] for step in steps[:3]], ["개발 진행"] * 3)
-        self.assertEqual([step[1] for step in steps[3:6]], ["교차 검토"] * 3)
-        self.assertEqual(steps[-1][1], "토론 결과 통합")
-        self.assertTrue(all(step[3] == "coding" for step in steps[:3]))
-        self.assertTrue(all(step[3] == "discussion" for step in steps[3:]))
+        self.assertEqual([step[1] for step in steps], ["구현", "테스트", roundtable.REVIEW_PHASE])
+        self.assertEqual([step[3] for step in steps], ["coding", "coding", "discussion"])
 
     def test_legacy_continuous_session_migrates_to_goal_coding_position(self):
         state = roundtable.new_state()
@@ -347,8 +344,9 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         )
 
         self.assertEqual(enabled, ["antigravity", "codex", "claude"])
-        for mode in ("discussion", "coding"):
-            self.assertEqual(roundtable.steps_for_mode(mode, enabled)[0][0], "antigravity")
+        self.assertEqual(roundtable.steps_for_mode("discussion", enabled)[0][0], "antigravity")
+        # 코딩 파이프라인은 역할이 고정이라 항상 Claude Code의 계획으로 시작한다.
+        self.assertEqual(roundtable.steps_for_mode("coding", enabled)[0][0], "claude")
 
     def test_disabled_start_agent_falls_back_to_first_enabled_agent(self):
         enabled = roundtable.prioritize_start_agent(["claude"], "codex")
@@ -921,21 +919,31 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         )
 
     def test_failed_workflow_step_can_continue_without_repeating(self):
+        # 파이프라인의 쓰기 단계는 목표 사이클 안에 있다: 테스트 담당이 범위 밖 파일을 고쳐 멈춘 경우.
         state = roundtable.new_state()
         state.update(
             mode="coding",
+            coding_stage="iteration",
             enabled_agents=list(roundtable.AGENT_ORDER),
-            step_index=9,
+            coding_cycle=1,
+            coding_cycle_step=1,
         )
         messages = [{
-            "agent": "codex",
-            "phase": "작업 수행",
+            "agent": "antigravity",
+            "phase": "테스트 · 목표 사이클 1",
             "meta": {"ok": False, "failure_kind": "role_scope"},
         }]
         self.assertTrue(roundtable.can_continue_after_failed_step(state, messages))
 
         messages[-1]["phase"] = "개입 답변"
         self.assertFalse(roundtable.can_continue_after_failed_step(state, messages))
+
+        roundtable.STATE = state
+        state["messages"] = [{**messages[-1], "phase": "테스트 · 목표 사이클 1"}]
+        with patch.object(roundtable, "save_state"), patch.object(roundtable, "add_runtime_event"), \
+             patch.object(roundtable, "start_worker_if_needed"):
+            self.assertTrue(roundtable.continue_after_failed_step().get("success"))
+        self.assertEqual(state["coding_cycle_step"], 2)   # 사이클 안에서 다음 단계(검토)로
 
     def test_role_prompt_contains_user_assignment(self):
         state = roundtable.new_state()

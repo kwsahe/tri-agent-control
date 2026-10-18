@@ -524,87 +524,65 @@ REPORT_STEP = (
     "무엇부터 시작하면 좋을지 실행 가능한 결론으로 3~6문장 요약해줘.", "discussion",
 )
 
-# 코딩 모드 전용: 역할 확정 뒤 "아직 수정하지 않고" 개선안을 먼저 제안하는 단계.
-# 실제 코드 반영은 사용자가 승인한 뒤(/approve)에만 진행된다.
-PROPOSAL_STEPS = [
-    ("codex", "개선안 제안",
-     "네 역할에 맞게, 프로젝트 구조를 다시 확인하고 구체적으로 어떤 파일을 어떻게 "
-     "개선/수정할지 제안해. 아직 실제로 파일을 수정하지 마 — 계획만 3~6개 항목으로 "
-     "구체적으로 말해.", "discussion"),
-    ("antigravity", "개선안 제안",
-     "Codex의 제안을 참고해서, 겹치지 않게 네 역할 몫의 개선/수정 계획을 구체적으로 "
-     "제안해. 동의하지 않는 부분이 있으면 반박해도 된다. 아직 실제로 파일을 수정하지 "
-     "마 — 계획만 3~6개 항목으로 말해.", "discussion"),
-    ("claude", CONFIRM_PHASE,
-     "Codex와 Antigravity의 제안을 참고해서, 겹치지 않게 네 역할 몫의 개선/수정 계획도 "
-     "덧붙이고, 셋의 계획 전체를 하나로 정리해서 팀장(사용자)에게 실제로 진행해도 될지 "
-     "확인을 요청하는 메시지를 작성해. 무엇을 어떻게 바꿀지 항목별로 명확하게 정리해. "
-     "아직 실제로 파일을 수정하지 마.", "discussion"),
+# ──────────────────────────────────────────
+# 코딩 파이프라인 — 토론 없이 고정 역할로 구현 → 테스트 → 검증 → 검토를 반복한다.
+# ──────────────────────────────────────────
+
+#: 역할은 토론으로 정하지 않는다. 이 표 하나만 바꾸면 역할이 바뀐다.
+PIPELINE_ROLES = {"claude": "implement", "antigravity": "test", "codex": "review"}
+PIPELINE_ROLE_LABELS = {"implement": "구현", "test": "테스트", "review": "검토"}
+#: 기존 역할 카탈로그에 대응시켜 쓰기 범위 강제를 재사용한다
+#: (qa = 테스트 경로만 쓰기, reviewer = 읽기 전용, "" = 범위 제한 없음).
+PIPELINE_CATALOG_ROLES = {"implement": "", "test": "qa", "review": "reviewer"}
+PIPELINE_IMPLEMENTER = next(agent for agent, role in PIPELINE_ROLES.items() if role == "implement")
+REVIEW_PHASE = "검토"
+
+PIPELINE_CYCLE_STEPS = [
+    ("claude", "구현",
+     "승인된 계획과 직전 사이클의 Codex 검토·자동 검증 결과(있다면)를 먼저 확인해. 아직 끝나지 않은 항목을 "
+     "계획 보고로 끝내지 말고 실제 코드로 구현해. 검토에서 지적된 결함이 있으면 그것부터 고쳐. "
+     "변경 파일과 결과만 간결하게 보고해.", "coding"),
+    ("antigravity", "테스트",
+     "Claude Code가 이번 사이클에 바꾼 기능을 확인하는 테스트를 테스트 파일(tests/, test_*.py, *.test.* 등)에만 "
+     "추가·수정하고 실행해. 제품 코드는 고치지 마. 실패하면 실패한 테스트, 원인과 재현 방법을 보고해.", "coding"),
+    ("codex", REVIEW_PHASE,
+     "이번 사이클의 변경과 자동 검증 결과를 승인된 계획에 대조해 읽기 전용으로 검토해. 결함, 누락된 요구사항, "
+     "회귀 위험, 빠진 테스트를 우선순위로 정리해. 파일은 수정하지 마. 고칠 것이 없으면 마지막 줄에 "
+     "REVIEW: PASS, 고칠 것이 있으면 마지막 줄에 REVIEW: CHANGES만 써라.", "discussion"),
 ]
 
-# 사용자가 승인한 뒤에만 실행되는 실제 코드 반영 단계
-CODING_WORK_STEPS = [
-    ("codex", "작업 수행",
-     "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을 이 프로젝트 코드에 실제로 "
-     "반영해. 직전 확인 요청에서 네 모델에 배정된 대상 파일과 기능만 수정하고 다른 모델을 호출하지 마. "
-     "작업이 끝나면 어떤 파일을 어떻게 바꿨는지 요약해서 보고해.", "coding"),
-    ("antigravity", "작업 수행",
-     "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을, Codex가 방금 한 작업과 "
-     "겹치거나 충돌하지 않게 이 프로젝트 코드에 실제로 반영해. 직전 확인 요청에서 네 모델에 "
-     "배정된 대상 파일과 기능만 수정하고 다른 모델을 호출하지 마. 작업이 끝나면 어떤 파일을 "
-     "어떻게 바꿨는지 요약해서 보고해.", "coding"),
-    ("claude", "작업 수행",
-     "팀장(사용자)이 방금 승인한 개선안 중 네가 맡은 부분을, Codex·Antigravity가 방금 "
-     "한 작업과 겹치거나 충돌하지 않게 이 프로젝트 코드에 실제로 반영해. 직전 확인 요청에서 "
-     "네 모델에 배정된 대상 파일과 기능만 수정하고 다른 모델을 호출하지 마. 작업이 끝나면 "
-     "어떤 파일을 어떻게 바꿨는지 요약해서 보고해.", "coding"),
-]
 
-CODING_REPORT_STEP = (
-    REPORTER_AGENT, "최종 보고",
-    "지금까지 세 명이 각자 실제로 반영한 코드 변경사항을 정리해서, 팀장(사용자)에게 "
-    "무엇이 어떻게 바뀌었는지, 다음에 뭘 하면 좋을지 실행 가능한 결론으로 요약해줘.",
-    "discussion",
-)
-
-GOAL_CODING_STEPS = [
-    ("codex", "개발 진행",
-     "현재 프로젝트 상태, 최근 교차 검토와 통합 결론을 먼저 확인해. 아직 완성되지 않은 항목 중 가장 중요한 담당 작업을 "
-     "계획 보고로 끝내지 말고 실제 코드로 구현해. 기존 변경과 충돌하지 않게 수정하고 가능한 검증을 실행한 뒤 변경 파일과 결과만 간결하게 보고해.",
-     "coding"),
-    ("antigravity", "개발 진행",
-     "Codex가 방금 반영한 내용과 최근 교차 검토를 확인해. 중복을 피하면서 프로젝트 완성도를 가장 크게 높일 담당 작업을 "
-     "실제 코드로 구현하고 검증해. 변경 파일, 구현 결과와 남은 위험만 간결하게 보고해.", "coding"),
-    ("claude", "개발 진행",
-     "Codex와 Antigravity가 이번 사이클에 반영한 변경과 최근 통합 결론을 확인해. 빠진 구현이나 연결 작업을 실제 코드로 "
-     "완료하고 검증해. 변경 파일, 구현 결과와 남은 위험만 간결하게 보고해.", "coding"),
-    ("codex", "교차 검토",
-     "이번 사이클의 세 모델 변경과 자동 검증 결과를 읽기 전용으로 검토해. 실제 사용자 요구 대비 결함, 미완성 기능, 회귀 위험, "
-     "누락 테스트를 우선순위로 정리하고 다음 사이클에서 반드시 고칠 항목을 제안해. 파일은 수정하지 마.", "discussion"),
-    ("antigravity", "교차 검토",
-     "이번 사이클 변경과 Codex 검토 의견을 프로젝트 파일에 대조해. 동의하지 않는 부분은 반박하고, 놓친 결함과 다음 구현 우선순위를 "
-     "구체적으로 제안해. 파일은 수정하지 마.", "discussion"),
-    ("claude", "교차 검토",
-     "이번 사이클 변경, 자동 검증, 두 모델의 검토 의견을 프로젝트 파일에 대조해. 사용자 경험과 전체 연결 관점에서 남은 결함과 "
-     "다음 구현 우선순위를 제안해. 파일은 수정하지 마.", "discussion"),
-]
+def pipeline_planning_steps(enabled_agents: list[str] | None = None) -> list[tuple[str, str, str, str]]:
+    """계획 단계 — Claude 한 번. 이 턴이 곧 승인 요청이다."""
+    return [(
+        PIPELINE_IMPLEMENTER, CONFIRM_PHASE,
+        "사용자 요청과 프로젝트 파일을 읽고 이번 작업의 구현 계획을 3~7개 항목으로 정리해. 각 항목에 수정할 파일과 "
+        "완료 기준(어떤 테스트·검증으로 확인할지)을 적어. 담당은 고정이다: Claude Code가 구현, Antigravity가 테스트, "
+        "Codex가 검토. 아직 파일은 수정하지 마. "
+        f"마지막 줄에 {APPROVAL_TOKEN}만 써라.",
+        "discussion",
+    )]
 
 
 def goal_coding_steps(enabled_agents: list[str]) -> list[tuple[str, str, str, str]]:
-    enabled = normalize_enabled_agents(enabled_agents)
-    steps = order_steps_by_agents(
-        [step for step in GOAL_CODING_STEPS if step[0] in enabled], enabled
+    """한 사이클 = 구현 → 테스트 → 검토. 순서는 고정이고 꺼진 모델의 단계만 빠진다."""
+    enabled = set(normalize_enabled_agents(enabled_agents))
+    return [step for step in PIPELINE_CYCLE_STEPS if step[0] in enabled]
+
+
+def pipeline_agent_roles() -> dict:
+    return normalize_agent_roles({
+        agent: PIPELINE_CATALOG_ROLES[role] for agent, role in PIPELINE_ROLES.items()
+    })
+
+
+def pipeline_roles_label(enabled_agents: list[str] | None) -> str:
+    enabled = set(normalize_enabled_agents(enabled_agents))
+    return ", ".join(
+        f'{AGENTS[agent]["label"]}={PIPELINE_ROLE_LABELS[role]}'
+        for agent, role in PIPELINE_ROLES.items()
+        if agent in enabled
     )
-    reporter = reporter_for(enabled)
-    steps.append((
-        reporter,
-        "토론 결과 통합",
-        "이번 사이클의 구현, 자동 검증과 세 모델 검토 의견을 하나의 결론으로 통합해. 의견 충돌을 정리하고 다음 사이클에서 "
-        "각 모델이 실제로 구현할 우선순위를 명확히 지정해. 프로젝트가 충분히 완성됐다고 판단해도 사용자가 중단하기 전까지 "
-        "품질, 테스트, 접근성, 성능과 운영 완성도를 다시 점검할 다음 작업을 선정해. 파일은 수정하지 마.",
-        "discussion",
-    ))
-    return steps
 
 
 DEFAULT_CODING_LIMITS = {
@@ -934,18 +912,6 @@ def make_report_step(enabled_agents: list[str], coding: bool = False) -> tuple[s
     return (reporter, "최종 보고", instruction, "discussion")
 
 
-def make_confirm_step(enabled_agents: list[str]) -> tuple[str, str, str, str]:
-    reporter = reporter_for(enabled_agents)
-    return (
-        reporter, CONFIRM_PHASE,
-        "지금까지 활성화된 에이전트들의 제안을 참고해서, 각자의 개선/수정 계획 전체를 "
-        "하나로 정리하고 팀장(사용자)에게 실제로 진행해도 될지 확인을 요청하는 메시지를 "
-        "작성해. 비활성화된 에이전트가 누구인지도 명시해. 아직 실제로 파일을 수정하지 말고, "
-        f"마지막 줄에 {APPROVAL_TOKEN}만 써라.",
-        "discussion",
-    )
-
-
 def steps_for_mode(mode: str, enabled_agents: list[str] | None = None) -> list[tuple[str, str, str, str]]:
     enabled = normalize_enabled_agents(enabled_agents)
     if mode == "quick":
@@ -956,13 +922,7 @@ def steps_for_mode(mode: str, enabled_agents: list[str] | None = None) -> list[t
         if agent in enabled
     ], enabled)
     if mode == "coding":
-        proposal_steps = order_steps_by_agents(
-            [step for step in PROPOSAL_STEPS if step[0] in enabled and step[1] != CONFIRM_PHASE], enabled
-        )
-        coding_steps = order_steps_by_agents(
-            [step for step in CODING_WORK_STEPS if step[0] in enabled], enabled
-        )
-        return discussion_steps + proposal_steps + [make_confirm_step(enabled)] + coding_steps + [make_report_step(enabled, coding=True)]
+        return pipeline_planning_steps(enabled)
     return discussion_steps + [make_report_step(enabled)]
 
 
@@ -1766,7 +1726,8 @@ def should_honor_approval_request(
 
 
 def allow_agent_calls(session_mode: str, phase: str) -> bool:
-    return not (session_mode == "coding" and phase == "작업 수행")
+    # 코딩 파이프라인은 역할이 고정이라 모델끼리 일을 넘기지 않는다.
+    return session_mode != "coding"
 
 
 def ask_codex(prompt: str, mode: str = "discussion", event_callback=None) -> str:
@@ -2885,16 +2846,23 @@ def can_continue_after_failed_step(state: dict, messages: list[dict]) -> bool:
     last = messages[-1]
     if (last.get("meta") or {}).get("failure_kind") not in {"role_scope", "cli"}:
         return False
-    steps = steps_for_mode(
-        state.get("mode", "discussion"),
-        normalize_enabled_agents(state.get("enabled_agents")),
-    )
-    step_index = int(state.get("step_index", 0))
+    enabled = normalize_enabled_agents(state.get("enabled_agents"))
+    # 파이프라인의 쓰기 단계는 모두 목표 사이클 안에 있다 — 그 단계 표와 위치로 판단한다.
+    if coding_iteration_state(state):
+        steps = goal_coding_steps(enabled)
+        step_index = int(state.get("coding_cycle_step", 0))
+    else:
+        steps = steps_for_mode(state.get("mode", "discussion"), enabled)
+        step_index = int(state.get("step_index", 0))
     if step_index >= len(steps):
         return False
     expected_agent, expected_phase, _instruction, _cli_mode = steps[step_index]
-    actual_phase = str(last.get("phase", "")).split(" · 사이클 ", 1)[0]
+    actual_phase = str(last.get("phase", "")).split(" · ", 1)[0]
     return last.get("agent") == expected_agent and actual_phase == expected_phase
+
+
+def coding_iteration_state(state: dict) -> bool:
+    return state.get("mode") == "coding" and state.get("coding_stage") == "iteration"
 
 
 def continue_after_failed_step() -> dict:
@@ -2902,7 +2870,8 @@ def continue_after_failed_step() -> dict:
         if not can_continue_after_failed_step(STATE, STATE.get("messages", [])):
             return {"error": "다음 단계로 넘길 수 있는 실패 턴이 없습니다."}
         skipped = STATE["messages"][-1]
-        STATE["step_index"] = int(STATE.get("step_index", 0)) + 1
+        position = "coding_cycle_step" if coding_iteration_state(STATE) else "step_index"
+        STATE[position] = int(STATE.get(position, 0)) + 1
         CONTROL["paused"] = False
         CONTROL["stopped"] = False
         save_state(STATE)
