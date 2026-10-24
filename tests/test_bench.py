@@ -17,7 +17,7 @@ class TaskSetTests(unittest.TestCase):
     def test_every_task_fails_at_start_and_its_solution_passes(self):
         expected, problems = run_bench.check_tasks(run_bench.task_dirs())
         self.assertEqual(problems, [])
-        self.assertEqual(len(expected), 8)
+        self.assertEqual(len(expected), 14)
 
 
 class ScoreTests(unittest.TestCase):
