@@ -124,6 +124,7 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
             roundtable.ask_claude("프로젝트 확인")
         args = run_cli.call_args.args[2]
         self.assertEqual(args[args.index("--tools") + 1], "Read,Glob,Grep")
+        self.assertNotIn("--allowedTools", args)   # 읽기 턴에서는 명령을 하나도 열지 않는다
         self.assertEqual(run_cli.call_args.kwargs["cwd"], roundtable.load_project_path())
 
     def test_discussion_without_project_uses_no_tools_and_isolated_directory(self):
@@ -172,6 +173,12 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
                 elif agent == "claude":
                     self.assertIn("Bash,Edit,Read,Write,Glob,Grep", args)
                     self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
+                    # acceptEdits만으로는 테스트 명령이 막혀 Claude가 자기 변경을 검증하지 못했다.
+                    allowed = args[args.index("--allowedTools") + 1].split(",")
+                    self.assertIn("Bash(python -m unittest*)", allowed)
+                    self.assertIn("Bash(.venv/Scripts/python -m pytest*)", allowed)
+                    self.assertTrue(all(rule.startswith("Bash(") for rule in allowed))
+                    self.assertNotIn("Bash", allowed)       # Bash 전체를 열지는 않는다
                 else:
                     self.assertEqual(args[args.index("--mode") + 1], "accept-edits")
                     self.assertIn("--dangerously-skip-permissions", args)

@@ -408,6 +408,19 @@ AGY_CMD = os.environ.get("AGY_CMD", "agy")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "900"))
 AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "600"))
+
+# 쓰기 턴에서 Claude Code가 승인 없이 돌릴 수 있는 검증 명령. acceptEdits는 파일 수정만 자동으로 허용하고
+# 명령 실행은 막아서, Claude가 자기 변경을 테스트하지 못했다. 테스트·빌드 명령만 열고 나머지
+# 명령(python -c 등)은 계속 막힌다. 자동 검증이 쓰는 명령과 같은 종류다.
+_CLAUDE_TEST_PYTHONS = (
+    "python", "python3", "py",
+    ".venv/Scripts/python", ".venv/Scripts/python.exe", ".venv/bin/python",
+    "venv/Scripts/python", "venv/Scripts/python.exe", "venv/bin/python",
+)
+CLAUDE_TEST_COMMANDS = (
+    *(f"Bash({python} -m {runner}*)" for python in _CLAUDE_TEST_PYTHONS for runner in ("pytest", "unittest")),
+    "Bash(pytest*)", "Bash(npm test*)", "Bash(npm run test*)", "Bash(npm run build*)",
+)
 #: CLI가 끝난 뒤 남은 출력을 기다리는 시간. 그 뒤에도 파이프가 열려 있으면 CLI가 띄운
 #: 자식(개발 서버 등)이 물려받은 것이므로 더 기다리지 않는다.
 CLI_PIPE_DRAIN_SECONDS = 2.0
@@ -547,7 +560,9 @@ PIPELINE_CYCLE_STEPS = [
     ("claude", "구현",
      "승인된 계획과 직전 사이클의 Codex 검토·자동 검증 결과(있다면)를 확인하고 실제 코드로 구현해. "
      "검토에서 지적된 결함이 있으면 그것부터 고쳐. 테스트 파일은 Antigravity 담당이니 고치지 마. "
-     "답변은 2줄 이내로만 써라: `변경: 바꾼 파일` / `결과: 한 줄 요약`.", "coding"),
+     "구현한 뒤 프로젝트 테스트를 직접 돌려 확인해 (`python -m unittest`, `python -m pytest`, `npm test` 같은 "
+     "테스트·빌드 명령만 실행할 수 있다). "
+     "답변은 2줄 이내로만 써라: `변경: 바꾼 파일` / `결과: 테스트 결과를 포함한 한 줄 요약`.", "coding"),
     ("antigravity", "테스트",
      "Claude Code가 이번 사이클에 바꾼 기능의 테스트를 테스트 파일(tests/, test_*.py, *.test.* 등)에만 "
      "추가·수정하고 실행해. 제품 코드는 고치지 마. "
@@ -1834,7 +1849,7 @@ def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> st
             "Return only a complete final answer in Korean, with no Tool: markers.",
         ])
     else:
-        args.extend(["--tools", "Bash,Edit,Read,Write,Glob,Grep"])
+        args.extend(["--tools", "Bash,Edit,Read,Write,Glob,Grep", "--allowedTools", ",".join(CLAUDE_TEST_COMMANDS)])
     args.extend(["--permission-mode", permission_mode, "--verbose", "--output-format", "stream-json", prompt])
     result = run_cli(
         "Claude Code",
@@ -4676,6 +4691,77 @@ def start_worker_if_needed(force: bool = False) -> None:
     thread.start()
 
 
+def start_topic(
+    topic: str,
+    mode: str = "discussion",
+    discussion_project_access: str = "read",
+    enabled_agents: list[str] | None = None,
+    agent_settings: dict | None = None,
+) -> str | None:
+    """현재 세션에 주제를 정하고 워커를 시작한다. 시작할 수 없으면 사용자에게 보여 줄 오류 문구를 돌려준다.
+
+    대시보드의 /topic과 평가 하니스(bench/)가 같이 쓴다.
+    """
+    topic = (topic or "").strip()
+    if mode == "continuous":
+        mode = "coding"
+    discussion_project_access = normalize_discussion_project_access(discussion_project_access)
+    enabled_agents = normalize_enabled_agents(enabled_agents)
+    agent_settings = normalize_agent_settings(agent_settings)
+    if mode not in MODE_LABELS:
+        mode = "discussion"
+    if mode == "quick":
+        # 빠른 질문은 모델 1명, 읽기 전용.
+        enabled_agents = enabled_agents[:1]
+        if discussion_project_access == "write":
+            discussion_project_access = "read"
+    if mode == "coding" and PIPELINE_IMPLEMENTER not in enabled_agents:
+        return "코딩 모드에는 구현 담당 Claude Code가 필요합니다. Claude Code를 켜고 다시 시작해주세요."
+    if not topic:
+        return "주제를 입력해주세요."
+    with STATE_LOCK:
+        STATE["topic"] = topic
+        if not STATE.get("name") or STATE.get("name") == "새 세션":
+            STATE["name"] = re.sub(r"\s+", " ", topic).strip()[:80]
+        STATE["mode"] = mode
+        STATE["discussion_project_access"] = (
+            "write" if mode == "coding" else discussion_project_access
+        )
+        if mode == "coding" or discussion_project_access == "write":
+            STATE["workspace_access"] = "write"
+        elif mode == "quick":
+            STATE["workspace_access"] = "read"
+        STATE["enabled_agents"] = enabled_agents
+        STATE["start_agent"] = enabled_agents[0]
+        STATE["step_index"] = 0
+        STATE["coding_stage"] = "planning"
+        STATE["plan_approved"] = False
+        if mode == "coding":
+            STATE["agent_roles"] = pipeline_agent_roles()
+        STATE["pipeline_git"] = {}
+        STATE["coding_cycle"] = 0
+        STATE["coding_cycle_step"] = 0
+        STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
+        STATE["coding_progress"] = normalize_coding_progress(None)
+        STATE["coding_stopped"] = False
+        STATE["coding_stop_reason"] = ""
+        STATE["workflow_status"] = workflow.ANALYZING
+        STATE["pending_user_question"] = None
+        STATE["agent_settings"] = agent_settings
+        STATE["finished"] = False
+        CONTROL["approval_requested"] = False
+        CONTROL["approval_requested_by"] = []
+        CONTROL["approval_rejected"] = False
+        save_state(STATE)
+        state_snapshot = dict(STATE)
+    start_log_session()
+    write_session_transcript_header(state_snapshot)
+    ensure_session_memory(state_snapshot)
+    print(f"  \U0001f4cc 토론 주제: {topic} ({MODE_LABELS[mode]}, 활성: {agent_names(enabled_agents)})")
+    start_worker_if_needed()
+    return None
+
+
 # ──────────────────────────────────────────
 # HTML 대시보드 (항상 이 한 화면 — 주제 입력도 이 안의 한 섹션일 뿐)
 # 화면 자체는 dashboard_template.html에 따로 빼두고, 여기서는 값만 채워 넣는다.
@@ -6282,78 +6368,23 @@ class RoundtableHandler(BaseHTTPRequestHandler):
 
         if self.path == "/topic":
             form = self._read_form()
-            topic = form.get("topic", [""])[0].strip()
-            mode = form.get("mode", ["discussion"])[0].strip()
-            if mode == "continuous":
-                mode = "coding"
-            discussion_project_access = normalize_discussion_project_access(
-                form.get("discussion_project_access", ["read"])[0].strip()
-            )
             requested_start_agent = form.get("start_agent", [""])[0].strip()
-            enabled_agents = prioritize_start_agent(form.get("agent", []), requested_start_agent)
-            agent_settings = normalize_agent_settings({
-                agent: {
-                    "model": form.get(f"model_{agent}", [""])[0].strip(),
-                    "effort": form.get(f"effort_{agent}", [""])[0].strip(),
-                }
-                for agent in AGENT_ORDER
-            })
-            if mode not in MODE_LABELS:
-                mode = "discussion"
-            if mode == "quick":
-                # 빠른 질문은 모델 1명, 읽기 전용.
-                enabled_agents = enabled_agents[:1]
-                if discussion_project_access == "write":
-                    discussion_project_access = "read"
-            if mode == "coding" and PIPELINE_IMPLEMENTER not in enabled_agents:
-                self._send_error_json(
-                    400, "코딩 모드에는 구현 담당 Claude Code가 필요합니다. Claude Code를 켜고 다시 시작해주세요."
-                )
+            error = start_topic(
+                form.get("topic", [""])[0],
+                form.get("mode", ["discussion"])[0].strip(),
+                form.get("discussion_project_access", ["read"])[0].strip(),
+                prioritize_start_agent(form.get("agent", []), requested_start_agent),
+                {
+                    agent: {
+                        "model": form.get(f"model_{agent}", [""])[0].strip(),
+                        "effort": form.get(f"effort_{agent}", [""])[0].strip(),
+                    }
+                    for agent in AGENT_ORDER
+                },
+            )
+            if error:
+                self._send_error_json(400, error)
                 return
-            if not topic:
-                self._send_error_json(400, "주제를 입력해주세요.")
-                return
-            if topic:
-                with STATE_LOCK:
-                    STATE["topic"] = topic
-                    if not STATE.get("name") or STATE.get("name") == "새 세션":
-                        STATE["name"] = re.sub(r"\s+", " ", topic).strip()[:80]
-                    STATE["mode"] = mode
-                    STATE["discussion_project_access"] = (
-                        "write" if mode == "coding" else discussion_project_access
-                    )
-                    if mode == "coding" or discussion_project_access == "write":
-                        STATE["workspace_access"] = "write"
-                    elif mode == "quick":
-                        STATE["workspace_access"] = "read"
-                    STATE["enabled_agents"] = enabled_agents
-                    STATE["start_agent"] = enabled_agents[0]
-                    STATE["step_index"] = 0
-                    STATE["coding_stage"] = "planning"
-                    STATE["plan_approved"] = False
-                    if mode == "coding":
-                        STATE["agent_roles"] = pipeline_agent_roles()
-                    STATE["pipeline_git"] = {}
-                    STATE["coding_cycle"] = 0
-                    STATE["coding_cycle_step"] = 0
-                    STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
-                    STATE["coding_progress"] = normalize_coding_progress(None)
-                    STATE["coding_stopped"] = False
-                    STATE["coding_stop_reason"] = ""
-                    STATE["workflow_status"] = workflow.ANALYZING
-                    STATE["pending_user_question"] = None
-                    STATE["agent_settings"] = agent_settings
-                    STATE["finished"] = False
-                    CONTROL["approval_requested"] = False
-                    CONTROL["approval_requested_by"] = []
-                    CONTROL["approval_rejected"] = False
-                    save_state(STATE)
-                    state_snapshot = dict(STATE)
-                start_log_session()
-                write_session_transcript_header(state_snapshot)
-                ensure_session_memory(state_snapshot)
-                print(f"  \U0001f4cc 토론 주제: {topic} ({MODE_LABELS[mode]}, 활성: {agent_names(enabled_agents)})")
-                start_worker_if_needed()
             self._send_html(render_dashboard())
             return
 

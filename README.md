@@ -240,6 +240,22 @@ python tests\live_smoke.py codex      # 하나만
 인증 정보가 섞이면 경고합니다. CLI가 없거나 로그인되지 않았으면 성공으로 위장하지
 않고 실패로 남깁니다.
 
+### 평가 하니스 (Claude 단독 vs 3명 파이프라인)
+
+`bench/`는 같은 코딩 과제를 **Claude 단독**(Claude만 켠 코딩 모드)과 **3명 파이프라인**으로 풀게 하고, 에이전트가 볼 수 없는 숨김 테스트로 채점합니다. 두 방식은 같은 TriAgent 실행 경로를 쓰고, 켜는 모델만 다릅니다.
+
+- **과제** — `bench/tasks/`에 8개가 있습니다: 새 함수 3, 버그 수정 3, 여러 파일 기능 2. 과제마다 시작 코드(`repo/`), 지시문(`task.md`), 숨김 테스트(`hidden/`), 정답 풀이(`solution/`)가 있습니다. 실행 전에 과제 자체를 점검합니다: 시작 상태는 숨김 테스트에 실패하고, 정답 풀이는 숨김·공개 테스트를 모두 통과해야 합니다.
+- **측정** — 성공(숨김 테스트 전부 통과), 숨김 테스트 통과율, 시간, 모델 호출 수, 토큰, 비용, 사이클 수, 변경 줄 수.
+- **격리** — 세션·상태 파일·worktree는 테스트와 같은 격리로 임시 폴더에 둡니다. 계획 승인은 하니스가 두 방식 모두 자동으로 합니다.
+
+```powershell
+python bench\run_bench.py --check                                   # 과제 점검만 (모델 호출 없음)
+python bench\run_bench.py --tasks e2-chunked,m1-cart --repeats 1    # 실제 모델로 실행 (요금·한도 소모)
+python bench\run_bench.py --report bench\results\<파일>.jsonl        # 결과표 다시 만들기
+```
+
+결과는 `bench/results/<시각>.jsonl`(실행마다 한 줄)과 같은 이름의 `.md` 결과표로 남습니다.
+
 ## 설정 파일
 
 | 파일 | 역할 |
@@ -299,6 +315,7 @@ static/dashboard.css     대시보드 디자인과 반응형 레이아웃
 static/dashboard.js      실시간 상태 갱신과 사용자 제어
 static/agents/            모델 아이콘
 tests/                    회귀 및 실제 CLI 스모크 테스트
+bench/                    평가 하니스 (과제 8개, 실행·채점·결과표)
 TEAM_PROMPT.md            세 모델 공통 지침
 PROJECT_PATH.txt          코딩 대상 프로젝트 경로
 orchestrate.py            이전 2모델 협업 실험 스크립트
@@ -333,6 +350,10 @@ orchestrate.py            이전 2모델 협업 실험 스크립트
   TriAgent 자신의 폴더로 대체하지 않습니다. 유효한 폴더를 다시 선택할 때까지 읽기와
   쓰기 모델 실행을 모두 차단하고, 원래 저장된 경로와 함께 차단 상태를 화면에 표시합니다.
   세션에 저장된 작업공간과 현재 선택 경로가 다르면 사용자 확인 없이 실행하지 않습니다.
+- **Claude Code 명령 실행 범위**:
+  - 쓰기 턴에서는 파일 수정과 함께 테스트·빌드 명령만 승인 없이 실행합니다. 허용하는 명령은 `python -m unittest`, `python -m pytest`(`.venv`/`venv`의 python 포함), `pytest`, `npm test`, `npm run test`, `npm run build`입니다.
+  - 그 밖의 명령(`python -c` 등)과, 테스트 명령 뒤에 `&&`로 다른 명령을 붙인 경우는 막힙니다.
+  - 다만 테스트가 프로젝트 코드를 실행하므로 완전한 격리는 아닙니다.
 - 로컬 대시보드는 외부 폰트를 포함해 **인터넷으로 나가는 요청을 하지 않습니다.**
 - CLI 출력·점검 로그에서 API 키·토큰으로 보이는 값은 마스킹합니다.
 
