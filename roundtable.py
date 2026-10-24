@@ -433,6 +433,7 @@ TRANSCRIPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TRANSCRIPT_MAX_CHARS", "16
 MEMORY_CONTEXT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_MEMORY_CONTEXT_MAX_CHARS", "1800"))
 TEAM_PROMPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TEAM_PROMPT_MAX_CHARS", "1400"))
 PROMPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_PROMPT_MAX_CHARS", "5000"))
+TOPIC_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TOPIC_MAX_CHARS", "4000"))
 OUTPUT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_OUTPUT_MAX_CHARS", "2000"))
 PROJECT_SNAPSHOT_MAX_ENTRIES = int(os.environ.get("ROUNDTABLE_SNAPSHOT_MAX_ENTRIES", "20000"))
 CODEX_CONTEXT_TOKENS = int(os.environ.get("CODEX_CONTEXT_TOKENS", "258400"))
@@ -2688,7 +2689,9 @@ def compose_agent_prompt(
     project_context: str = "",
 ) -> str:
     team_prompt = team_prompt[:TEAM_PROMPT_MAX_CHARS]
-    topic = topic[:500]
+    # 예전에는 500자에서 조용히 잘라, 긴 요청의 뒷부분 규칙을 모델이 아예 보지 못했다.
+    if len(topic) > TOPIC_MAX_CHARS:
+        topic = topic[:TOPIC_MAX_CHARS] + f"\n(요청이 {TOPIC_MAX_CHARS:,}자를 넘어 뒷부분을 잘랐습니다)"
     instruction = instruction[:1200]
     header = (
         "모든 사용자 노출 문장은 한국어로 쓴다. 파일명·명령어·코드 식별자만 원문을 유지한다.\n"
@@ -2714,7 +2717,9 @@ def compose_agent_prompt(
     if transcript:
         context_parts.append(f"최근 대화:\n{transcript}")
     context = "\n\n".join(context_parts)
-    available = max(0, PROMPT_MAX_CHARS - len(base) - 24)
+    # 긴 요청만큼 한도를 늘린다. 마지막 자르기는 프롬프트 끝(요청·이번 작업)부터 자르기 때문이다.
+    limit = PROMPT_MAX_CHARS + max(0, len(topic) - 500)
+    available = max(0, limit - len(base) - 24)
     if len(context) > available:
         notice = "\n... 문맥 축약 ...\n"
         remaining = max(0, available - len(notice))
@@ -2722,7 +2727,7 @@ def compose_agent_prompt(
         tail_size = remaining - head_size
         context = context[:head_size] + notice + (context[-tail_size:] if tail_size else "")
     prompt = f"{header}{team_prompt}\n\n{context}{current_task}"
-    return prompt[:PROMPT_MAX_CHARS]
+    return prompt[:limit]
 
 
 # ──────────────────────────────────────────
@@ -5023,16 +5028,19 @@ def topic_section_html(
             for agent in enabled_agents
         )
         return (
-            f'<div class="topic"><h3>{html.escape(topic)} '
+            # 주제는 두 줄까지만, 세부 정보는 접어 둔다. 다 펼쳐 두면 1380×760 화면에서
+            # 이 카드가 285px를 차지해 대화 영역이 16px만 남았다.
+            f'<div class="topic"><h3 class="topic-title" title="{html.escape(topic)}">{html.escape(topic)} '
             f'<span style="color:var(--faint);font-weight:500">· {html.escape(mode_label)}</span></h3>'
+            '<details class="topic-details"><summary>세션 정보</summary>'
             f'<p>활성: {html.escape(agent_names(enabled_agents))} · 비활성: '
             f'{html.escape(agent_names(disabled_agents) if disabled_agents else "없음")}</p>'
-            f'<p>첫 실행 모델: {html.escape(AGENTS[enabled_agents[0]]["label"])}</p>'
+            f'<p>첫 실행 모델: {html.escape(AGENTS[PIPELINE_IMPLEMENTER if mode == "coding" else enabled_agents[0]]["label"])}</p>'
             f'<p>모델: {html.escape(settings_label)}</p>'
             f'<p>프로젝트 접근: {"읽기·쓰기 (코딩 실행)" if mode == "coding" else html.escape(discussion_access_label)}</p>'
             f'<p>저장 폴더: {html.escape(str(session_memory_dir(active_id)))}</p>'
             f'{project_path_line if mode == "coding" else ""}'
-            f'{worktree_line if mode == "coding" else ""}</div>'
+            f'{worktree_line if mode == "coding" else ""}</details></div>'
         )
 
     return f"""

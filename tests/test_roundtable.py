@@ -1435,15 +1435,36 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         self.assertEqual(roundtable.unresolved_approval_requesters(messages), [])
 
     def test_composed_prompt_has_a_hard_character_limit(self):
+        topic = "주제" * 1000
         prompt = roundtable.compose_agent_prompt(
             "공통 지침" * 1000,
-            "주제" * 1000,
+            topic,
             "메모리" * 3000,
             "대화" * 3000,
             "작업" * 1000,
         )
-        self.assertLessEqual(len(prompt), roundtable.PROMPT_MAX_CHARS)
+        # 한도는 긴 요청만큼만 늘어난다 (나머지 문맥 예산은 그대로).
+        self.assertLessEqual(len(prompt), roundtable.PROMPT_MAX_CHARS + len(topic) - 500)
         self.assertIn("현재 작업", prompt)
+
+    def test_long_requests_reach_the_model_in_full(self):
+        """예전에는 500자에서 잘려 뒷부분 규칙을 모델이 보지 못했다 (평가 하니스에서 발견)."""
+        topic = "규칙 " * 400 + "마지막 규칙: 모자라면 아무것도 빼지 않는다."
+        prompt = roundtable.compose_agent_prompt("공통 지침" * 1000, topic, "메모리" * 3000,
+                                                 "대화" * 3000, "이번 작업 지시")
+        self.assertIn(topic, prompt)
+        self.assertTrue(prompt.endswith("현재 작업: 이번 작업 지시\n"))
+
+    def test_requests_over_the_topic_limit_say_they_were_cut(self):
+        topic = "가" * (roundtable.TOPIC_MAX_CHARS + 100)
+        prompt = roundtable.compose_agent_prompt("", topic, "", "", "작업")
+        self.assertIn("뒷부분을 잘랐습니다", prompt)
+        self.assertNotIn("가" * (roundtable.TOPIC_MAX_CHARS + 1), prompt)
+
+    def test_topic_card_folds_details_so_the_chat_has_room(self):
+        markup = roundtable.topic_section_html("긴 요청 " * 100, "coding", ["claude", "codex"], "s1")
+        self.assertIn('<details class="topic-details">', markup)
+        self.assertIn("첫 실행 모델: Claude Code", markup)   # 코딩 모드는 항상 Claude 계획부터
 
     def test_agent_output_is_clipped(self):
         output, truncated = roundtable.clip_agent_output("가" * 3000, max_chars=2000)

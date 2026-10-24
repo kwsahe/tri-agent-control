@@ -728,6 +728,21 @@ button.danger {
   font-weight: 650;
 }
 
+/* 긴 요청도 두 줄까지만 (전체는 툴팁). 세부 정보는 접어 대화 영역을 남긴다. */
+.topic-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.topic-details > summary {
+  cursor: pointer;
+  color: var(--faint);
+  font-size: 12px;
+  width: fit-content;
+}
+
 .topic p,
 .memory-path {
   margin: 5px 0 0;
