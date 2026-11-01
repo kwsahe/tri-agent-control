@@ -291,7 +291,8 @@ python bench\run_bench.py --report bench\results\<파일>.jsonl        # 결과�
 |---|---:|---|
 | `CODEX_CMD` / `AGY_CMD` / `CLAUDE_CMD` | `codex` / `agy` / `claude` | CLI 실행 명령 |
 | `CODEX_TIMEOUT_SECONDS` | 900 | Codex 응답 제한 시간 |
-| `AGY_TIMEOUT_SECONDS` / `CLAUDE_TIMEOUT_SECONDS` | 600 | Antigravity와 Claude 응답 제한 시간 |
+| `AGY_TIMEOUT_SECONDS` | 1200 | Antigravity 응답 제한 시간 (테스트 작성·실행이 길다) |
+| `CLAUDE_TIMEOUT_SECONDS` | 600 | Claude 응답 제한 시간 |
 | `ROUNDTABLE_PORT` | 8765 | 로컬 대시보드 시작 포트 |
 | `ROUNDTABLE_TRANSCRIPT_WINDOW` | 2 | 직접 전달하는 최근 메시지 수 |
 | `ROUNDTABLE_MEMORY_BRIEF_LINES` | 6 | 압축 메모리 줄 수 |

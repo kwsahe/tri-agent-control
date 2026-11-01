@@ -407,7 +407,8 @@ CODEX_CMD = os.environ.get("CODEX_CMD", "codex")
 AGY_CMD = os.environ.get("AGY_CMD", "agy")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "900"))
-AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "600"))
+# 테스트 담당은 기존 테스트를 고치고 새 테스트를 쓰고 돌리느라 오래 걸린다 (실사용: 로그인 기능에서 600초 초과).
+AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "1200"))
 
 # 쓰기 턴에서 Claude Code가 승인 없이 돌릴 수 있는 검증 명령. acceptEdits는 파일 수정만 자동으로 허용하고
 # 명령 실행은 막아서, Claude가 자기 변경을 테스트하지 못했다. 테스트·빌드 명령만 열고 나머지
