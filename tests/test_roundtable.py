@@ -330,6 +330,16 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         state["total_est_tokens"] = state["coding_limits"]["max_tokens"]
         self.assertIn("최대 토큰", roundtable.coding_limit_reason(state))
 
+        # 캐시 읽기는 도구 호출마다 같은 문맥을 다시 읽은 양이라 한도에 세지 않는다.
+        # (실사용: 화면 구현 턴 하나가 캐시 읽기 20만 개로 한도를 넘겨 테스트·검토 전에 끝났다.)
+        state["total_est_tokens"] = 0
+        state["total_actual_tokens"] = 283_544
+        state["total_work_tokens"] = 41_779
+        self.assertIsNone(roundtable.coding_limit_reason(state))
+        state["total_work_tokens"] = state["coding_limits"]["max_tokens"]
+        self.assertIn("최대 토큰", roundtable.coding_limit_reason(state))
+        state["total_work_tokens"] = 0
+
         state["total_est_tokens"] = 0
         state["coding_progress"]["changed_paths"] = [
             f"file-{index}.txt"
@@ -1052,6 +1062,14 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         self.assertEqual(summary["claude"]["turns"], 1)
         self.assertEqual(summary["claude"]["input_tokens"], 80)
         self.assertEqual(summary["codex"]["estimated_tokens"], 12)
+
+    def test_work_tokens_leave_out_cache_reads(self):
+        claude = {"input_tokens": 22, "cache_creation_input_tokens": 27_719,
+                  "cache_read_input_tokens": 201_765, "output_tokens": 13_390}
+        self.assertEqual(roundtable.work_token_count(claude), 41_131)
+        codex = {"input_tokens": 12_000, "cached_input_tokens": 9_000, "output_tokens": 50}
+        self.assertEqual(roundtable.work_token_count(codex), 3_050)
+        self.assertEqual(roundtable.work_token_count(None), 0)
 
     def test_actual_token_count_does_not_double_count_openai_cache(self):
         usage = {"input_tokens": 12000, "cached_input_tokens": 9000, "output_tokens": 50}

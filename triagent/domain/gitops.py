@@ -21,7 +21,7 @@ from pathlib import Path
 
 __all__ = [
     "GitResult", "SHARED_DIRS", "is_repo", "is_clean", "current_branch", "repo_root",
-    "create_worktree", "link_shared_dirs", "remove_worktree", "commit_paths",
+    "create_worktree", "link_shared_dirs", "remove_worktree", "ignored_paths", "commit_paths",
 ]
 
 #: worktree에 연결해 함께 쓰는 사용자 폴더의 무거운 의존성 폴더 (Git이 추적하지 않는다).
@@ -155,6 +155,22 @@ def remove_worktree(repo: Path, worktree_dir: Path, workspace: Path | None = Non
     except (OSError, subprocess.TimeoutExpired) as exc:
         return GitResult(False, f"git 실행 실패로 worktree를 지우지 못했습니다: {exc}")
     return GitResult(True, "")
+
+
+def ignored_paths(root: Path, paths: list[str]) -> set[str]:
+    """``paths`` 중 .gitignore에 걸리는 것 (빌드 결과물 등). 저장소가 아니거나 git을 못 쓰면 빈 집합.
+
+    이미 추적 중인 파일은 무시 규칙에 걸려도 돌려주지 않는다 (진짜 변경이다).
+    """
+    if not paths:
+        return set()
+    try:
+        result = _git(root, "check-ignore", "--stdin", "-z", input_text="\0".join(paths))
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode not in (0, 1):   # 1 = 걸리는 것 없음, 128 = 저장소 아님 등
+        return set()
+    return {path for path in result.stdout.split("\0") if path}
 
 
 def commit_paths(root: Path, message: str, paths: list[str]) -> GitResult:

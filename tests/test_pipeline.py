@@ -186,6 +186,21 @@ class GitOpsTests(unittest.TestCase):
         self.assertFalse(self.wt.exists())
         self.assertTrue((self.root / "frontend" / "node_modules" / "vitest" / "marker.txt").exists())
 
+    def test_build_outputs_listed_in_gitignore_are_reported_as_ignored(self):
+        """실사용: Claude가 npm run build를 돌려 생긴 frontend/dist/가 변경 파일로 잡혔다."""
+        self.init_repo()
+        (self.root / ".gitignore").write_text("dist/\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "ignore")
+        (self.root / "dist").mkdir()
+        (self.root / "dist" / "index.js").write_text("x\n", encoding="utf-8")
+        self.assertEqual(gitops.ignored_paths(self.root, ["app.py", "dist/", "dist/index.js"]),
+                         {"dist/", "dist/index.js"})
+        self.assertEqual(gitops.ignored_paths(self.root, []), set())
+
+    def test_ignored_paths_outside_a_repo_is_empty(self):
+        self.assertEqual(gitops.ignored_paths(self.root, ["dist/index.js"]), set())
+
     def test_worktree_with_uncommitted_changes_is_not_removed(self):
         self.init_repo()
         gitops.create_worktree(self.root, self.wt, "triagent/s1")

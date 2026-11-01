@@ -3473,6 +3473,18 @@ def actual_token_count(usage: dict | None) -> int:
     ))
 
 
+def work_token_count(usage: dict | None) -> int:
+    """코딩 한도용 처리 토큰: 캐시 읽기를 뺀다.
+
+    캐시 읽기는 도구를 부를 때마다 같은 문맥을 다시 읽은 양이라 작업량이 아니라 도구 호출 수에
+    비례한다. 화면 구현 턴 하나(비용 $0.53)가 캐시 읽기 20만 개로 토큰 한도를 넘겨 테스트·검토 전에
+    세션이 끝났다.
+    """
+    usage = usage or {}
+    cached = int(usage.get("cache_read_input_tokens", 0) or 0) + int(usage.get("cached_input_tokens", 0) or 0)
+    return max(0, actual_token_count(usage) - cached)
+
+
 def budget_exceeded_reason(state: dict) -> str | None:
     budget = state.get("budget") or {}
     token_limit = int(budget.get("token_limit", 0) or 0)
@@ -3496,11 +3508,11 @@ def coding_limit_reason(state: dict) -> str | None:
     if started_at and time.time() - started_at >= limits["max_minutes"] * 60:
         return f"최대 실행 시간 {limits['max_minutes']}분 도달"
     used_tokens = max(
-        int(state.get("total_actual_tokens", 0) or 0) - int(state.get("coding_start_actual_tokens", 0) or 0),
+        int(state.get("total_work_tokens", 0) or 0) - int(state.get("coding_start_work_tokens", 0) or 0),
         int(state.get("total_est_tokens", 0) or 0) - int(state.get("coding_start_est_tokens", 0) or 0),
     )
     if used_tokens >= limits["max_tokens"]:
-        return f"최대 토큰 {limits['max_tokens']:,} 도달"
+        return f"최대 토큰 {limits['max_tokens']:,} 도달 (캐시 읽기 제외)"
     if len(progress["changed_paths"]) >= limits["max_changed_files"]:
         return f"최대 변경 파일 {limits['max_changed_files']}개 도달"
     if progress["diff_lines"] >= limits["max_diff_lines"]:
@@ -3537,6 +3549,9 @@ def add_message(
             STATE["total_est_tokens"] = STATE.get("total_est_tokens", 0) + meta.get("est_tokens", 0)
             STATE["total_elapsed_time"] = STATE.get("total_elapsed_time", 0.0) + meta.get("elapsed", 0.0)
             STATE["total_actual_tokens"] = STATE.get("total_actual_tokens", 0) + actual_token_count(
+                meta.get("actual_usage")
+            )
+            STATE["total_work_tokens"] = STATE.get("total_work_tokens", 0) + work_token_count(
                 meta.get("actual_usage")
             )
             STATE["total_actual_cost_usd"] = round(
@@ -4060,6 +4075,11 @@ def run_step(
         snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
     )
     changed_paths = compare_project_snapshots(before_snapshot, after_snapshot) if cli_mode == "coding" else []
+    if changed_paths:
+        # 빌드 결과물(frontend/dist/ 등)처럼 .gitignore에 걸리는 경로는 에이전트 변경으로 세지 않는다.
+        # 세면 변경 파일 한도를 채우고, 사이클 커밋의 git add가 "ignored" 오류로 실패한다.
+        ignored = gitops.ignored_paths(project_path, [item["path"] for item in changed_paths])
+        changed_paths = [item for item in changed_paths if item["path"] not in ignored]
     scope_violations = role_scope_violations(agent, changed_paths, state_snapshot) if cli_mode == "coding" else []
     turn_diff = build_turn_diff(project_path, before_texts, changed_paths) if cli_mode == "coding" else ""
     checkpoint_path = save_turn_checkpoint(
@@ -4497,6 +4517,7 @@ def worker_loop(session_id: str) -> None:
                     # 한도를 먼저 써버리면 사이클 1이 시작하자마자 끝난다.
                     STATE["coding_started_at"] = time.time()
                     STATE["coding_start_actual_tokens"] = int(STATE.get("total_actual_tokens", 0) or 0)
+                    STATE["coding_start_work_tokens"] = int(STATE.get("total_work_tokens", 0) or 0)
                     STATE["coding_start_est_tokens"] = int(STATE.get("total_est_tokens", 0) or 0)
                     STATE["coding_stopped"] = False
                     STATE["coding_stop_reason"] = ""
