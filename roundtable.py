@@ -419,7 +419,12 @@ _CLAUDE_TEST_PYTHONS = (
 )
 CLAUDE_TEST_COMMANDS = (
     *(f"Bash({python} -m {runner}*)" for python in _CLAUDE_TEST_PYTHONS for runner in ("pytest", "unittest")),
-    "Bash(pytest*)", "Bash(npm test*)", "Bash(npm run test*)", "Bash(npm run build*)",
+    # 절대 경로·./ 로 부른 가상환경 python (실사용: `.venv` python으로 pytest를 못 돌렸다).
+    # 실행 파일 이름이 python으로 끝나야 한다. `a && b`처럼 이어 붙인 명령은 Claude Code가 따로 검사한다.
+    *(f"Bash(*{python} -m {runner}*)" for python in ("python", "python.exe", "python3")
+      for runner in ("pytest", "unittest")),
+    "Bash(pytest*)", "Bash(npx vitest*)",
+    "Bash(npm test*)", "Bash(npm run test*)", "Bash(npm run build*)",
 )
 #: CLI가 끝난 뒤 남은 출력을 기다리는 시간. 그 뒤에도 파이프가 열려 있으면 CLI가 띄운
 #: 자식(개발 서버 등)이 물려받은 것이므로 더 기다리지 않는다.
@@ -614,7 +619,7 @@ DEFAULT_CODING_LIMITS = {
     "max_minutes": 45,
     "max_tokens": 200_000,
     "max_changed_files": 50,
-    "max_diff_lines": 2_000,
+    "max_diff_lines": 5_000,   # 풀스택 기능 하나가 테스트 포함 2,390줄이었다
     "max_consecutive_failures": 2,
     "max_same_error": 2,
 }
@@ -1379,7 +1384,9 @@ def parse_cli_stream_event(tool_name: str, line: str) -> tuple[dict | None, str 
                     name = block.get("name", "도구")
                     tool_input = block.get("input") or {}
                     path = tool_input.get("file_path") or tool_input.get("path")
-                    detail = f": {path}" if path else ""
+                    command = tool_input.get("command") if name == "Bash" else None
+                    # 어떤 명령이 막혔는지 알 수 있게 Bash 명령도 남긴다 (실사용에서 거부된 명령을 알 수 없었다).
+                    detail = f": {path}" if path else (f": {command}" if command else "")
                     kind = "file" if name in {"Edit", "Write", "NotebookEdit"} else "tool"
                     event = {"kind": kind, "text": f"{name} 실행{detail}"[:300], "usage": usage}
                     if path:
@@ -1390,6 +1397,12 @@ def parse_cli_stream_event(tool_name: str, line: str) -> tuple[dict | None, str 
             if usage:
                 return {"kind": "usage", "text": "Claude 사용량 갱신", "usage": usage}, None
         if event_type == "user":
+            for block in (data.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error"):
+                    content = block.get("content")
+                    if isinstance(content, list):
+                        content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+                    return {"kind": "tool", "text": f"도구 실행 실패: {str(content or '')[:200]}"}, None
             return {"kind": "tool", "text": "도구 실행 결과 확인"}, None
         if event_type == "result":
             usage = data.get("usage") or {}
@@ -3496,11 +3509,22 @@ def budget_exceeded_reason(state: dict) -> str | None:
     return None
 
 
-def coding_limit_reason(state: dict) -> str | None:
+def coding_limit_reason(state: dict, cycle_boundary: bool = True) -> str | None:
+    """코딩을 멈출 이유. 크기·시간·토큰 한도는 사이클 경계(새 사이클 시작 직전)에서만 본다.
+
+    사이클 중간에 멈추면 이미 한 구현이 검증·검토·커밋 없이 버려진다 (실사용: 로그인 기능이
+    테스트 턴 직후 diff 한도에 걸려 커밋 0개로 끝났다). 실패 반복 한도는 언제나 본다.
+    """
     if state.get("mode") != "coding" or state.get("coding_stage") != "iteration":
         return None
     limits = normalize_coding_limits(state.get("coding_limits"))
     progress = normalize_coding_progress(state.get("coding_progress"))
+    if progress["consecutive_failures"] >= limits["max_consecutive_failures"]:
+        return f"연속 실패 {limits['max_consecutive_failures']}회 도달"
+    if progress["same_error_count"] >= limits["max_same_error"]:
+        return f"동일 오류 {limits['max_same_error']}회 반복"
+    if not cycle_boundary:
+        return None
     cycle = max(1, int(state.get("coding_cycle", 1) or 1))
     if cycle > limits["max_cycles"]:
         return f"최대 목표 사이클 {limits['max_cycles']}회 완료"
@@ -3517,10 +3541,6 @@ def coding_limit_reason(state: dict) -> str | None:
         return f"최대 변경 파일 {limits['max_changed_files']}개 도달"
     if progress["diff_lines"] >= limits["max_diff_lines"]:
         return f"최대 diff {limits['max_diff_lines']:,}줄 도달"
-    if progress["consecutive_failures"] >= limits["max_consecutive_failures"]:
-        return f"연속 실패 {limits['max_consecutive_failures']}회 도달"
-    if progress["same_error_count"] >= limits["max_same_error"]:
-        return f"동일 오류 {limits['max_same_error']}회 반복"
     return None
 
 
@@ -4473,7 +4493,9 @@ def worker_loop(session_id: str) -> None:
                     max(1, int(STATE.get("coding_cycle", 1) or 1))
                     if coding_iteration else 0
                 )
-                limit_reason = coding_limit_reason(STATE) if coding_iteration else None
+                limit_reason = (
+                    coding_limit_reason(STATE, cycle_boundary=step_index == 0) if coding_iteration else None
+                )
                 finished_already = bool(STATE.get("finished"))
             if mode == "coding" and PIPELINE_IMPLEMENTER not in enabled_agents:
                 # 옛 세션을 Claude Code 없이 재개한 경우 — 구현 담당 없이 파이프라인을 돌리지 않는다.

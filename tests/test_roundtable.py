@@ -177,6 +177,7 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
                     allowed = args[args.index("--allowedTools") + 1].split(",")
                     self.assertIn("Bash(python -m unittest*)", allowed)
                     self.assertIn("Bash(.venv/Scripts/python -m pytest*)", allowed)
+                    self.assertIn("Bash(*python.exe -m pytest*)", allowed)   # 절대 경로·./ 로 부른 가상환경
                     self.assertTrue(all(rule.startswith("Bash(") for rule in allowed))
                     self.assertNotIn("Bash", allowed)       # Bash 전체를 열지는 않는다
                 else:
@@ -350,6 +351,11 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         state["coding_progress"]["changed_paths"] = []
         state["coding_progress"]["diff_lines"] = state["coding_limits"]["max_diff_lines"]
         self.assertIn("최대 diff", roundtable.coding_limit_reason(state))
+        # 사이클 중간에는 크기 한도로 멈추지 않는다 — 이미 한 구현이 검증·검토·커밋 없이 버려진다.
+        self.assertIsNone(roundtable.coding_limit_reason(state, cycle_boundary=False))
+        state["coding_progress"]["consecutive_failures"] = state["coding_limits"]["max_consecutive_failures"]
+        self.assertIn("연속 실패", roundtable.coding_limit_reason(state, cycle_boundary=False))
+        state["coding_progress"]["consecutive_failures"] = 0
 
         state["coding_progress"]["diff_lines"] = 0
         state["coding_started_at"] = (
@@ -1018,6 +1024,20 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         )
         self.assertEqual(event["kind"], "message")
         self.assertEqual(final, "완료")
+
+    def test_claude_stream_shows_bash_commands_and_rejections(self):
+        event, _final = roundtable.parse_cli_stream_event(
+            "Claude Code",
+            '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash",'
+            '"input":{"command":"./.venv/Scripts/python -m pytest backend -q"}}]}}',
+        )
+        self.assertIn("Bash 실행: ./.venv/Scripts/python -m pytest backend -q", event["text"])
+        event, _final = roundtable.parse_cli_stream_event(
+            "Claude Code",
+            '{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,'
+            '"content":"This command requires approval"}]}}',
+        )
+        self.assertEqual(event["text"], "도구 실행 실패: This command requires approval")
 
     def test_claude_stream_result_exposes_usage(self):
         event, final = roundtable.parse_cli_stream_event(
