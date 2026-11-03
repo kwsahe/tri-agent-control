@@ -1008,6 +1008,97 @@ input[type="checkbox"] {
   background: rgba(59, 130, 246, 0.02);
 }
 
+/* 모델 턴 한 줄 요약 — 원문·통계·diff는 펼쳐야 보인다. */
+.turn-fold:not([open]) {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.turn-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  cursor: pointer;
+  list-style: none;
+}
+
+.turn-line::-webkit-details-marker {
+  display: none;
+}
+
+.turn-line::before {
+  content: "▸";
+  color: var(--faint);
+  flex: none;
+  transition: transform 0.15s ease;
+}
+
+.turn-fold[open] > .turn-line {
+  margin-bottom: 10px;
+}
+
+.turn-fold[open] > .turn-line::before {
+  transform: rotate(90deg);
+}
+
+.turn-line .avatar {
+  width: 22px;
+  height: 22px;
+  flex: none;
+}
+
+.turn-line .name,
+.turn-line .turn-icon,
+.turn-line .time {
+  flex: none;
+}
+
+.turn-line .phase {
+  flex: none;   /* 단계 이름은 짧다 — 줄어드는 쪽은 답변 첫 줄이다 */
+}
+
+.turn-facts {
+  flex: none;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.turn-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.turn-line .time {
+  margin-left: auto;
+}
+
+/* 좁은 화면: 한 줄에 다 안 들어가므로 답변 첫 줄을 아랫줄로 내리고 시각은 숨긴다. */
+@media (max-width: 640px) {
+  .turn-line {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .turn-line .time {
+    display: none;
+  }
+
+  .turn-facts {
+    white-space: normal;
+  }
+
+  .turn-preview {
+    flex-basis: 100%;
+  }
+}
+
 .meta {
   display: grid;
   grid-template-columns: 28px auto auto 1fr;

@@ -175,7 +175,9 @@ class QuickModeTests(unittest.TestCase):
         discussion = roundtable.steps_for_mode("discussion", list(roundtable.AGENT_ORDER))
         coding = roundtable.steps_for_mode("coding", list(roundtable.AGENT_ORDER))
         self.assertGreater(len(discussion), 3)
-        self.assertGreater(len(coding), len(discussion))
+        # 코딩은 토론 없이 계획 1회 후 고정 사이클로 간다.
+        self.assertEqual(len(coding), 1)
+        self.assertEqual(len(roundtable.goal_coding_steps(list(roundtable.AGENT_ORDER))), 3)
 
     def test_execution_plan_shows_call_counts_per_mode(self):
         quick = roundtable.mode_execution_plan("quick", list(roundtable.AGENT_ORDER))
@@ -189,7 +191,9 @@ class QuickModeTests(unittest.TestCase):
         self.assertFalse(quick["role_negotiation"])
 
         self.assertGreater(discussion["min_calls"], quick["min_calls"])
-        self.assertGreater(coding["max_calls"], discussion["max_calls"])
+        # 토론이 없어져 코딩은 계획 1회 + 사이클당 3회다.
+        self.assertEqual(coding["max_calls"], 1 + 3 * roundtable.DEFAULT_CODING_LIMITS["max_cycles"])
+        self.assertFalse(coding["role_negotiation"])
         self.assertTrue(coding["auto_validation"])
         self.assertTrue(coding["long_running_warning"])
 

@@ -1,0 +1,812 @@
+"""고정 역할 코딩 파이프라인 회귀 테스트.
+
+모든 파일 조작은 TemporaryDirectory 안에서만 한다. 실제 모델 CLI는 부르지 않는다.
+"""
+
+import json
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import isolation  # noqa: F401  (실제 데이터 폴더 격리 — 반드시 roundtable보다 먼저)
+import roundtable
+from triagent.domain import gitops, validation
+
+SESSION_ID = "20260101_000000_000030"
+ALL = list(roundtable.AGENT_ORDER)
+
+
+class PipelineStepsTests(unittest.TestCase):
+    def test_planning_is_a_single_read_only_claude_turn_that_asks_for_approval(self):
+        steps = roundtable.steps_for_mode("coding", ALL)
+        self.assertEqual(len(steps), 1)
+        agent, phase, instruction, cli_mode = steps[0]
+        self.assertEqual((agent, phase, cli_mode), ("claude", roundtable.CONFIRM_PHASE, "discussion"))
+        self.assertIn(roundtable.APPROVAL_TOKEN, instruction)
+
+    def test_cycle_is_implement_test_review_in_fixed_order(self):
+        steps = roundtable.goal_coding_steps(ALL)
+        self.assertEqual(
+            [(s[0], s[1], s[3]) for s in steps],
+            [("claude", "구현", "coding"),
+             ("antigravity", "테스트", "coding"),
+             ("codex", roundtable.REVIEW_PHASE, "discussion")],
+        )
+        # 시작 모델 순서를 바꿔도 파이프라인 순서는 고정이다.
+        self.assertEqual(roundtable.goal_coding_steps(["codex", "antigravity", "claude"]), steps)
+
+    def test_disabled_agents_drop_their_steps(self):
+        steps = roundtable.goal_coding_steps(["claude", "codex"])
+        self.assertEqual([s[1] for s in steps], ["구현", roundtable.REVIEW_PHASE])
+
+    def test_fixed_roles_map_onto_the_role_catalog(self):
+        roles = roundtable.pipeline_agent_roles()
+        self.assertEqual(roles, {"codex": "reviewer", "antigravity": "qa", "claude": ""})
+        self.assertFalse(roundtable.ROLE_CATALOG["reviewer"]["can_write"])
+        self.assertIn("tests/**", roundtable.ROLE_CATALOG["qa"]["patterns"])
+        self.assertEqual(
+            roundtable.pipeline_roles_label(ALL),
+            "Claude Code=구현, Antigravity=테스트, Codex=검토",
+        )
+
+    def test_coding_mode_never_delegates_with_call_agent(self):
+        for phase in ("구현", "테스트", roundtable.REVIEW_PHASE, roundtable.CONFIRM_PHASE):
+            self.assertFalse(roundtable.allow_agent_calls("coding", phase))
+        self.assertTrue(roundtable.allow_agent_calls("discussion", "개입 답변"))
+
+
+class ReviewVerdictTests(unittest.TestCase):
+    def test_last_line_verdict_is_extracted_and_hidden(self):
+        self.assertEqual(roundtable.extract_review_verdict("문제 없음\nREVIEW: PASS"), ("문제 없음", "pass"))
+        self.assertEqual(roundtable.extract_review_verdict("고칠 것\n review: changes \n"), ("고칠 것", "changes"))
+
+    def test_missing_or_quoted_verdict_is_not_a_pass(self):
+        for text in ("검토했습니다.", "REVIEW: PASS 라고 쓰면 통과입니다.\n추가 의견", "REVIEW: MAYBE", ""):
+            with self.subTest(text=text):
+                self.assertEqual(roundtable.extract_review_verdict(text)[1], "")
+
+
+@patch.object(roundtable, "render_html_snapshot")
+@patch.object(roundtable, "add_runtime_event")
+@patch.object(roundtable, "build_memory_context", return_value="")
+@patch.object(roundtable, "load_team_prompt", return_value="공통 지침")
+@patch.object(roundtable, "save_state")
+class ReviewTurnTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        self.original_control = dict(roundtable.CONTROL)
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="검토 테스트", mode="coding", plan_approved=True,
+                                coding_stage="iteration", agent_roles=roundtable.pipeline_agent_roles())
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+        roundtable.CONTROL.clear()
+        roundtable.CONTROL.update(self.original_control)
+        self._tmp.cleanup()
+
+    def run_review(self, reply: str) -> dict:
+        with patch.dict(roundtable.ASK_FUNCS, {"codex": lambda _p, _m: reply}), \
+             patch.object(roundtable, "read_configured_project_path", return_value=self._tmp.name), \
+             patch.object(roundtable, "add_message", return_value=True) as add_message:
+            roundtable.run_step("codex", f"{roundtable.REVIEW_PHASE} · 목표 사이클 1", "검토해라",
+                                "discussion", expected_session_id=SESSION_ID)
+        _agent, _phase, text, meta = add_message.call_args.args[:4]
+        return {"text": text, "meta": meta}
+
+    def test_review_turn_records_the_verdict_and_hides_the_token(self, *_):
+        result = self.run_review("치명적 결함 없음\nREVIEW: PASS")
+        self.assertEqual(result["meta"]["review_verdict"], "pass")
+        self.assertNotIn("REVIEW:", result["text"])
+
+    def test_verdict_survives_a_clipped_long_review(self, *_):
+        result = self.run_review("가" * (roundtable.OUTPUT_MAX_CHARS * 2) + "\nREVIEW: CHANGES")
+        self.assertEqual(result["meta"]["review_verdict"], "changes")
+
+
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(root), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@unittest.skipUnless(shutil.which("git"), "git이 없으면 커밋을 검증할 수 없다")
+class GitOpsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name).resolve()
+        self.root = base / "repo"
+        self.root.mkdir()
+        self.wt = base / "worktrees" / "repo-s1"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def init_repo(self) -> None:
+        git(self.root, "init", "-q", "-b", "main")
+        git(self.root, "config", "user.email", "test@example.com")
+        git(self.root, "config", "user.name", "Test")
+        git(self.root, "config", "core.autocrlf", "false")
+        (self.root / "app.py").write_text("x = 1\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "init")
+
+    def test_not_a_repo_is_refused_without_side_effects(self):
+        self.assertIsNone(gitops.repo_root(self.root))
+        self.assertFalse(gitops.create_worktree(self.root, self.wt, "triagent/s1").ok)
+        self.assertFalse((self.root / ".git").exists())
+
+    def test_worktree_leaves_the_users_branch_and_uncommitted_work_alone(self):
+        self.init_repo()
+        (self.root / "app.py").write_text("x = 2  # 사용자 작업 중\n", encoding="utf-8")
+        result = gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        self.assertEqual(result, gitops.GitResult(True, "triagent/s1"))
+        self.assertEqual(gitops.current_branch(self.root), "main")
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "x = 2  # 사용자 작업 중\n")
+        self.assertEqual(gitops.current_branch(self.wt), "triagent/s1")
+        self.assertEqual((self.wt / "app.py").read_text(encoding="utf-8"), "x = 1\n")  # 마지막 커밋 기준
+        # 다시 불러도 그대로 성공한다 (재개 시).
+        self.assertTrue(gitops.create_worktree(self.root, self.wt, "triagent/s1").ok)
+
+    def test_existing_folder_that_is_not_the_session_worktree_is_refused(self):
+        self.init_repo()
+        self.wt.mkdir(parents=True)
+        result = gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        self.assertFalse(result.ok)
+        self.assertIn("이미 있지만", result.detail)
+
+    def test_removing_the_worktree_unlinks_shared_dirs_and_keeps_the_originals_and_branch(self):
+        self.init_repo()
+        (self.root / ".venv").mkdir()
+        (self.root / ".venv" / "marker.txt").write_text("원본\n", encoding="utf-8")
+        gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        self.assertEqual(gitops.link_shared_dirs(self.root, self.wt), [".venv"])
+        self.assertEqual((self.wt / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
+        self.assertEqual(gitops.remove_worktree(self.root, self.wt), gitops.GitResult(True, ""))
+        self.assertFalse(self.wt.exists())
+        self.assertEqual((self.root / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
+        self.assertEqual(git(self.root, "branch", "--list", "triagent/s1"), "triagent/s1")
+
+    def test_worktree_with_uncommitted_changes_is_not_removed(self):
+        self.init_repo()
+        gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        (self.wt / "unsaved.py").write_text("u = 1\n", encoding="utf-8")
+        self.assertFalse(gitops.remove_worktree(self.root, self.wt).ok)
+        self.assertTrue((self.wt / "unsaved.py").exists())
+
+    def test_commit_paths_returns_sha_and_skips_when_nothing_changed(self):
+        self.init_repo()
+        git(self.root, "checkout", "-q", "-b", "triagent/s1")
+        (self.root / "new.py").write_text("y = 1\n", encoding="utf-8")
+        result = gitops.commit_paths(self.root, "TriAgent cycle 1: test", ["new.py"])
+        self.assertTrue(result.ok)
+        self.assertEqual(result.detail, git(self.root, "rev-parse", "--short", "HEAD"))
+        self.assertEqual(git(self.root, "log", "-1", "--format=%s"), "TriAgent cycle 1: test")
+        self.assertEqual(git(self.root, "rev-parse", "--short", "main"),
+                         git(self.root, "rev-parse", "--short", "HEAD~1"))  # main은 그대로
+        self.assertEqual(gitops.commit_paths(self.root, "again", ["new.py"]), gitops.GitResult(True, ""))
+
+    def test_commit_paths_leaves_the_users_other_work_alone(self):
+        """에이전트가 바꾼 파일만 커밋한다 — 사용자가 고친 파일, 미리 스테이지한 것, 사라진 경로는 제외."""
+        self.init_repo()
+        (self.root / "notes.py").write_text("n = 0\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "notes")
+        git(self.root, "checkout", "-q", "-b", "triagent/s1")
+        (self.root / "agent.py").write_text("a = 1\n", encoding="utf-8")       # 에이전트 변경
+        (self.root / "app.py").write_text("x = 99  # 사용자 작업\n", encoding="utf-8")  # 사용자 변경
+        (self.root / "notes.py").write_text("n = 1\n", encoding="utf-8")
+        git(self.root, "add", "notes.py")                                     # 사용자가 스테이지
+        result = gitops.commit_paths(self.root, "cycle", ["agent.py", "made_then_deleted.py"])
+        self.assertTrue(result.ok, result)
+        self.assertEqual(git(self.root, "show", "--name-only", "--format=", "HEAD"), "agent.py")
+        # git() 헬퍼는 앞 공백을 지우므로 porcelain 출력은 원문 그대로 본다.
+        status = subprocess.run(["git", "-C", str(self.root), "status", "--porcelain"],
+                                capture_output=True, text=True, check=True).stdout.splitlines()
+        self.assertIn(" M app.py", status)      # 사용자 변경은 커밋되지 않고 남음
+        self.assertIn("M  notes.py", status)    # 사용자가 스테이지한 것도 그대로
+
+    def test_commit_paths_in_a_subfolder_never_touches_the_parent_repo(self):
+        self.init_repo()
+        workspace = self.root / "app"
+        workspace.mkdir()
+        (workspace / "keep.py").write_text("k = 1\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "sub")
+        (self.root / "outside.txt").write_text("사용자 파일\n", encoding="utf-8")
+        (workspace / "keep.py").write_text("k = 2\n", encoding="utf-8")
+        result = gitops.commit_paths(workspace, "cycle", ["keep.py"])
+        self.assertTrue(result.ok, result)
+        self.assertEqual(git(self.root, "show", "--name-only", "--format=", "HEAD"), "app/keep.py")
+        self.assertIn("?? outside.txt", git(self.root, "status", "--porcelain"))
+
+    def test_git_errors_while_preparing_are_reported_not_raised(self):
+        with patch.object(gitops, "_git", side_effect=subprocess.TimeoutExpired("git", 60)):
+            result = gitops.create_worktree(self.root, self.wt, "triagent/s1")
+            self.assertIsNone(gitops.repo_root(self.root))
+        self.assertFalse(result.ok)
+        self.assertIn("git 실행 실패", result.detail)
+
+
+class CycleFinishTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, mode="coding", coding_stage="iteration",
+                                plan_approved=True, enabled_agents=ALL, messages=[])
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+
+    def review(self, cycle: int, verdict: str) -> None:
+        roundtable.STATE["messages"].append({
+            "agent": "codex", "phase": f"{roundtable.REVIEW_PHASE} · 목표 사이클 {cycle}",
+            "text": "검토", "meta": {"review_verdict": verdict},
+        })
+
+    def finish(self, validation_ok: bool = True) -> bool:
+        roundtable.STATE["validation_results"] = [{"label": "unittest", "ok": validation_ok, "elapsed": 1}]
+        roundtable.STATE["validation_cycle"] = 1
+        with patch.object(roundtable, "save_state"), patch.object(roundtable, "add_runtime_event"), \
+             patch.object(roundtable, "commit_cycle") as commit:
+            done = roundtable.finish_pipeline_cycle(SESSION_ID, 1)
+        commit.assert_called_once()
+        return done
+
+    def test_stale_or_missing_validation_is_rerun_before_deciding(self):
+        """실패 턴을 건너뛰어 이번 사이클 검증이 빠졌으면 이전 결과로 완료하지 않는다."""
+        self.review(1, "pass")
+        roundtable.STATE.update(validation_results=[{"label": "old", "ok": True, "elapsed": 1}], validation_cycle=0)
+        failing = [{"label": "unittest", "ok": False, "elapsed": 1}]
+        with patch.object(roundtable, "save_state"), patch.object(roundtable, "add_runtime_event"), \
+             patch.object(roundtable, "commit_cycle"), \
+             patch.object(roundtable, "run_validation_for_current_workspace", return_value=failing) as validate:
+            done = roundtable.finish_pipeline_cycle(SESSION_ID, 1)
+        validate.assert_called_once()
+        self.assertFalse(done)
+        self.assertEqual(roundtable.STATE["validation_cycle"], 1)
+
+    def test_pass_and_green_validation_finishes_the_session(self):
+        self.review(1, "pass")
+        self.assertTrue(self.finish())
+        self.assertTrue(roundtable.STATE["finished"])
+        self.assertEqual(roundtable.STATE["coding_stop_reason"], "검토·검증 통과")
+
+    def test_changes_or_missing_verdict_or_red_validation_continues(self):
+        for verdict, validation_ok in (("changes", True), ("", True), ("pass", False)):
+            with self.subTest(verdict=verdict, validation_ok=validation_ok):
+                roundtable.STATE.update(messages=[], finished=False)
+                if verdict:
+                    self.review(1, verdict)
+                self.assertFalse(self.finish(validation_ok))
+                self.assertFalse(roundtable.STATE["finished"])
+
+    def test_an_older_cycles_pass_does_not_count(self):
+        self.review(0, "pass")
+        self.assertFalse(self.finish())
+
+    def test_without_a_reviewer_green_validation_is_enough(self):
+        roundtable.STATE["enabled_agents"] = ["claude", "antigravity"]
+        self.assertTrue(self.finish())
+        self.assertEqual(roundtable.STATE["coding_stop_reason"], "자동 검증 통과 · 검토 담당 없음")
+
+    def finish_without_validation_commands(self) -> tuple[bool, list]:
+        roundtable.STATE.update(validation_results=[], validation_cycle=1)
+        with patch.object(roundtable, "save_state"), \
+             patch.object(roundtable, "add_runtime_event") as event, \
+             patch.object(roundtable, "commit_cycle") as commit:
+            done = roundtable.finish_pipeline_cycle(SESSION_ID, 1)
+        self.assertEqual(commit.call_args.args[3], "none")
+        return done, [call.args[0] for call in event.call_args_list]
+
+    def test_no_validation_commands_is_labelled_as_no_validation_not_a_pass(self):
+        """실사용 검증: 검증 명령이 없었는데 '검토·검증 통과'와 'Validation: pass'로 기록됐다."""
+        self.review(1, "pass")
+        done, events = self.finish_without_validation_commands()
+        self.assertTrue(done)
+        self.assertEqual(roundtable.STATE["coding_stop_reason"], "검토 통과 · 자동 검증 없음")
+        self.assertTrue(any("검증 없이 완료" in text for text in events))
+
+    def test_no_reviewer_and_no_validation_says_nothing_was_checked(self):
+        roundtable.STATE["enabled_agents"] = ["claude", "antigravity"]
+        done, _events = self.finish_without_validation_commands()
+        self.assertTrue(done)
+        self.assertEqual(roundtable.STATE["coding_stop_reason"], "검토·자동 검증 없이 완료")
+
+
+class CycleCommitTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="장바구니  기능\n추가", mode="coding")
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+        self._tmp.cleanup()
+
+    def git_state(self, **overrides) -> dict:
+        state = {"enabled": True, "branch": "triagent/x", "workspace": str(Path(self._tmp.name).resolve()),
+                 "note": "", "commits": [], "committed_upto": 0}
+        state.update(overrides)
+        return state
+
+    def call(self, git_state: dict, commit_result=None, on_branch: str = "triagent/x", validation: str = "pass"):
+        roundtable.STATE["pipeline_git"] = git_state
+        with patch.object(roundtable, "save_state"), \
+             patch.object(roundtable, "add_runtime_event") as event, \
+             patch.object(roundtable, "read_configured_project_path", return_value=self._tmp.name), \
+             patch.object(roundtable.gitops, "current_branch", return_value=on_branch), \
+             patch.object(roundtable.gitops, "commit_paths",
+                          return_value=commit_result or roundtable.gitops.GitResult(True, "abc1234")) as commit:
+            roundtable.commit_cycle(SESSION_ID, 2, "changes", validation)
+        return commit, event
+
+    def test_commit_message_and_recorded_sha(self):
+        commit, _event = self.call(self.git_state())
+        self.assertEqual(commit.call_args.args[0], Path(self._tmp.name).resolve())  # 세션 worktree에서 커밋
+        message = commit.call_args.args[1]
+        self.assertTrue(message.startswith("TriAgent cycle 2: 장바구니 기능 추가"))
+        self.assertIn("Review: changes · Validation: pass", message)
+        self.assertEqual(roundtable.STATE["pipeline_git"]["commits"], [{"cycle": 2, "sha": "abc1234"}])
+
+    def test_missing_validation_is_recorded_as_none_not_pass(self):
+        commit, _event = self.call(self.git_state(), validation="none")
+        self.assertIn("Validation: none", commit.call_args.args[1])
+
+    def test_only_files_changed_by_agent_turns_since_the_last_commit_are_committed(self):
+        def turn(*paths):
+            return {"agent": "claude", "meta": {"changed_paths": [{"path": p, "change": "수정"} for p in paths]}}
+
+        roundtable.STATE["messages"] = [turn("old.py"), turn("src/a.py", "src/new_dir/"), turn("tests/test_a.py")]
+        commit, _event = self.call(self.git_state(committed_upto=1))
+        self.assertEqual(commit.call_args.args[2], ["src/a.py", "tests/test_a.py"])
+        self.assertEqual(roundtable.STATE["pipeline_git"]["committed_upto"], 3)
+
+    def test_wrong_branch_or_folder_never_commits(self):
+        """worktree가 다른 브랜치로 바뀌었거나 사라졌으면 커밋하지 않는다."""
+        for git_state, on_branch in (
+            (self.git_state(), "main"),
+            (self.git_state(workspace="C:\\other\\project"), "triagent/x"),
+        ):
+            with self.subTest(on_branch=on_branch, workspace=git_state["workspace"]):
+                commit, event = self.call(git_state, on_branch=on_branch)
+                commit.assert_not_called()
+                self.assertIn("커밋 안 함", event.call_args.args[0])
+
+    def test_disabled_git_never_commits(self):
+        commit, _event = self.call(self.git_state(enabled=False, branch="", note="Git 저장소가 아니라"))
+        commit.assert_not_called()
+
+    def test_commit_failure_is_reported_not_raised(self):
+        _commit, event = self.call(
+            self.git_state(), roundtable.gitops.GitResult(False, "Please tell me who you are"),
+        )
+        self.assertIn("Please tell me who you are", event.call_args.args[0])
+        self.assertEqual(roundtable.STATE["pipeline_git"]["commits"], [])
+
+
+@unittest.skipUnless(shutil.which("git"), "git이 없으면 worktree를 검증할 수 없다")
+class PipelineWorktreeTests(unittest.TestCase):
+    """실제 git으로: 파이프라인은 세션 worktree에서만 일하고 사용자 폴더는 그대로 둔다."""
+
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        self.original_control = dict(roundtable.CONTROL)
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name).resolve()
+        self.repo = base / "proj"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.email", "test@example.com")
+        git(self.repo, "config", "user.name", "Test")
+        git(self.repo, "config", "core.autocrlf", "false")
+        (self.repo / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+        (self.repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "init")
+        self.main_sha = git(self.repo, "rev-parse", "main")
+        (self.repo / ".venv").mkdir()
+        (self.repo / ".venv" / "marker.txt").write_text("원본\n", encoding="utf-8")
+        (self.repo / "app.py").write_text("x = 2  # 사용자 작업 중\n", encoding="utf-8")
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="기능 추가", mode="coding", messages=[])
+        self.patches = [
+            # 일부러 정규화 안 된 경로 — 앱이 실제 경로로 바꿔 저장하는지 본다.
+            patch.object(roundtable, "WORKTREE_ROOT", base / "x" / ".." / "worktrees"),
+            patch.object(roundtable, "read_configured_project_path", return_value=str(self.repo)),
+            patch.object(roundtable, "save_state"),
+        ]
+        for item in self.patches:
+            item.start()
+        self.events = patch.object(roundtable, "add_runtime_event").start()
+
+    def tearDown(self):
+        patch.stopall()
+        roundtable.STATE = self.original_state
+        roundtable.CONTROL.clear()
+        roundtable.CONTROL.update(self.original_control)
+        for worktree in (Path(self._tmp.name) / "worktrees").glob("*"):
+            gitops.remove_worktree(self.repo, worktree)   # 연결부터 끊어야 원본을 지우지 않는다
+        self._tmp.cleanup()
+
+    def prepare(self) -> Path:
+        roundtable.prepare_pipeline_git(SESSION_ID)
+        return Path(roundtable.STATE["pipeline_git"]["workspace"])
+
+    def test_cycle_runs_and_commits_in_the_worktree_without_touching_the_user_folder(self):
+        workspace = self.prepare()
+        self.assertEqual(workspace, Path(self._tmp.name).resolve() / "worktrees" / f"proj-{SESSION_ID}")
+        # 패키지 앱이 바꿔 준 가상 경로가 아니라 실제 경로를 저장해야 앱 밖에서 띄운 서버도 지울 수 있다.
+        self.assertEqual(roundtable.STATE["pipeline_git"]["worktree"], str(workspace))
+        self.assertEqual(roundtable.cli_working_directory("coding"), workspace)
+        self.assertEqual(roundtable.cli_working_directory("discussion"), workspace)  # 검토도 worktree를 읽는다
+        self.assertTrue(any("커밋되지 않은 변경" in call.args[0] for call in self.events.call_args_list))
+        self.assertEqual((workspace / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
+
+        (workspace / "feature.py").write_text("f = 1\n", encoding="utf-8")
+        roundtable.STATE["messages"] = [{"agent": "claude", "meta": {"changed_paths": [{"path": "feature.py"}]}}]
+        roundtable.commit_cycle(SESSION_ID, 1, "pass", "pass")
+
+        self.assertEqual(len(roundtable.STATE["pipeline_git"]["commits"]), 1)
+        branch = f"triagent/{SESSION_ID}"
+        self.assertEqual(git(self.repo, "show", "--name-only", "--format=", branch), "feature.py")
+        self.assertEqual(git(self.repo, "rev-parse", "main"), self.main_sha)
+        self.assertEqual(gitops.current_branch(self.repo), "main")
+        self.assertEqual((self.repo / "app.py").read_text(encoding="utf-8"), "x = 2  # 사용자 작업 중\n")
+        self.assertFalse((self.repo / "feature.py").exists())
+
+    def test_planning_reads_the_user_folder_before_the_worktree_exists(self):
+        self.assertEqual(roundtable.cli_working_directory("discussion"), self.repo)
+
+    def test_a_missing_worktree_blocks_instead_of_writing_to_the_user_folder(self):
+        workspace = self.prepare()
+        roundtable.STATE["pipeline_git"]["workspace"] = str(workspace.parent / "gone")
+        with self.assertRaises(roundtable.WorkspaceUnavailable):
+            roundtable.cli_working_directory("coding")
+
+    def test_not_a_repo_works_in_the_user_folder_without_commits(self):
+        shutil.rmtree(self.repo / ".git", onerror=lambda func, path, _exc: (Path(path).chmod(0o700), func(path)))
+        roundtable.prepare_pipeline_git(SESSION_ID)
+        self.assertFalse(roundtable.STATE["pipeline_git"]["enabled"])
+        self.assertEqual(roundtable.cli_working_directory("coding"), self.repo)
+
+    def test_deleting_the_session_removes_its_worktree_but_keeps_the_branch_and_venv(self):
+        workspace = self.prepare()
+        roundtable.atomic_write_json(roundtable.session_json_path(SESSION_ID), roundtable.STATE)
+        roundtable.STATE = roundtable.new_state()   # 현재 세션은 지울 수 없다
+        result = roundtable.delete_session(SESSION_ID)
+        self.assertEqual(result, {"success": True, "id": SESSION_ID})
+        self.assertFalse(workspace.exists())
+        self.assertEqual((self.repo / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
+        self.assertEqual(git(self.repo, "branch", "--list", f"triagent/{SESSION_ID}"), f"triagent/{SESSION_ID}")
+
+    def test_a_cloned_session_gets_its_own_worktree_from_the_source_branch(self):
+        source_workspace = self.prepare()
+        (source_workspace / "feature.py").write_text("f = 1\n", encoding="utf-8")
+        git(source_workspace, "add", "feature.py")
+        git(source_workspace, "commit", "-q", "-m", "cycle 1")
+        source = json.loads(json.dumps(roundtable.STATE))
+        with patch.object(roundtable, "load_session", return_value=source), \
+             patch.object(roundtable, "cancel_active_cli_processes"), \
+             patch.object(roundtable, "session_memory_dir", side_effect=lambda sid: Path(self._tmp.name) / "mem" / sid):
+            result = roundtable.clone_session(SESSION_ID)
+        clone_git = roundtable.STATE["pipeline_git"]
+        self.assertEqual(clone_git["branch"], f"triagent/{result['id']}")
+        self.assertNotEqual(clone_git["workspace"], str(source_workspace))
+        self.assertTrue((Path(clone_git["workspace"]) / "feature.py").exists())
+
+
+class StartGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        self.original_control = dict(roundtable.CONTROL)
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="가드 테스트", mode="discussion")
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+        roundtable.CONTROL.clear()
+        roundtable.CONTROL.update(self.original_control)
+        self._tmp.cleanup()
+
+    def switch(self):
+        with patch.object(roundtable, "read_configured_project_path", return_value=self._tmp.name), \
+             patch.object(roundtable, "save_state"), patch.object(roundtable, "add_runtime_event"), \
+             patch.object(roundtable, "start_worker_if_needed"):
+            return roundtable.switch_mode("coding")
+
+    def test_switching_to_coding_without_claude_is_refused(self):
+        roundtable.STATE["enabled_agents"] = ["codex", "antigravity"]
+        result = self.switch()
+        self.assertIn("Claude Code", result.get("error", ""))
+        self.assertEqual(roundtable.STATE["mode"], "discussion")
+
+    def test_switching_to_coding_fixes_the_roles(self):
+        roundtable.STATE.update(enabled_agents=ALL, agent_roles={"codex": "backend", "antigravity": "", "claude": "qa"})
+        self.assertTrue(self.switch().get("success"))
+        self.assertEqual(roundtable.STATE["agent_roles"], roundtable.pipeline_agent_roles())
+
+    def test_roles_cannot_be_changed_in_coding_mode(self):
+        roundtable.STATE.update(mode="coding", agent_roles=roundtable.pipeline_agent_roles())
+        result = roundtable.update_agent_roles({"codex": "backend", "antigravity": "qa", "claude": ""})
+        self.assertIn("역할이 고정", result.get("error", ""))
+        self.assertEqual(roundtable.STATE["agent_roles"], roundtable.pipeline_agent_roles())
+
+
+class MigrationTests(unittest.TestCase):
+    def test_old_planning_session_restarts_at_the_plan_step(self):
+        state = roundtable.normalize_state({"mode": "coding", "coding_stage": "planning", "step_index": 11,
+                                            "enabled_agents": ALL})
+        self.assertEqual(state["step_index"], 0)
+        self.assertEqual(state["pipeline_version"], roundtable.PIPELINE_VERSION)
+        self.assertEqual(state["agent_roles"], roundtable.pipeline_agent_roles())
+        roundtable.steps_for_mode("coding", ALL)[state["step_index"]]   # IndexError 없어야 함
+
+    def test_old_approved_planning_session_goes_straight_to_cycles(self):
+        state = roundtable.normalize_state({"mode": "coding", "coding_stage": "planning", "step_index": 11,
+                                            "plan_approved": True, "enabled_agents": ALL})
+        self.assertEqual(state["step_index"], len(roundtable.steps_for_mode("coding", ALL)))
+
+    def test_old_iteration_session_restarts_its_current_cycle(self):
+        state = roundtable.normalize_state({"mode": "coding", "coding_stage": "iteration", "coding_cycle": 2,
+                                            "coding_cycle_step": 5, "enabled_agents": ALL})
+        self.assertEqual((state["coding_cycle"], state["coding_cycle_step"]), (2, 0))
+
+    def test_new_and_migrated_sessions_are_left_alone(self):
+        fresh = roundtable.new_state()
+        fresh.update(mode="coding", coding_stage="iteration", coding_cycle_step=2)
+        self.assertEqual(roundtable.normalize_state(fresh)["coding_cycle_step"], 2)
+
+    def test_finished_and_discussion_sessions_are_not_touched(self):
+        done = roundtable.normalize_state({"mode": "coding", "coding_stage": "planning", "step_index": 11,
+                                           "finished": True, "enabled_agents": ALL})
+        self.assertEqual(done["step_index"], 11)
+        talk = roundtable.normalize_state({"mode": "discussion", "step_index": 4, "enabled_agents": ALL})
+        self.assertEqual(talk["step_index"], 4)
+
+
+@patch.object(roundtable, "update_profile")
+@patch.object(roundtable, "render_html_snapshot")
+@patch.object(roundtable, "add_runtime_event")
+@patch.object(roundtable, "save_state")
+class WorkerFlowTests(unittest.TestCase):
+    """리뷰에서 나온 worker_loop 흐름 결함의 회귀 테스트 (모델은 부르지 않는다)."""
+
+    def setUp(self):
+        self.original_state = roundtable.STATE
+        self.original_control = dict(roundtable.CONTROL)
+        roundtable.STATE = roundtable.new_state()
+        roundtable.STATE.update(id=SESSION_ID, topic="흐름", mode="coding", enabled_agents=ALL,
+                                coding_stage="iteration", coding_cycle=1, coding_cycle_step=0,
+                                plan_approved=True, finished=False)
+        roundtable.CONTROL.update(stopped=False, paused=False, approval_requested=False,
+                                  awaiting_approval=False, intervention_pending=False, intervention_queue=[],
+                                  worker_session_id=SESSION_ID)
+
+    def tearDown(self):
+        roundtable.STATE = self.original_state
+        roundtable.CONTROL.clear()
+        roundtable.CONTROL.update(self.original_control)
+
+    def test_a_finished_session_does_not_start_new_cycles(self, *_):
+        roundtable.STATE.update(finished=True, coding_stop_reason="검토·검증 통과")
+        with patch.object(roundtable, "run_step") as run_step:
+            roundtable.worker_loop(SESSION_ID)
+        run_step.assert_not_called()
+
+    def test_entering_cycles_without_approval_asks_again_before_touching_git(self, *_):
+        roundtable.STATE.update(coding_stage="planning", step_index=1, plan_approved=False)
+        with patch.object(roundtable, "prepare_pipeline_git") as prepare, \
+             patch.object(roundtable, "wait_for_user_approval", return_value=False) as wait:
+            roundtable.worker_loop(SESSION_ID)
+        prepare.assert_not_called()
+        wait.assert_called_once()
+        self.assertEqual(roundtable.STATE["coding_stage"], "planning")
+        self.assertIsNone(roundtable.STATE["coding_started_at"])   # 승인 전에는 시간 측정도 시작하지 않음
+
+    def test_skipping_past_the_cycle_end_still_commits_and_judges(self, *_):
+        roundtable.STATE["coding_cycle_step"] = len(roundtable.goal_coding_steps(ALL))
+        with patch.object(roundtable, "finish_pipeline_cycle", return_value=True) as finish, \
+             patch.object(roundtable, "run_step") as run_step:
+            roundtable.worker_loop(SESSION_ID)
+        finish.assert_called_once_with(SESSION_ID, 1)
+        run_step.assert_not_called()
+
+    def test_coding_session_without_claude_never_runs(self, *_):
+        roundtable.STATE["enabled_agents"] = ["codex", "antigravity"]
+        with patch.object(roundtable, "run_step") as run_step:
+            roundtable.worker_loop(SESSION_ID)
+        run_step.assert_not_called()
+        self.assertTrue(roundtable.CONTROL["paused"])
+
+
+class ReviewFollowUpTests(unittest.TestCase):
+    def test_tester_scope_accepts_common_test_layouts_but_not_product_code(self):
+        state = {"agent_roles": roundtable.pipeline_agent_roles()}
+        allowed = ["src/__tests__/cart.js", "shop/tests.py", "pkg/tests/test_x.py", "src/pkg/test_x.py",
+                   "conftest.py", "pkg/conftest.py", ".coverage", "test-results/report.xml",
+                   "htmlcov/index.html", "web/cart.test.ts"]
+        changed = [{"path": p, "change": "수정"} for p in allowed + ["src/app.py", "templates/cart.html"]]
+        self.assertEqual(
+            roundtable.role_scope_violations("antigravity", changed, state),
+            ["src/app.py", "templates/cart.html"],
+        )
+
+    def test_a_failed_planning_turn_cannot_be_skipped(self):
+        state = roundtable.new_state()
+        state.update(mode="coding", coding_stage="planning", step_index=0, enabled_agents=ALL)
+        failed_plan = [{"agent": "claude", "phase": roundtable.CONFIRM_PHASE,
+                        "meta": {"ok": False, "failure_kind": "cli"}}]
+        self.assertFalse(roundtable.can_continue_after_failed_step(state, failed_plan))
+
+    def test_finished_old_sessions_still_get_the_fixed_roles(self):
+        state = roundtable.normalize_state({"mode": "coding", "coding_stage": "iteration", "finished": True,
+                                            "agent_roles": {"claude": "frontend"}, "enabled_agents": ALL})
+        self.assertEqual(state["agent_roles"], roundtable.pipeline_agent_roles())
+
+    def test_tests_never_point_at_or_run_git_in_the_real_repository(self):
+        """작업 폴더를 정하지 않은 테스트가 실제 저장소에서 파이프라인 브랜치를 만든 적이 있다."""
+        real_repo = roundtable.ROOT.resolve()
+        configured = Path(roundtable.read_configured_project_path()).resolve()
+        self.assertNotEqual(configured, real_repo)
+        self.assertNotIn(real_repo, configured.parents)
+        self.assertFalse(gitops.is_repo(roundtable.ROOT))          # 안전망이 막는다
+        self.assertEqual(gitops.current_branch(roundtable.ROOT), "")
+        self.assertIsNone(gitops.repo_root(roundtable.ROOT))
+        self.assertIn(isolation._ROOT, roundtable.WORKTREE_ROOT.parents)   # 실제 %LOCALAPPDATA%가 아니다
+        self.assertFalse(gitops.create_worktree(roundtable.ROOT, roundtable.WORKTREE_ROOT / "x", "triagent/x").ok)
+
+    def test_markdown_wrapped_verdicts_are_read(self):
+        self.assertEqual(roundtable.extract_review_verdict("좋음\n**REVIEW: PASS**")[1], "pass")
+        self.assertEqual(roundtable.extract_review_verdict("고칠 것\n`REVIEW: CHANGES`")[1], "changes")
+
+
+class ValidationDetectionTests(unittest.TestCase):
+    """실사용 검증에서 테스트 담당이 루트에 test_calc.py를 만들었는데 자동 검증이 못 찾았다."""
+
+    ENV = validation.ToolEnvironment(python_executable="python", has_pytest=False, has_npm=False)
+
+    def detect(self, files: dict[str, str], **env) -> list:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text, encoding="utf-8")
+            environment = validation.ToolEnvironment(**{**self.ENV.__dict__, **env})
+            return validation.detect_validation_commands(root, environment)
+
+    def test_root_level_test_files_are_run_with_unittest_from_the_root(self):
+        self.assertEqual(
+            self.detect({"calc.py": "", "test_calc.py": "import unittest\n"}),
+            [("Python unittest", ["python", "-m", "unittest", "discover", "-s", "."])],
+        )
+
+    def test_tests_folder_keeps_its_existing_command(self):
+        self.assertEqual(
+            self.detect({"tests/test_calc.py": "", "test_root.py": ""}),
+            [("Python unittest", ["python", "-m", "unittest", "discover", "-s", "tests"])],
+        )
+
+    def test_pytest_runs_for_either_layout_and_nothing_runs_without_tests(self):
+        self.assertEqual(self.detect({"test_calc.py": ""}, has_pytest=True),
+                         [("Python pytest", ["python", "-m", "pytest", "-q"])])
+        self.assertEqual(self.detect({"calc.py": "", "tests/helpers.py": ""}), [])
+
+    def test_run_in_band_is_only_passed_to_jest(self):
+        """vitest는 --runInBand를 모르는 옵션으로 거부한다 (link21-ai-agent-hub에서 확인)."""
+        def npm_test(script):
+            commands = self.detect({"package.json": json.dumps({"scripts": {"test": script}})}, has_npm=True)
+            return commands[0][1]
+
+        self.assertEqual(npm_test("vitest run"), ["npm", "test"])
+        self.assertEqual(npm_test("jest"), ["npm", "test", "--", "--runInBand"])
+        self.assertEqual(npm_test("react-scripts test"), ["npm", "test"])
+
+    def test_project_venv_python_and_its_pytest_are_used(self):
+        """프로젝트 의존성과 pytest는 프로젝트 .venv에 있다 — TriAgent 자신의 Python으로는 못 돌린다."""
+        for venv_name in (".venv", "venv"):
+            with self.subTest(venv=venv_name):
+                [(label, command)] = self.detect({
+                    f"{venv_name}/Scripts/python.exe": "",
+                    f"{venv_name}/Lib/site-packages/pytest/__init__.py": "",
+                    "tests/test_app.py": "",
+                })
+                self.assertEqual(label, f"Python pytest · {venv_name}")
+                self.assertTrue(command[0].endswith(f"{venv_name}\\Scripts\\python.exe")
+                                or command[0].endswith(f"{venv_name}/Scripts/python.exe"), command)
+                self.assertEqual(command[1:], ["-m", "pytest", "-q"])
+
+    def test_project_venv_without_pytest_falls_back_to_unittest_in_that_venv(self):
+        [(label, command)] = self.detect({
+            ".venv/bin/python": "",                       # macOS/Linux 배치
+            "tests/test_app.py": "",
+        })
+        self.assertEqual(label, "Python unittest · .venv")
+        self.assertTrue(command[0].replace("\\", "/").endswith(".venv/bin/python"), command)
+        self.assertEqual(command[1:], ["-m", "unittest", "discover", "-s", "tests"])
+
+    def test_posix_venv_pytest_is_detected(self):
+        [(label, _command)] = self.detect({
+            ".venv/bin/python": "",
+            ".venv/lib/python3.12/site-packages/pytest/__init__.py": "",
+            "test_app.py": "",
+        })
+        self.assertEqual(label, "Python pytest · .venv")
+
+
+class CompactOutputTests(unittest.TestCase):
+    """함수 하나 추가에 계획 1,400자·보고 수백 자가 나왔다 — 단계별 답변 형식을 짧게 고정한다."""
+
+    def test_step_instructions_fix_a_short_answer_format(self):
+        plan = roundtable.pipeline_planning_steps()[0][2]
+        implement, test, review = (step[2] for step in roundtable.PIPELINE_CYCLE_STEPS)
+        self.assertIn("5줄 이내", plan)
+        self.assertIn(roundtable.APPROVAL_TOKEN, plan)
+        self.assertIn("2줄 이내", implement)
+        self.assertIn("테스트 파일은 Antigravity 담당", implement)
+        self.assertIn("2줄 이내", test)
+        self.assertIn("최대 3줄", review)
+        self.assertIn("REVIEW: PASS", review)
+
+
+class TurnSummaryTests(unittest.TestCase):
+    """대화창은 모델 턴마다 한 줄 요약을 보여주고, 원문·통계·diff는 펼쳐야 보인다."""
+
+    def message(self, agent="claude", phase="구현 · 목표 사이클 1", text="변경: text_tools.py\n결과: slugify 추가", **meta):
+        base = {"elapsed": 64.3, "ok": True, "cli_mode": "coding",
+                "changed_paths": [{"path": "playground/text_tools.py", "change": "수정"},
+                                  {"path": "tests/", "change": "생성"}]}
+        base.update(meta)
+        return {"agent": agent, "phase": phase, "time": "18:12:01", "text": text, "meta": base}
+
+    def test_model_turn_is_one_folded_line_with_the_key_facts(self):
+        html_text = roundtable.bubble_html(self.message())
+        self.assertIn('<details class="bubble turn-fold"', html_text)
+        self.assertNotIn(" open>", html_text.split("<summary")[0])
+        summary = html_text.split("<summary", 1)[1].split("</summary>", 1)[0]
+        for fact in ("✅", "Claude Code", "구현 · 목표 사이클 1", "64초", "text_tools.py", "변경: text_tools.py"):
+            self.assertIn(fact, summary)
+        self.assertNotIn("tests/", summary)   # 폴더 항목은 파일 목록에서 뺀다
+        self.assertIn("slugify 추가", html_text.split("</summary>", 1)[1])   # 원문은 펼친 안쪽
+
+    def test_review_verdict_shows_in_the_line(self):
+        html_text = roundtable.bubble_html(self.message(
+            agent="codex", phase=f"{roundtable.REVIEW_PHASE} · 목표 사이클 1", text="지적 없음",
+            cli_mode="discussion", changed_paths=[], review_verdict="pass"))
+        self.assertIn("PASS", html_text.split("</summary>", 1)[0])
+
+    def test_plans_waiting_for_approval_and_failures_start_open(self):
+        plan = roundtable.bubble_html(self.message(phase=roundtable.CONFIRM_PHASE, approval_requested=True))
+        failed = roundtable.bubble_html(self.message(ok=False))
+        for html_text in (plan, failed):
+            self.assertIn('<details class="bubble turn-fold" open', html_text)
+        self.assertIn("❌", failed.split("</summary>", 1)[0])
+
+    def test_user_messages_are_not_folded(self):
+        html_text = roundtable.bubble_html({"agent": "user", "phase": "승인", "time": "18:11", "text": "승인"})
+        self.assertNotIn("turn-fold", html_text)
+
+    def test_summary_escapes_model_text(self):
+        html_text = roundtable.bubble_html(self.message(text="<img src=x onerror=alert(1)> 결과"))
+        self.assertNotIn("<img src=x", html_text.split("</summary>", 1)[0])
+
+
+class ExecutionPlanTests(unittest.TestCase):
+    def test_coding_plan_counts_one_plan_call_plus_three_per_cycle(self):
+        plan = roundtable.mode_execution_plan("coding", ALL)
+        cycles = roundtable.DEFAULT_CODING_LIMITS["max_cycles"]
+        self.assertEqual((plan["min_calls"], plan["max_calls"]), (1 + 3, 1 + 3 * cycles))
+        self.assertFalse(plan["role_negotiation"])
+        self.assertEqual(plan["pipeline_roles"], "Claude Code=구현, Antigravity=테스트, Codex=검토")
+
+    def test_other_modes_have_no_pipeline_roles(self):
+        self.assertEqual(roundtable.mode_execution_plan("quick", ALL)["pipeline_roles"], "")
+
+
+if __name__ == "__main__":
+    unittest.main()

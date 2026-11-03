@@ -189,9 +189,9 @@ class PlanApprovalGateTests(SafetyTestBase):
         self.assertEqual(cli_mode, "coding")
 
     def test_worker_asks_again_instead_of_running_an_unapproved_write_step(self, *_):
-        steps = roundtable.steps_for_mode("coding", ["codex"])
-        write_index = next(i for i, step in enumerate(steps) if step[3] == "coding")
-        roundtable.STATE.update(step_index=write_index, plan_approved=False)
+        # 계획 단계에는 쓰기 단계가 없다 — 승인 없이 사이클의 구현 단계에 도달한 상황.
+        roundtable.STATE.update(enabled_agents=["claude", "codex"], coding_stage="iteration",
+                                coding_cycle=1, coding_cycle_step=0, plan_approved=False)
         with patch.object(roundtable, "run_step") as run_step, \
              patch.object(roundtable, "wait_for_user_approval", return_value=False) as wait, \
              patch.object(roundtable, "update_profile"):
@@ -226,7 +226,7 @@ class PlanApprovalGateTests(SafetyTestBase):
         self.assertFalse(rejected["plan_approved"])
 
     def test_switching_into_coding_mode_requires_a_new_approval(self, *_):
-        roundtable.STATE.update(mode="discussion", plan_approved=True)
+        roundtable.STATE.update(mode="discussion", plan_approved=True, enabled_agents=["claude", "codex"])
         with patch.object(roundtable, "read_configured_project_path", return_value=str(self.workspace)), \
              patch.object(roundtable, "start_worker_if_needed"):
             result = roundtable.switch_mode("coding")
