@@ -124,6 +124,7 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
             roundtable.ask_claude("프로젝트 확인")
         args = run_cli.call_args.args[2]
         self.assertEqual(args[args.index("--tools") + 1], "Read,Glob,Grep")
+        self.assertNotIn("--allowedTools", args)   # 읽기 턴에서는 명령을 하나도 열지 않는다
         self.assertEqual(run_cli.call_args.kwargs["cwd"], roundtable.load_project_path())
 
     def test_discussion_without_project_uses_no_tools_and_isolated_directory(self):
@@ -172,6 +173,13 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
                 elif agent == "claude":
                     self.assertIn("Bash,Edit,Read,Write,Glob,Grep", args)
                     self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
+                    # acceptEdits만으로는 테스트 명령이 막혀 Claude가 자기 변경을 검증하지 못했다.
+                    allowed = args[args.index("--allowedTools") + 1].split(",")
+                    self.assertIn("Bash(python -m unittest*)", allowed)
+                    self.assertIn("Bash(.venv/Scripts/python -m pytest*)", allowed)
+                    self.assertIn("Bash(*python.exe -m pytest*)", allowed)   # 절대 경로·./ 로 부른 가상환경
+                    self.assertTrue(all(rule.startswith("Bash(") for rule in allowed))
+                    self.assertNotIn("Bash", allowed)       # Bash 전체를 열지는 않는다
                 else:
                     self.assertEqual(args[args.index("--mode") + 1], "accept-edits")
                     self.assertIn("--dangerously-skip-permissions", args)
@@ -323,6 +331,16 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         state["total_est_tokens"] = state["coding_limits"]["max_tokens"]
         self.assertIn("최대 토큰", roundtable.coding_limit_reason(state))
 
+        # 캐시 읽기는 도구 호출마다 같은 문맥을 다시 읽은 양이라 한도에 세지 않는다.
+        # (실사용: 화면 구현 턴 하나가 캐시 읽기 20만 개로 한도를 넘겨 테스트·검토 전에 끝났다.)
+        state["total_est_tokens"] = 0
+        state["total_actual_tokens"] = 283_544
+        state["total_work_tokens"] = 41_779
+        self.assertIsNone(roundtable.coding_limit_reason(state))
+        state["total_work_tokens"] = state["coding_limits"]["max_tokens"]
+        self.assertIn("최대 토큰", roundtable.coding_limit_reason(state))
+        state["total_work_tokens"] = 0
+
         state["total_est_tokens"] = 0
         state["coding_progress"]["changed_paths"] = [
             f"file-{index}.txt"
@@ -333,6 +351,11 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         state["coding_progress"]["changed_paths"] = []
         state["coding_progress"]["diff_lines"] = state["coding_limits"]["max_diff_lines"]
         self.assertIn("최대 diff", roundtable.coding_limit_reason(state))
+        # 사이클 중간에는 크기 한도로 멈추지 않는다 — 이미 한 구현이 검증·검토·커밋 없이 버려진다.
+        self.assertIsNone(roundtable.coding_limit_reason(state, cycle_boundary=False))
+        state["coding_progress"]["consecutive_failures"] = state["coding_limits"]["max_consecutive_failures"]
+        self.assertIn("연속 실패", roundtable.coding_limit_reason(state, cycle_boundary=False))
+        state["coding_progress"]["consecutive_failures"] = 0
 
         state["coding_progress"]["diff_lines"] = 0
         state["coding_started_at"] = (
@@ -1002,6 +1025,20 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         self.assertEqual(event["kind"], "message")
         self.assertEqual(final, "완료")
 
+    def test_claude_stream_shows_bash_commands_and_rejections(self):
+        event, _final = roundtable.parse_cli_stream_event(
+            "Claude Code",
+            '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash",'
+            '"input":{"command":"./.venv/Scripts/python -m pytest backend -q"}}]}}',
+        )
+        self.assertIn("Bash 실행: ./.venv/Scripts/python -m pytest backend -q", event["text"])
+        event, _final = roundtable.parse_cli_stream_event(
+            "Claude Code",
+            '{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,'
+            '"content":"This command requires approval"}]}}',
+        )
+        self.assertEqual(event["text"], "도구 실행 실패: This command requires approval")
+
     def test_claude_stream_result_exposes_usage(self):
         event, final = roundtable.parse_cli_stream_event(
             "Claude Code",
@@ -1045,6 +1082,14 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         self.assertEqual(summary["claude"]["turns"], 1)
         self.assertEqual(summary["claude"]["input_tokens"], 80)
         self.assertEqual(summary["codex"]["estimated_tokens"], 12)
+
+    def test_work_tokens_leave_out_cache_reads(self):
+        claude = {"input_tokens": 22, "cache_creation_input_tokens": 27_719,
+                  "cache_read_input_tokens": 201_765, "output_tokens": 13_390}
+        self.assertEqual(roundtable.work_token_count(claude), 41_131)
+        codex = {"input_tokens": 12_000, "cached_input_tokens": 9_000, "output_tokens": 50}
+        self.assertEqual(roundtable.work_token_count(codex), 3_050)
+        self.assertEqual(roundtable.work_token_count(None), 0)
 
     def test_actual_token_count_does_not_double_count_openai_cache(self):
         usage = {"input_tokens": 12000, "cached_input_tokens": 9000, "output_tokens": 50}
@@ -1428,15 +1473,36 @@ class RoundtableTests(IsolatedWorkspaceMixin, unittest.TestCase):
         self.assertEqual(roundtable.unresolved_approval_requesters(messages), [])
 
     def test_composed_prompt_has_a_hard_character_limit(self):
+        topic = "주제" * 1000
         prompt = roundtable.compose_agent_prompt(
             "공통 지침" * 1000,
-            "주제" * 1000,
+            topic,
             "메모리" * 3000,
             "대화" * 3000,
             "작업" * 1000,
         )
-        self.assertLessEqual(len(prompt), roundtable.PROMPT_MAX_CHARS)
+        # 한도는 긴 요청만큼만 늘어난다 (나머지 문맥 예산은 그대로).
+        self.assertLessEqual(len(prompt), roundtable.PROMPT_MAX_CHARS + len(topic) - 500)
         self.assertIn("현재 작업", prompt)
+
+    def test_long_requests_reach_the_model_in_full(self):
+        """예전에는 500자에서 잘려 뒷부분 규칙을 모델이 보지 못했다 (평가 하니스에서 발견)."""
+        topic = "규칙 " * 400 + "마지막 규칙: 모자라면 아무것도 빼지 않는다."
+        prompt = roundtable.compose_agent_prompt("공통 지침" * 1000, topic, "메모리" * 3000,
+                                                 "대화" * 3000, "이번 작업 지시")
+        self.assertIn(topic, prompt)
+        self.assertTrue(prompt.endswith("현재 작업: 이번 작업 지시\n"))
+
+    def test_requests_over_the_topic_limit_say_they_were_cut(self):
+        topic = "가" * (roundtable.TOPIC_MAX_CHARS + 100)
+        prompt = roundtable.compose_agent_prompt("", topic, "", "", "작업")
+        self.assertIn("뒷부분을 잘랐습니다", prompt)
+        self.assertNotIn("가" * (roundtable.TOPIC_MAX_CHARS + 1), prompt)
+
+    def test_topic_card_folds_details_so_the_chat_has_room(self):
+        markup = roundtable.topic_section_html("긴 요청 " * 100, "coding", ["claude", "codex"], "s1")
+        self.assertIn('<details class="topic-details">', markup)
+        self.assertIn("첫 실행 모델: Claude Code", markup)   # 코딩 모드는 항상 Claude 계획부터
 
     def test_agent_output_is_clipped(self):
         output, truncated = roundtable.clip_agent_output("가" * 3000, max_chars=2000)

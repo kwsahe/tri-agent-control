@@ -1002,7 +1002,9 @@ function replaceTopicSection(html) {
   ]));
   const optionsOpen = $("startOptions") ? !$("startOptions").hidden : false;
   const focused = section.contains(document.activeElement) ? startFieldKey(document.activeElement) : null;
+  const detailsOpen = !!section.querySelector("details.topic-details")?.open;
   section.innerHTML = html;
+  if (detailsOpen) section.querySelector("details.topic-details")?.setAttribute("open", "");
   section.querySelectorAll(fields).forEach((el) => {
     const key = startFieldKey(el);
     if (!saved.has(key)) return;
@@ -1035,6 +1037,8 @@ function applyState(data) {
   }
 
   const hasTopic = !!data.topic;
+  // 운영 카드뉴스는 시작 전 안내다. 세션이 있으면 숨겨 대화 영역을 남긴다.
+  if ($("guideCarousel")) $("guideCarousel").hidden = hasTopic;
   const pauseDisabled = !hasTopic || data.finished || data.stopped || data.paused;
   const waitingForAnswer = data.workflow_status === "WAITING_FOR_USER_RESPONSE";
   const resumeDisabled = !hasTopic || data.finished || data.stopped || !data.paused || waitingForAnswer;

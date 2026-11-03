@@ -21,7 +21,7 @@ from pathlib import Path
 
 __all__ = [
     "GitResult", "SHARED_DIRS", "is_repo", "is_clean", "current_branch", "repo_root",
-    "create_worktree", "link_shared_dirs", "remove_worktree", "commit_paths",
+    "create_worktree", "link_shared_dirs", "remove_worktree", "ignored_paths", "commit_paths",
 ]
 
 #: worktree에 연결해 함께 쓰는 사용자 폴더의 무거운 의존성 폴더 (Git이 추적하지 않는다).
@@ -103,12 +103,23 @@ def _is_link(path: Path) -> bool:
     return bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
+def _shared_dir_paths(root: Path) -> list[Path]:
+    """연결 대상의 상대 경로: 최상위와 한 단계 아래 (frontend/node_modules 같은 모노레포 구성)."""
+    paths = [Path(name) for name in SHARED_DIRS]
+    try:
+        children = [child.name for child in Path(root).iterdir()
+                    if child.is_dir() and not child.name.startswith(".") and child.name not in SHARED_DIRS]
+    except OSError:
+        children = []
+    return paths + [Path(child) / name for child in children for name in SHARED_DIRS]
+
+
 def link_shared_dirs(source: Path, target: Path) -> list[str]:
-    """사용자 폴더의 가상환경·node_modules를 worktree에 연결한다(복사하지 않는다). 연결한 이름 목록."""
+    """사용자 폴더의 가상환경·node_modules를 worktree에 연결한다(복사하지 않는다). 연결한 상대 경로 목록."""
     linked = []
-    for name in SHARED_DIRS:
-        src, dst = Path(source) / name, Path(target) / name
-        if not src.is_dir() or dst.exists() or _is_link(dst):
+    for relative in _shared_dir_paths(source):
+        src, dst = Path(source) / relative, Path(target) / relative
+        if not src.is_dir() or dst.exists() or _is_link(dst) or not dst.parent.is_dir():
             continue
         try:
             if os.name == "nt":
@@ -118,15 +129,15 @@ def link_shared_dirs(source: Path, target: Path) -> list[str]:
                 dst.symlink_to(src.resolve(), target_is_directory=True)
         except (OSError, ImportError, AttributeError):
             continue
-        linked.append(name)
+        linked.append(relative.as_posix())
     return linked
 
 
 def remove_worktree(repo: Path, worktree_dir: Path, workspace: Path | None = None) -> GitResult:
     """연결부터 끊고 worktree를 지운다. 커밋 안 된 변경이 있으면 지우지 않는다 (브랜치는 남긴다)."""
     base = Path(workspace or worktree_dir)
-    for name in SHARED_DIRS:
-        link = base / name
+    for relative in _shared_dir_paths(base):
+        link = base / relative
         if _is_link(link):
             try:
                 # 연결만 끊는다 — 재귀 삭제하면 연결된 원본(사용자 .venv 등)까지 지워진다.
@@ -144,6 +155,22 @@ def remove_worktree(repo: Path, worktree_dir: Path, workspace: Path | None = Non
     except (OSError, subprocess.TimeoutExpired) as exc:
         return GitResult(False, f"git 실행 실패로 worktree를 지우지 못했습니다: {exc}")
     return GitResult(True, "")
+
+
+def ignored_paths(root: Path, paths: list[str]) -> set[str]:
+    """``paths`` 중 .gitignore에 걸리는 것 (빌드 결과물 등). 저장소가 아니거나 git을 못 쓰면 빈 집합.
+
+    이미 추적 중인 파일은 무시 규칙에 걸려도 돌려주지 않는다 (진짜 변경이다).
+    """
+    if not paths:
+        return set()
+    try:
+        result = _git(root, "check-ignore", "--stdin", "-z", input_text="\0".join(paths))
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if result.returncode not in (0, 1):   # 1 = 걸리는 것 없음, 128 = 저장소 아님 등
+        return set()
+    return {path for path in result.stdout.split("\0") if path}
 
 
 def commit_paths(root: Path, message: str, paths: list[str]) -> GitResult:

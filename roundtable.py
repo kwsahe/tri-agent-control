@@ -407,7 +407,26 @@ CODEX_CMD = os.environ.get("CODEX_CMD", "codex")
 AGY_CMD = os.environ.get("AGY_CMD", "agy")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "600"))
 CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "900"))
-AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "600"))
+# 테스트 담당은 기존 테스트를 고치고 새 테스트를 쓰고 돌리느라 오래 걸린다 (실사용: 로그인 기능에서 600초 초과).
+AGY_TIMEOUT = int(os.environ.get("AGY_TIMEOUT_SECONDS", "1200"))
+
+# 쓰기 턴에서 Claude Code가 승인 없이 돌릴 수 있는 검증 명령. acceptEdits는 파일 수정만 자동으로 허용하고
+# 명령 실행은 막아서, Claude가 자기 변경을 테스트하지 못했다. 테스트·빌드 명령만 열고 나머지
+# 명령(python -c 등)은 계속 막힌다. 자동 검증이 쓰는 명령과 같은 종류다.
+_CLAUDE_TEST_PYTHONS = (
+    "python", "python3", "py",
+    ".venv/Scripts/python", ".venv/Scripts/python.exe", ".venv/bin/python",
+    "venv/Scripts/python", "venv/Scripts/python.exe", "venv/bin/python",
+)
+CLAUDE_TEST_COMMANDS = (
+    *(f"Bash({python} -m {runner}*)" for python in _CLAUDE_TEST_PYTHONS for runner in ("pytest", "unittest")),
+    # 절대 경로·./ 로 부른 가상환경 python (실사용: `.venv` python으로 pytest를 못 돌렸다).
+    # 실행 파일 이름이 python으로 끝나야 한다. `a && b`처럼 이어 붙인 명령은 Claude Code가 따로 검사한다.
+    *(f"Bash(*{python} -m {runner}*)" for python in ("python", "python.exe", "python3")
+      for runner in ("pytest", "unittest")),
+    "Bash(pytest*)", "Bash(npx vitest*)",
+    "Bash(npm test*)", "Bash(npm run test*)", "Bash(npm run build*)",
+)
 #: CLI가 끝난 뒤 남은 출력을 기다리는 시간. 그 뒤에도 파이프가 열려 있으면 CLI가 띄운
 #: 자식(개발 서버 등)이 물려받은 것이므로 더 기다리지 않는다.
 CLI_PIPE_DRAIN_SECONDS = 2.0
@@ -420,6 +439,7 @@ TRANSCRIPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TRANSCRIPT_MAX_CHARS", "16
 MEMORY_CONTEXT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_MEMORY_CONTEXT_MAX_CHARS", "1800"))
 TEAM_PROMPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TEAM_PROMPT_MAX_CHARS", "1400"))
 PROMPT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_PROMPT_MAX_CHARS", "5000"))
+TOPIC_MAX_CHARS = int(os.environ.get("ROUNDTABLE_TOPIC_MAX_CHARS", "4000"))
 OUTPUT_MAX_CHARS = int(os.environ.get("ROUNDTABLE_OUTPUT_MAX_CHARS", "2000"))
 PROJECT_SNAPSHOT_MAX_ENTRIES = int(os.environ.get("ROUNDTABLE_SNAPSHOT_MAX_ENTRIES", "20000"))
 CODEX_CONTEXT_TOKENS = int(os.environ.get("CODEX_CONTEXT_TOKENS", "258400"))
@@ -547,7 +567,9 @@ PIPELINE_CYCLE_STEPS = [
     ("claude", "구현",
      "승인된 계획과 직전 사이클의 Codex 검토·자동 검증 결과(있다면)를 확인하고 실제 코드로 구현해. "
      "검토에서 지적된 결함이 있으면 그것부터 고쳐. 테스트 파일은 Antigravity 담당이니 고치지 마. "
-     "답변은 2줄 이내로만 써라: `변경: 바꾼 파일` / `결과: 한 줄 요약`.", "coding"),
+     "구현한 뒤 프로젝트 테스트를 직접 돌려 확인해 (`python -m unittest`, `python -m pytest`, `npm test` 같은 "
+     "테스트·빌드 명령만 실행할 수 있다). "
+     "답변은 2줄 이내로만 써라: `변경: 바꾼 파일` / `결과: 테스트 결과를 포함한 한 줄 요약`.", "coding"),
     ("antigravity", "테스트",
      "Claude Code가 이번 사이클에 바꾼 기능의 테스트를 테스트 파일(tests/, test_*.py, *.test.* 등)에만 "
      "추가·수정하고 실행해. 제품 코드는 고치지 마. "
@@ -598,7 +620,7 @@ DEFAULT_CODING_LIMITS = {
     "max_minutes": 45,
     "max_tokens": 200_000,
     "max_changed_files": 50,
-    "max_diff_lines": 2_000,
+    "max_diff_lines": 5_000,   # 풀스택 기능 하나가 테스트 포함 2,390줄이었다
     "max_consecutive_failures": 2,
     "max_same_error": 2,
 }
@@ -1363,7 +1385,9 @@ def parse_cli_stream_event(tool_name: str, line: str) -> tuple[dict | None, str 
                     name = block.get("name", "도구")
                     tool_input = block.get("input") or {}
                     path = tool_input.get("file_path") or tool_input.get("path")
-                    detail = f": {path}" if path else ""
+                    command = tool_input.get("command") if name == "Bash" else None
+                    # 어떤 명령이 막혔는지 알 수 있게 Bash 명령도 남긴다 (실사용에서 거부된 명령을 알 수 없었다).
+                    detail = f": {path}" if path else (f": {command}" if command else "")
                     kind = "file" if name in {"Edit", "Write", "NotebookEdit"} else "tool"
                     event = {"kind": kind, "text": f"{name} 실행{detail}"[:300], "usage": usage}
                     if path:
@@ -1374,6 +1398,12 @@ def parse_cli_stream_event(tool_name: str, line: str) -> tuple[dict | None, str 
             if usage:
                 return {"kind": "usage", "text": "Claude 사용량 갱신", "usage": usage}, None
         if event_type == "user":
+            for block in (data.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error"):
+                    content = block.get("content")
+                    if isinstance(content, list):
+                        content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+                    return {"kind": "tool", "text": f"도구 실행 실패: {str(content or '')[:200]}"}, None
             return {"kind": "tool", "text": "도구 실행 결과 확인"}, None
         if event_type == "result":
             usage = data.get("usage") or {}
@@ -1834,7 +1864,7 @@ def ask_claude(prompt: str, mode: str = "discussion", event_callback=None) -> st
             "Return only a complete final answer in Korean, with no Tool: markers.",
         ])
     else:
-        args.extend(["--tools", "Bash,Edit,Read,Write,Glob,Grep"])
+        args.extend(["--tools", "Bash,Edit,Read,Write,Glob,Grep", "--allowedTools", ",".join(CLAUDE_TEST_COMMANDS)])
     args.extend(["--permission-mode", permission_mode, "--verbose", "--output-format", "stream-json", prompt])
     result = run_cli(
         "Claude Code",
@@ -2673,7 +2703,9 @@ def compose_agent_prompt(
     project_context: str = "",
 ) -> str:
     team_prompt = team_prompt[:TEAM_PROMPT_MAX_CHARS]
-    topic = topic[:500]
+    # 예전에는 500자에서 조용히 잘라, 긴 요청의 뒷부분 규칙을 모델이 아예 보지 못했다.
+    if len(topic) > TOPIC_MAX_CHARS:
+        topic = topic[:TOPIC_MAX_CHARS] + f"\n(요청이 {TOPIC_MAX_CHARS:,}자를 넘어 뒷부분을 잘랐습니다)"
     instruction = instruction[:1200]
     header = (
         "모든 사용자 노출 문장은 한국어로 쓴다. 파일명·명령어·코드 식별자만 원문을 유지한다.\n"
@@ -2699,7 +2731,9 @@ def compose_agent_prompt(
     if transcript:
         context_parts.append(f"최근 대화:\n{transcript}")
     context = "\n\n".join(context_parts)
-    available = max(0, PROMPT_MAX_CHARS - len(base) - 24)
+    # 긴 요청만큼 한도를 늘린다. 마지막 자르기는 프롬프트 끝(요청·이번 작업)부터 자르기 때문이다.
+    limit = PROMPT_MAX_CHARS + max(0, len(topic) - 500)
+    available = max(0, limit - len(base) - 24)
     if len(context) > available:
         notice = "\n... 문맥 축약 ...\n"
         remaining = max(0, available - len(notice))
@@ -2707,7 +2741,7 @@ def compose_agent_prompt(
         tail_size = remaining - head_size
         context = context[:head_size] + notice + (context[-tail_size:] if tail_size else "")
     prompt = f"{header}{team_prompt}\n\n{context}{current_task}"
-    return prompt[:PROMPT_MAX_CHARS]
+    return prompt[:limit]
 
 
 # ──────────────────────────────────────────
@@ -3453,6 +3487,18 @@ def actual_token_count(usage: dict | None) -> int:
     ))
 
 
+def work_token_count(usage: dict | None) -> int:
+    """코딩 한도용 처리 토큰: 캐시 읽기를 뺀다.
+
+    캐시 읽기는 도구를 부를 때마다 같은 문맥을 다시 읽은 양이라 작업량이 아니라 도구 호출 수에
+    비례한다. 화면 구현 턴 하나(비용 $0.53)가 캐시 읽기 20만 개로 토큰 한도를 넘겨 테스트·검토 전에
+    세션이 끝났다.
+    """
+    usage = usage or {}
+    cached = int(usage.get("cache_read_input_tokens", 0) or 0) + int(usage.get("cached_input_tokens", 0) or 0)
+    return max(0, actual_token_count(usage) - cached)
+
+
 def budget_exceeded_reason(state: dict) -> str | None:
     budget = state.get("budget") or {}
     token_limit = int(budget.get("token_limit", 0) or 0)
@@ -3464,11 +3510,22 @@ def budget_exceeded_reason(state: dict) -> str | None:
     return None
 
 
-def coding_limit_reason(state: dict) -> str | None:
+def coding_limit_reason(state: dict, cycle_boundary: bool = True) -> str | None:
+    """코딩을 멈출 이유. 크기·시간·토큰 한도는 사이클 경계(새 사이클 시작 직전)에서만 본다.
+
+    사이클 중간에 멈추면 이미 한 구현이 검증·검토·커밋 없이 버려진다 (실사용: 로그인 기능이
+    테스트 턴 직후 diff 한도에 걸려 커밋 0개로 끝났다). 실패 반복 한도는 언제나 본다.
+    """
     if state.get("mode") != "coding" or state.get("coding_stage") != "iteration":
         return None
     limits = normalize_coding_limits(state.get("coding_limits"))
     progress = normalize_coding_progress(state.get("coding_progress"))
+    if progress["consecutive_failures"] >= limits["max_consecutive_failures"]:
+        return f"연속 실패 {limits['max_consecutive_failures']}회 도달"
+    if progress["same_error_count"] >= limits["max_same_error"]:
+        return f"동일 오류 {limits['max_same_error']}회 반복"
+    if not cycle_boundary:
+        return None
     cycle = max(1, int(state.get("coding_cycle", 1) or 1))
     if cycle > limits["max_cycles"]:
         return f"최대 목표 사이클 {limits['max_cycles']}회 완료"
@@ -3476,19 +3533,15 @@ def coding_limit_reason(state: dict) -> str | None:
     if started_at and time.time() - started_at >= limits["max_minutes"] * 60:
         return f"최대 실행 시간 {limits['max_minutes']}분 도달"
     used_tokens = max(
-        int(state.get("total_actual_tokens", 0) or 0) - int(state.get("coding_start_actual_tokens", 0) or 0),
+        int(state.get("total_work_tokens", 0) or 0) - int(state.get("coding_start_work_tokens", 0) or 0),
         int(state.get("total_est_tokens", 0) or 0) - int(state.get("coding_start_est_tokens", 0) or 0),
     )
     if used_tokens >= limits["max_tokens"]:
-        return f"최대 토큰 {limits['max_tokens']:,} 도달"
+        return f"최대 토큰 {limits['max_tokens']:,} 도달 (캐시 읽기 제외)"
     if len(progress["changed_paths"]) >= limits["max_changed_files"]:
         return f"최대 변경 파일 {limits['max_changed_files']}개 도달"
     if progress["diff_lines"] >= limits["max_diff_lines"]:
         return f"최대 diff {limits['max_diff_lines']:,}줄 도달"
-    if progress["consecutive_failures"] >= limits["max_consecutive_failures"]:
-        return f"연속 실패 {limits['max_consecutive_failures']}회 도달"
-    if progress["same_error_count"] >= limits["max_same_error"]:
-        return f"동일 오류 {limits['max_same_error']}회 반복"
     return None
 
 
@@ -3517,6 +3570,9 @@ def add_message(
             STATE["total_est_tokens"] = STATE.get("total_est_tokens", 0) + meta.get("est_tokens", 0)
             STATE["total_elapsed_time"] = STATE.get("total_elapsed_time", 0.0) + meta.get("elapsed", 0.0)
             STATE["total_actual_tokens"] = STATE.get("total_actual_tokens", 0) + actual_token_count(
+                meta.get("actual_usage")
+            )
+            STATE["total_work_tokens"] = STATE.get("total_work_tokens", 0) + work_token_count(
                 meta.get("actual_usage")
             )
             STATE["total_actual_cost_usd"] = round(
@@ -4040,6 +4096,11 @@ def run_step(
         snapshot_project_tree(project_path) if cli_mode == "coding" else ({}, False)
     )
     changed_paths = compare_project_snapshots(before_snapshot, after_snapshot) if cli_mode == "coding" else []
+    if changed_paths:
+        # 빌드 결과물(frontend/dist/ 등)처럼 .gitignore에 걸리는 경로는 에이전트 변경으로 세지 않는다.
+        # 세면 변경 파일 한도를 채우고, 사이클 커밋의 git add가 "ignored" 오류로 실패한다.
+        ignored = gitops.ignored_paths(project_path, [item["path"] for item in changed_paths])
+        changed_paths = [item for item in changed_paths if item["path"] not in ignored]
     scope_violations = role_scope_violations(agent, changed_paths, state_snapshot) if cli_mode == "coding" else []
     turn_diff = build_turn_diff(project_path, before_texts, changed_paths) if cli_mode == "coding" else ""
     checkpoint_path = save_turn_checkpoint(
@@ -4433,7 +4494,9 @@ def worker_loop(session_id: str) -> None:
                     max(1, int(STATE.get("coding_cycle", 1) or 1))
                     if coding_iteration else 0
                 )
-                limit_reason = coding_limit_reason(STATE) if coding_iteration else None
+                limit_reason = (
+                    coding_limit_reason(STATE, cycle_boundary=step_index == 0) if coding_iteration else None
+                )
                 finished_already = bool(STATE.get("finished"))
             if mode == "coding" and PIPELINE_IMPLEMENTER not in enabled_agents:
                 # 옛 세션을 Claude Code 없이 재개한 경우 — 구현 담당 없이 파이프라인을 돌리지 않는다.
@@ -4477,6 +4540,7 @@ def worker_loop(session_id: str) -> None:
                     # 한도를 먼저 써버리면 사이클 1이 시작하자마자 끝난다.
                     STATE["coding_started_at"] = time.time()
                     STATE["coding_start_actual_tokens"] = int(STATE.get("total_actual_tokens", 0) or 0)
+                    STATE["coding_start_work_tokens"] = int(STATE.get("total_work_tokens", 0) or 0)
                     STATE["coding_start_est_tokens"] = int(STATE.get("total_est_tokens", 0) or 0)
                     STATE["coding_stopped"] = False
                     STATE["coding_stop_reason"] = ""
@@ -4674,6 +4738,77 @@ def start_worker_if_needed(force: bool = False) -> None:
             save_state(STATE)
     thread = threading.Thread(target=worker_loop, args=(session_id,), daemon=True)
     thread.start()
+
+
+def start_topic(
+    topic: str,
+    mode: str = "discussion",
+    discussion_project_access: str = "read",
+    enabled_agents: list[str] | None = None,
+    agent_settings: dict | None = None,
+) -> str | None:
+    """현재 세션에 주제를 정하고 워커를 시작한다. 시작할 수 없으면 사용자에게 보여 줄 오류 문구를 돌려준다.
+
+    대시보드의 /topic과 평가 하니스(bench/)가 같이 쓴다.
+    """
+    topic = (topic or "").strip()
+    if mode == "continuous":
+        mode = "coding"
+    discussion_project_access = normalize_discussion_project_access(discussion_project_access)
+    enabled_agents = normalize_enabled_agents(enabled_agents)
+    agent_settings = normalize_agent_settings(agent_settings)
+    if mode not in MODE_LABELS:
+        mode = "discussion"
+    if mode == "quick":
+        # 빠른 질문은 모델 1명, 읽기 전용.
+        enabled_agents = enabled_agents[:1]
+        if discussion_project_access == "write":
+            discussion_project_access = "read"
+    if mode == "coding" and PIPELINE_IMPLEMENTER not in enabled_agents:
+        return "코딩 모드에는 구현 담당 Claude Code가 필요합니다. Claude Code를 켜고 다시 시작해주세요."
+    if not topic:
+        return "주제를 입력해주세요."
+    with STATE_LOCK:
+        STATE["topic"] = topic
+        if not STATE.get("name") or STATE.get("name") == "새 세션":
+            STATE["name"] = re.sub(r"\s+", " ", topic).strip()[:80]
+        STATE["mode"] = mode
+        STATE["discussion_project_access"] = (
+            "write" if mode == "coding" else discussion_project_access
+        )
+        if mode == "coding" or discussion_project_access == "write":
+            STATE["workspace_access"] = "write"
+        elif mode == "quick":
+            STATE["workspace_access"] = "read"
+        STATE["enabled_agents"] = enabled_agents
+        STATE["start_agent"] = enabled_agents[0]
+        STATE["step_index"] = 0
+        STATE["coding_stage"] = "planning"
+        STATE["plan_approved"] = False
+        if mode == "coding":
+            STATE["agent_roles"] = pipeline_agent_roles()
+        STATE["pipeline_git"] = {}
+        STATE["coding_cycle"] = 0
+        STATE["coding_cycle_step"] = 0
+        STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
+        STATE["coding_progress"] = normalize_coding_progress(None)
+        STATE["coding_stopped"] = False
+        STATE["coding_stop_reason"] = ""
+        STATE["workflow_status"] = workflow.ANALYZING
+        STATE["pending_user_question"] = None
+        STATE["agent_settings"] = agent_settings
+        STATE["finished"] = False
+        CONTROL["approval_requested"] = False
+        CONTROL["approval_requested_by"] = []
+        CONTROL["approval_rejected"] = False
+        save_state(STATE)
+        state_snapshot = dict(STATE)
+    start_log_session()
+    write_session_transcript_header(state_snapshot)
+    ensure_session_memory(state_snapshot)
+    print(f"  \U0001f4cc 토론 주제: {topic} ({MODE_LABELS[mode]}, 활성: {agent_names(enabled_agents)})")
+    start_worker_if_needed()
+    return None
 
 
 # ──────────────────────────────────────────
@@ -4937,16 +5072,19 @@ def topic_section_html(
             for agent in enabled_agents
         )
         return (
-            f'<div class="topic"><h3>{html.escape(topic)} '
+            # 주제는 두 줄까지만, 세부 정보는 접어 둔다. 다 펼쳐 두면 1380×760 화면에서
+            # 이 카드가 285px를 차지해 대화 영역이 16px만 남았다.
+            f'<div class="topic"><h3 class="topic-title" title="{html.escape(topic)}">{html.escape(topic)} '
             f'<span style="color:var(--faint);font-weight:500">· {html.escape(mode_label)}</span></h3>'
+            '<details class="topic-details"><summary>세션 정보</summary>'
             f'<p>활성: {html.escape(agent_names(enabled_agents))} · 비활성: '
             f'{html.escape(agent_names(disabled_agents) if disabled_agents else "없음")}</p>'
-            f'<p>첫 실행 모델: {html.escape(AGENTS[enabled_agents[0]]["label"])}</p>'
+            f'<p>첫 실행 모델: {html.escape(AGENTS[PIPELINE_IMPLEMENTER if mode == "coding" else enabled_agents[0]]["label"])}</p>'
             f'<p>모델: {html.escape(settings_label)}</p>'
             f'<p>프로젝트 접근: {"읽기·쓰기 (코딩 실행)" if mode == "coding" else html.escape(discussion_access_label)}</p>'
             f'<p>저장 폴더: {html.escape(str(session_memory_dir(active_id)))}</p>'
             f'{project_path_line if mode == "coding" else ""}'
-            f'{worktree_line if mode == "coding" else ""}</div>'
+            f'{worktree_line if mode == "coding" else ""}</details></div>'
         )
 
     return f"""
@@ -6282,78 +6420,23 @@ class RoundtableHandler(BaseHTTPRequestHandler):
 
         if self.path == "/topic":
             form = self._read_form()
-            topic = form.get("topic", [""])[0].strip()
-            mode = form.get("mode", ["discussion"])[0].strip()
-            if mode == "continuous":
-                mode = "coding"
-            discussion_project_access = normalize_discussion_project_access(
-                form.get("discussion_project_access", ["read"])[0].strip()
-            )
             requested_start_agent = form.get("start_agent", [""])[0].strip()
-            enabled_agents = prioritize_start_agent(form.get("agent", []), requested_start_agent)
-            agent_settings = normalize_agent_settings({
-                agent: {
-                    "model": form.get(f"model_{agent}", [""])[0].strip(),
-                    "effort": form.get(f"effort_{agent}", [""])[0].strip(),
-                }
-                for agent in AGENT_ORDER
-            })
-            if mode not in MODE_LABELS:
-                mode = "discussion"
-            if mode == "quick":
-                # 빠른 질문은 모델 1명, 읽기 전용.
-                enabled_agents = enabled_agents[:1]
-                if discussion_project_access == "write":
-                    discussion_project_access = "read"
-            if mode == "coding" and PIPELINE_IMPLEMENTER not in enabled_agents:
-                self._send_error_json(
-                    400, "코딩 모드에는 구현 담당 Claude Code가 필요합니다. Claude Code를 켜고 다시 시작해주세요."
-                )
+            error = start_topic(
+                form.get("topic", [""])[0],
+                form.get("mode", ["discussion"])[0].strip(),
+                form.get("discussion_project_access", ["read"])[0].strip(),
+                prioritize_start_agent(form.get("agent", []), requested_start_agent),
+                {
+                    agent: {
+                        "model": form.get(f"model_{agent}", [""])[0].strip(),
+                        "effort": form.get(f"effort_{agent}", [""])[0].strip(),
+                    }
+                    for agent in AGENT_ORDER
+                },
+            )
+            if error:
+                self._send_error_json(400, error)
                 return
-            if not topic:
-                self._send_error_json(400, "주제를 입력해주세요.")
-                return
-            if topic:
-                with STATE_LOCK:
-                    STATE["topic"] = topic
-                    if not STATE.get("name") or STATE.get("name") == "새 세션":
-                        STATE["name"] = re.sub(r"\s+", " ", topic).strip()[:80]
-                    STATE["mode"] = mode
-                    STATE["discussion_project_access"] = (
-                        "write" if mode == "coding" else discussion_project_access
-                    )
-                    if mode == "coding" or discussion_project_access == "write":
-                        STATE["workspace_access"] = "write"
-                    elif mode == "quick":
-                        STATE["workspace_access"] = "read"
-                    STATE["enabled_agents"] = enabled_agents
-                    STATE["start_agent"] = enabled_agents[0]
-                    STATE["step_index"] = 0
-                    STATE["coding_stage"] = "planning"
-                    STATE["plan_approved"] = False
-                    if mode == "coding":
-                        STATE["agent_roles"] = pipeline_agent_roles()
-                    STATE["pipeline_git"] = {}
-                    STATE["coding_cycle"] = 0
-                    STATE["coding_cycle_step"] = 0
-                    STATE["coding_started_at"] = None  # 목표 사이클 시작 때 정한다
-                    STATE["coding_progress"] = normalize_coding_progress(None)
-                    STATE["coding_stopped"] = False
-                    STATE["coding_stop_reason"] = ""
-                    STATE["workflow_status"] = workflow.ANALYZING
-                    STATE["pending_user_question"] = None
-                    STATE["agent_settings"] = agent_settings
-                    STATE["finished"] = False
-                    CONTROL["approval_requested"] = False
-                    CONTROL["approval_requested_by"] = []
-                    CONTROL["approval_rejected"] = False
-                    save_state(STATE)
-                    state_snapshot = dict(STATE)
-                start_log_session()
-                write_session_transcript_header(state_snapshot)
-                ensure_session_memory(state_snapshot)
-                print(f"  \U0001f4cc 토론 주제: {topic} ({MODE_LABELS[mode]}, 활성: {agent_names(enabled_agents)})")
-                start_worker_if_needed()
             self._send_html(render_dashboard())
             return
 

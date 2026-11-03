@@ -170,6 +170,37 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual((self.root / ".venv" / "marker.txt").read_text(encoding="utf-8"), "원본\n")
         self.assertEqual(git(self.root, "branch", "--list", "triagent/s1"), "triagent/s1")
 
+    def test_nested_dependency_folders_are_linked_too(self):
+        """frontend/node_modules처럼 한 단계 아래의 의존성 폴더도 연결해야 worktree에서 npm test가 돈다."""
+        self.init_repo()
+        (self.root / "frontend").mkdir()
+        (self.root / "frontend" / "app.js").write_text("export {}\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "frontend")
+        (self.root / "frontend" / "node_modules" / "vitest").mkdir(parents=True)
+        (self.root / "frontend" / "node_modules" / "vitest" / "marker.txt").write_text("원본\n", encoding="utf-8")
+        gitops.create_worktree(self.root, self.wt, "triagent/s1")
+        self.assertEqual(gitops.link_shared_dirs(self.root, self.wt), ["frontend/node_modules"])
+        self.assertTrue((self.wt / "frontend" / "node_modules" / "vitest" / "marker.txt").exists())
+        self.assertEqual(gitops.remove_worktree(self.root, self.wt), gitops.GitResult(True, ""))
+        self.assertFalse(self.wt.exists())
+        self.assertTrue((self.root / "frontend" / "node_modules" / "vitest" / "marker.txt").exists())
+
+    def test_build_outputs_listed_in_gitignore_are_reported_as_ignored(self):
+        """실사용: Claude가 npm run build를 돌려 생긴 frontend/dist/가 변경 파일로 잡혔다."""
+        self.init_repo()
+        (self.root / ".gitignore").write_text("dist/\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "ignore")
+        (self.root / "dist").mkdir()
+        (self.root / "dist" / "index.js").write_text("x\n", encoding="utf-8")
+        self.assertEqual(gitops.ignored_paths(self.root, ["app.py", "dist/", "dist/index.js"]),
+                         {"dist/", "dist/index.js"})
+        self.assertEqual(gitops.ignored_paths(self.root, []), set())
+
+    def test_ignored_paths_outside_a_repo_is_empty(self):
+        self.assertEqual(gitops.ignored_paths(self.root, ["dist/index.js"]), set())
+
     def test_worktree_with_uncommitted_changes_is_not_removed(self):
         self.init_repo()
         gitops.create_worktree(self.root, self.wt, "triagent/s1")

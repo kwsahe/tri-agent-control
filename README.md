@@ -173,7 +173,7 @@ python roundtable.py
 
 자동 검증은 `tests/` 폴더나 루트의 `test_*.py`(pytest가 있으면 pytest, 없으면 unittest), npm `test`/`build` 스크립트를 찾아 실행합니다. 프로젝트에 `.venv`/`venv`가 있으면 그 가상환경의 Python과 pytest로 실행하고, `--runInBand`는 테스트 스크립트가 Jest일 때만 붙입니다. 찾지 못하면 통과로 치지 않고 **"자동 검증 없음"**으로 표시합니다 — 완료 사유와 사이클 커밋 메시지(`Validation: none`)에 그대로 남습니다.
 
-기본 한도는 3사이클, 45분, 추정 20만 토큰, 변경 파일 50개, diff 2,000줄입니다. 연속 실패 또는 동일 오류가 2회 반복돼도 자동으로 멈춥니다. 대시보드의 `중단`을 누르면 현재 CLI 프로세스와 코딩 사이클을 즉시 종료합니다. 파이프라인 이전에 진행 중이던 코딩 세션(이전 `continuous` 세션 포함)은 로드할 때 계획 단계 처음(이미 승인됐다면 사이클 진입 직전) 또는 현재 목표 사이클의 처음으로 옮겨지고 역할이 고정됩니다.
+기본 한도는 3사이클, 45분, 처리 토큰 20만(캐시 읽기 제외 — 도구를 부를 때마다 같은 문맥을 다시 읽은 양은 작업량이 아니므로), 변경 파일 50개(`.gitignore`에 걸리는 빌드 결과물은 세지 않음), diff 5,000줄입니다. 크기·시간·토큰 한도는 사이클 경계에서만 확인하므로, 진행 중인 사이클은 검증·검토·커밋까지 마치고 멈춥니다. 연속 실패 또는 동일 오류가 2회 반복돼도 자동으로 멈춥니다. 대시보드의 `중단`을 누르면 현재 CLI 프로세스와 코딩 사이클을 즉시 종료합니다. 파이프라인 이전에 진행 중이던 코딩 세션(이전 `continuous` 세션 포함)은 로드할 때 계획 단계 처음(이미 승인됐다면 사이클 진입 직전) 또는 현재 목표 사이클의 처음으로 옮겨지고 역할이 고정됩니다.
 
 ## 프롬프트와 메모리 절약
 
@@ -240,6 +240,22 @@ python tests\live_smoke.py codex      # 하나만
 인증 정보가 섞이면 경고합니다. CLI가 없거나 로그인되지 않았으면 성공으로 위장하지
 않고 실패로 남깁니다.
 
+### 평가 하니스 (Claude 단독 vs 3명 파이프라인)
+
+`bench/`는 같은 코딩 과제를 **Claude 단독**(Claude만 켠 코딩 모드)과 **3명 파이프라인**으로 풀게 하고, 에이전트가 볼 수 없는 숨김 테스트로 채점합니다. 두 방식은 같은 TriAgent 실행 경로를 쓰고, 켜는 모델만 다릅니다.
+
+- **과제** — `bench/tasks/`에 14개가 있습니다: 새 함수 3(`e*`), 버그 수정 3(`m*`), 여러 파일 기능 2(`h*`), 놓치기 쉬운 어려운 과제 6(`x*`). 어려운 과제는 규칙이 여러 개 얽혀 있거나, 같은 버그가 다른 파일에도 복사돼 있거나, 증상 두 개의 원인이 서로 다른 곳에 있거나, 입력을 몰래 바꾸거나 부동소수 오차가 생기는 함정이 있습니다. 과제마다 시작 코드(`repo/`), 지시문(`task.md`), 숨김 테스트(`hidden/`), 정답 풀이(`solution/`)가 있습니다. 실행 전에 과제 자체를 점검합니다: 시작 상태는 숨김 테스트에 실패하고, 정답 풀이는 숨김·공개 테스트를 모두 통과해야 합니다.
+- **측정** — 성공(숨김 테스트 전부 통과), 숨김 테스트 통과율, 시간, 모델 호출 수, 토큰, 비용, 사이클 수, 변경 줄 수.
+- **격리** — 세션·상태 파일·worktree는 테스트와 같은 격리로 임시 폴더에 둡니다. 계획 승인은 하니스가 두 방식 모두 자동으로 합니다.
+
+```powershell
+python bench\run_bench.py --check                                   # 과제 점검만 (모델 호출 없음)
+python bench\run_bench.py --tasks e2-chunked,m1-cart --repeats 1    # 실제 모델로 실행 (요금·한도 소모)
+python bench\run_bench.py --report bench\results\<파일>.jsonl        # 결과표 다시 만들기
+```
+
+결과는 `bench/results/<시각>.jsonl`(실행마다 한 줄)과 같은 이름의 `.md` 결과표로 남습니다.
+
 ## 설정 파일
 
 | 파일 | 역할 |
@@ -275,7 +291,8 @@ python tests\live_smoke.py codex      # 하나만
 |---|---:|---|
 | `CODEX_CMD` / `AGY_CMD` / `CLAUDE_CMD` | `codex` / `agy` / `claude` | CLI 실행 명령 |
 | `CODEX_TIMEOUT_SECONDS` | 900 | Codex 응답 제한 시간 |
-| `AGY_TIMEOUT_SECONDS` / `CLAUDE_TIMEOUT_SECONDS` | 600 | Antigravity와 Claude 응답 제한 시간 |
+| `AGY_TIMEOUT_SECONDS` | 1200 | Antigravity 응답 제한 시간 (테스트 작성·실행이 길다) |
+| `CLAUDE_TIMEOUT_SECONDS` | 600 | Claude 응답 제한 시간 |
 | `ROUNDTABLE_PORT` | 8765 | 로컬 대시보드 시작 포트 |
 | `ROUNDTABLE_TRANSCRIPT_WINDOW` | 2 | 직접 전달하는 최근 메시지 수 |
 | `ROUNDTABLE_MEMORY_BRIEF_LINES` | 6 | 압축 메모리 줄 수 |
@@ -299,6 +316,7 @@ static/dashboard.css     대시보드 디자인과 반응형 레이아웃
 static/dashboard.js      실시간 상태 갱신과 사용자 제어
 static/agents/            모델 아이콘
 tests/                    회귀 및 실제 CLI 스모크 테스트
+bench/                    평가 하니스 (과제 14개, 실행·채점·결과표)
 TEAM_PROMPT.md            세 모델 공통 지침
 PROJECT_PATH.txt          코딩 대상 프로젝트 경로
 orchestrate.py            이전 2모델 협업 실험 스크립트
@@ -333,6 +351,10 @@ orchestrate.py            이전 2모델 협업 실험 스크립트
   TriAgent 자신의 폴더로 대체하지 않습니다. 유효한 폴더를 다시 선택할 때까지 읽기와
   쓰기 모델 실행을 모두 차단하고, 원래 저장된 경로와 함께 차단 상태를 화면에 표시합니다.
   세션에 저장된 작업공간과 현재 선택 경로가 다르면 사용자 확인 없이 실행하지 않습니다.
+- **Claude Code 명령 실행 범위**:
+  - 쓰기 턴에서는 파일 수정과 함께 테스트·빌드 명령만 승인 없이 실행합니다. 허용하는 명령은 `python -m unittest`, `python -m pytest`(`.venv`/`venv`의 python 포함), `pytest`, `npm test`, `npm run test`, `npm run build`입니다.
+  - 그 밖의 명령(`python -c` 등)과, 테스트 명령 뒤에 `&&`로 다른 명령을 붙인 경우는 막힙니다.
+  - 다만 테스트가 프로젝트 코드를 실행하므로 완전한 격리는 아닙니다.
 - 로컬 대시보드는 외부 폰트를 포함해 **인터넷으로 나가는 요청을 하지 않습니다.**
 - CLI 출력·점검 로그에서 API 키·토큰으로 보이는 값은 마스킹합니다.
 
